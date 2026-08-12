@@ -1,0 +1,172 @@
+use Test;
+use lib 'lib';
+
+use JSON::Fast;
+
+use App::Moneymoor;
+
+# The distribution's own housekeeping — the things that are true of the
+# repository rather than of any one module, and that nothing else in
+# the suite would notice going wrong:
+#
+#   * `META6.json`'s `provides` and `lib/` agree, in both directions. A
+#     module missing from `provides` is invisible to an installed copy
+#     of the dist: `zef install` puts the file nowhere, `use` fails,
+#     and every test here still passes because tests run against
+#     `-Ilib`. `dist.ini` sets `AutoScanPackages enabled = false`, so
+#     nothing regenerates the list — adding a module means adding a
+#     line by hand, and forgetting is silent.
+#   * Every one of them loads, together, in one process. Export
+#     collisions between two modules are invisible to a test that only
+#     ever loads one of them.
+#   * `bin/moneymoor` compiles.
+#   * Every module carries Pod. `mi6 build` regenerates README.md and
+#     docs/ from it, so a module without any ships as a blank page.
+
+plan 5;
+
+my constant META = 'META6.json';
+
+# The -I flags this run was started with, so the child processes below
+# can find Selkie and Notcurses-Native wherever the caller had them.
+my @incs = $*REPO.repo-chain
+    .grep({ .^name eq 'CompUnit::Repository::FileSystem' })
+    .map({ '-I' ~ .prefix.absolute });
+
+sub lib-modules(--> Hash) {
+    my %found;
+    sub walk($dir) {
+        for $dir.dir.sort -> $entry {
+            if $entry.d { walk($entry) }
+            elsif $entry.Str.ends-with('.rakumod') {
+                my $rel = $entry.relative;
+                %found{
+                    $rel.subst(/^ 'lib/' /, '')
+                        .subst(/ '.rakumod' $ /, '')
+                        .subst('/', '::', :g)
+                } = $rel;
+            }
+        }
+    }
+    walk('lib'.IO);
+    %found;
+}
+
+my %fs        = lib-modules();
+my %meta      = from-json(META.IO.slurp);
+my %provides  = %meta<provides>;
+
+# The eleven palettes are data tables, copied verbatim from
+# App-Mindmoor under the Phase 0 kit rule (docs/ui-v0.1-spec.md §2 says
+# "none" under edits). They carry a comment header naming the palette
+# and its source, and no Pod — same as their originals, and the reason
+# is that a rendered page per palette would be eleven pages of hex.
+# `t/50-theme-completeness.rakutest` is what actually holds them to
+# account.
+sub palette-module(Str $name --> Bool) {
+    $name.starts-with('App::Moneymoor::Theme::');
+}
+
+subtest 'META6 provides and lib/ describe the same distribution' => {
+    plan 4;
+
+    # `App::Moneymoor.version` is a hard-coded literal — a caller
+    # recording "which engine derived this budget" gets nothing from a
+    # version that stopped tracking the dist.
+    is App::Moneymoor.version.Str, %meta<version>,
+        'App::Moneymoor.version agrees with META6';
+
+    is-deeply (%fs.keys (-) %provides.keys).keys.sort.List, ().List,
+        'every module under lib/ is in provides — one that is not '
+            ~ 'installs nowhere and only fails for the user';
+    is-deeply (%provides.keys (-) %fs.keys).keys.sort.List, ().List,
+        'and every provides entry names a file that exists';
+
+    my @mismatched = %provides.keys.sort.grep({
+        %fs{$_}:exists && %fs{$_} ne %provides{$_}
+    });
+    is-deeply @mismatched.List, ().List,
+        'with each pointing at its own path';
+};
+
+subtest 'every module in provides loads, all in one process' => {
+    plan 2;
+    # One process, not fifty: two modules whose `is export` lists
+    # collide compile fine on their own and only break the app, which
+    # loads all of them.
+    #
+    # The palettes are the one deliberate collision — all eleven export
+    # a sub called `theme`, which is exactly why
+    # `App::Moneymoor::Themes` reaches them with `need` and calls them
+    # by their fully-qualified names. They are loaded that way here too,
+    # so "does it load" is still asked of all fifty.
+    my $prog = $*TMPDIR.add("moneymoor-load-{$*PID}.raku");
+    LEAVE { unlink $prog if $prog.e }
+    my @uses  = %provides.keys.sort.grep({ !palette-module($_) });
+    my @needs = %provides.keys.sort.grep(&palette-module);
+    $prog.spurt(
+        # The engine's ordering rule: the sqlcipher shim has to be
+        # loaded before the first `use App::Moneymoor::DB`.
+        "use MacOS::NativeLib <sqlcipher>;\n"
+        ~ @uses.map({ "use $_;\n" }).join
+        ~ @needs.map({ "need $_;\n" }).join
+        ~ @needs.map({ "\{$_\::theme\}\n" }).join
+        ~ "say 'loaded';\n"
+    );
+
+    my $proc = run($*EXECUTABLE, |@incs, $prog.absolute,
+                   :out, :err);
+    my $out = $proc.out.slurp(:close).trim;
+    my $err = $proc.err.slurp(:close);
+
+    is $out, 'loaded',
+        "all {%provides.elems} modules load together";
+    # MacOS::NativeLib says so on stderr when the dylib is already
+    # linked; anything else is this distribution's problem.
+    my @noise = $err.lines.grep({
+        $_.trim.chars && !$_.contains("Library 'libsqlcipher' not found")
+    });
+    is-deeply @noise.List, ().List, 'and load silently';
+};
+
+subtest 'bin/moneymoor compiles' => {
+    plan 2;
+    ok 'bin/moneymoor'.IO.e, 'the entry point is where META6 says';
+    my $proc = run($*EXECUTABLE, '-c', |@incs, 'bin/moneymoor',
+                   :out, :err);
+    $proc.out.slurp(:close);
+    my $err = $proc.err.slurp(:close);
+    ok $proc.exitcode == 0,
+        "raku -c bin/moneymoor is clean{$proc.exitcode == 0 ?? '' !! ": $err"}";
+};
+
+subtest 'every module carries Pod that names itself' => {
+    my @documented = %fs.keys.sort.grep({ !palette-module($_) });
+    plan @documented.elems;
+    for @documented -> $mod {
+        my $src = %fs{$mod}.IO.slurp;
+        # `mi6 build` renders these into docs/; a module with no Pod
+        # ships an empty page, and one whose =head1 NAME says something
+        # else ships a page filed under the wrong name.
+        my Bool $ok = $src.contains('=begin pod')
+                   && $src.contains('=end pod')
+                   && $src.contains("=head1 NAME")
+                   && $src.contains($mod);
+        ok $ok, "$mod documents itself";
+    }
+};
+
+subtest 'the palettes are the documented exception' => {
+    my @palettes = %fs.keys.sort.grep(&palette-module);
+    plan @palettes.elems + 1;
+    ok @palettes.elems == 11,
+        'eleven palettes, as copied from the shared kit';
+    for @palettes -> $mod {
+        # No Pod by design — but they must still say which palette they
+        # are and where it came from, which is what the header comment
+        # is for.
+        my @lines = %fs{$mod}.IO.lines;
+        ok @lines.grep({ .starts-with('#') && .contains('http') }),
+            "$mod cites its source in a header comment";
+    }
+};

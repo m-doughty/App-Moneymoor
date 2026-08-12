@@ -1,0 +1,393 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+use App::Moneymoor::Util::Period;
+
+# Property suite: build random-but-legal budgets, one operation at a
+# time, and after EVERY operation assert the three things the engine
+# promises.
+#
+#   1. The master invariant, in its general form, for every period:
+#        Σ available + RTA + assigned-in-later-periods + credit-overspend
+#          == cash balance
+#   2. The move ledger is a consistent double entry: every move is
+#      positive, connects two different known categories, and the
+#      payment-envelope side of every move is exactly the moved-in /
+#      moved-out the derivation applied.
+#   3. Recomputation is deterministic: the same facts in a different
+#      order produce a byte-identical view.
+#
+# Plus the rollover algebra rule 3 is defined by:
+#      carry-out == available + credit-overspend + cash-overspend
+#   and, for an envelope that does NOT carry its negative,
+#      carry-out == max(0, available),
+#   while one that does reports no cash overspending at all.
+#
+# Which envelopes carry is drawn per seed, so the soak runs over mixed
+# populations rather than over the one that was true before
+# `carry-overspend` existed: rule 3 now has two answers, and every
+# property above has to hold of a budget whose envelopes disagree about
+# which one they are on.
+#
+# All four run under EVERY scheme below, on every seed. The properties
+# are statements about the algebra, not about calendar months: the
+# derivation depends only on each fact bucketing into exactly one period
+# and on period keys ordering as text, so a scheme that changes what a
+# bucket is must change none of them. This is the soak that says so —
+# and the one that reaches the boundaries a calendar month never has: a
+# period that starts mid-month, a period no month lines up with, and a
+# transaction dated on the anchor day itself.
+
+# Scheme name → scheme. monthly/1 is the incumbent; monthly/14 is the
+# payday month; weekly/4 is the every-four-weeks window that lines up
+# with no month at all, anchored INSIDE the window the generator draws
+# dates from so that on-anchor, pre-anchor and post-anchor dates all
+# occur.
+constant SCHEMES = (
+    'monthly/1'  => App::Moneymoor::Util::Period.default-scheme,
+    'monthly/14' => App::Moneymoor::Util::Period.monthly(anchor-day => 14),
+    'weekly/4'   => App::Moneymoor::Util::Period.weekly(
+                        weeks => 4, anchor => '2026-03-14'),
+);
+
+constant SEEDS = (20260801, 4242, 987654321, 13, 555, 1_000_003, 2_718_281, 7);
+constant STEPS = 45;
+
+plan SCHEMES.elems;
+
+# A 64-bit LCG rather than `srand` + `rand`: Rakudo's global PRNG
+# cannot be reliably re-seeded mid-process (a second srand with the
+# same seed does not replay the first sequence), and a property suite
+# whose cases change between runs is not a regression test. This is
+# self-contained, portable, and identical on every platform.
+sub make-rng(Int:D $seed) {
+    my Int $state = $seed;
+    -> Int:D $n {
+        $state = ($state * 6364136223846793005 + 1442695040888963407)
+                 +& 0xFFFF_FFFF_FFFF_FFFF;
+        ($state +> 33) % $n;
+    }
+}
+
+#| The six months the generator draws transaction dates from. Not
+#| periods — the dates are drawn from the calendar and bucketed by
+#| whichever scheme is running, so every scheme sees exactly the same
+#| stream of facts and only the windows differ. That is what makes a
+#| failure under one scheme and not another a statement about the
+#| scheme rather than about the draw.
+constant DRAW-MONTHS = <2026-01-01 2026-02-01 2026-03-01
+                        2026-04-01 2026-05-01 2026-06-01>;
+constant SPEND-CATEGORIES = (GROCERIES, DINING);
+
+#| A date somewhere in a randomly chosen month of the window above.
+#| Date arithmetic rather than string surgery, so the draw is uniform
+#| over real dates and cannot produce a 31st that does not exist.
+sub random-date(&rng) {
+    (Date.new(DRAW-MONTHS[rng(DRAW-MONTHS.elems)]) + rng(28)).Str;
+}
+
+sub random-amount(&rng) { 25 * (1 + rng(2000)) }
+
+#| Apply one random, well-formed operation. Returns a short label so a
+#| failure can name the step that produced it. Assignment keys are
+#| derived from the ACTIVE scheme, so every one of them is a real period
+#| start under the scheme the resulting view is computed with.
+sub step(Facts:D $f, &rng, App::Moneymoor::Util::Period:D $scheme --> Str) {
+    my Int $roll = rng(100);
+    my Str $date = random-date(&rng);
+    my Str $period = $scheme.period-of($date);
+    my Int $amount = random-amount(&rng);
+    my Int $category = SPEND-CATEGORIES[rng(SPEND-CATEGORIES.elems)];
+
+    if $roll < 14 {
+        $f.inflow(account => CURRENT, :$date, :$amount);
+        "inflow $amount on $date";
+    }
+    elsif $roll < 30 {
+        $f.spend(account => CURRENT, :$date, :$amount, :$category);
+        "cash spend $amount on $date";
+    }
+    elsif $roll < 44 {
+        $f.spend(account => VISA, :$date, :$amount, :$category);
+        "card spend $amount on $date";
+    }
+    elsif $roll < 49 {
+        $f.refund(account => VISA, :$date, :$amount, :$category);
+        "card refund $amount on $date";
+    }
+    elsif $roll < 53 {
+        $f.refund(account => CURRENT, :$date, :$amount, :$category);
+        "cash refund $amount on $date";
+    }
+    elsif $roll < 57 {
+        $f.inflow(account => VISA, :$date, :$amount);
+        "card inflow to rta $amount on $date";
+    }
+    elsif $roll < 63 {
+        $f.transfer(from => CURRENT, to => VISA, :$date, :$amount);
+        "card payment $amount on $date";
+    }
+    elsif $roll < 66 {
+        $f.transfer(from => VISA, to => CURRENT, :$date, :$amount);
+        "cash advance $amount on $date";
+    }
+    elsif $roll < 70 {
+        $f.transfer(from => CURRENT, to => SAVINGS, :$date, :$amount);
+        "cash to cash $amount on $date";
+    }
+    elsif $roll < 74 {
+        $f.transfer(from => CURRENT, to => ISA, :$date, :$amount,
+                    parts => [($category) => -$amount]);
+        "cash to tracking $amount on $date";
+    }
+    elsif $roll < 77 {
+        $f.transfer(from => ISA, to => CURRENT, :$date, :$amount,
+                    parts => [(RTA) => $amount], categorize-from => False);
+        "tracking to cash $amount on $date";
+    }
+    elsif $roll < 80 {
+        # Paying the card as a categorized transaction rather than a
+        # transfer — legal, and it puts activity on a payment envelope.
+        $f.txn(account => CURRENT, :$date, amount => -$amount,
+               parts => [(VISA-PAY) => -$amount]);
+        "categorized card payment $amount on $date";
+    }
+    elsif $roll < 90 {
+        $f.assign($period, $category, random-amount(&rng));
+        "assign $period";
+    }
+    elsif $roll < 93 {
+        $f.assign($period, VISA-PAY, random-amount(&rng));
+        "assign payment envelope $period";
+    }
+    elsif $roll < 96 {
+        # Money moved between envelopes is two assignment writes.
+        my Int $from = SPEND-CATEGORIES[rng(SPEND-CATEGORIES.elems)];
+        my Int $to = $from == GROCERIES ?? DINING !! GROCERIES;
+        my Int $moved = random-amount(&rng);
+        my $from-row = $f.assignments.first({
+            .period eq $period && .category-id == $from });
+        my $to-row = $f.assignments.first({
+            .period eq $period && .category-id == $to });
+        my Int $from-now = $from-row.defined ?? $from-row.amount !! 0;
+        my Int $to-now   = $to-row.defined   ?? $to-row.amount   !! 0;
+        $f.assign($period, $from, $from-now - $moved);
+        $f.assign($period, $to,   $to-now   + $moved);
+        "move money $period";
+    }
+    elsif $roll < 98 {
+        my @ids = $f.transactions.map(*.id);
+        if @ids {
+            my Int $victim = @ids[rng(@ids.elems)];
+            $f.delete-txn($victim);
+            "delete txn $victim";
+        } else {
+            $f.inflow(account => CURRENT, :$date, :$amount);
+            "inflow $amount on $date (nothing to delete)";
+        }
+    }
+    else {
+        my @ids = $f.transactions.map(*.id);
+        if @ids {
+            my Int $victim = @ids[rng(@ids.elems)];
+            my Bool $edited = $f.edit-txn($victim,
+                amount => ($f.transactions.first({ .id == $victim }).amount < 0
+                            ?? -$amount !! $amount),
+                date => $date);
+            "edit txn $victim ({ $edited ?? 'applied' !! 'skipped' })";
+        } else {
+            $f.assign($period, $category, $amount);
+            "assign $period (nothing to edit)";
+        }
+    }
+}
+
+#| Every period's master invariant. Returns an error string, or ''.
+sub invariant-error($view --> Str) {
+    $view.invariant-errors.head // '';
+}
+
+#| The move ledger must be a consistent double entry, and the payment
+#| envelope side of every move must be the moved-in / moved-out the
+#| derivation actually applied.
+sub move-ledger-error($view --> Str) {
+    # Parentheses matter: a bareword left of => is auto-quoted, and the
+    # key has to be the category id.
+    my %is-payment = (VISA-PAY) => True;
+    for $view.budget-periods -> $bp {
+        my Int $total-in = 0;
+        my Int $total-out = 0;
+        my %in;
+        my %out;
+        for $bp.moves -> $mv {
+            return "{ $bp.period }: move with a non-positive amount "
+                 ~ "({ $mv.amount })"
+                unless $mv.amount > 0;
+            return "{ $bp.period }: move from a category to itself "
+                 ~ "({ $mv.from-category-id })"
+                if $mv.from-category-id == $mv.to-category-id;
+            return "{ $bp.period }: move with no period" unless $mv.period eq $bp.period;
+            $total-in  += $mv.amount;
+            $total-out += $mv.amount;
+            %in{ $mv.to-category-id }   = (%in{ $mv.to-category-id } // 0) + $mv.amount;
+            %out{ $mv.from-category-id } = (%out{ $mv.from-category-id } // 0) + $mv.amount;
+        }
+        return "{ $bp.period }: move set is not zero-sum "
+             ~ "(in $total-in, out $total-out)"
+            unless $total-in == $total-out;
+
+        for $bp.category-periods -> $cp {
+            if %is-payment{ $cp.category-id } {
+                return "{ $bp.period }: payment envelope { $cp.category-id } "
+                     ~ "applied moved-in { $cp.moved-in } but the move log "
+                     ~ "says { %in{ $cp.category-id } // 0 }"
+                    unless $cp.moved-in == (%in{ $cp.category-id } // 0);
+                return "{ $bp.period }: payment envelope { $cp.category-id } "
+                     ~ "applied moved-out { $cp.moved-out } but the move log "
+                     ~ "says { %out{ $cp.category-id } // 0 }"
+                    unless $cp.moved-out == (%out{ $cp.category-id } // 0);
+            } else {
+                return "{ $bp.period }: ordinary category { $cp.category-id } "
+                     ~ "applied a move directly (in { $cp.moved-in }, "
+                     ~ "out { $cp.moved-out })"
+                    unless $cp.moved-in == 0 && $cp.moved-out == 0;
+            }
+        }
+    }
+    '';
+}
+
+#|( Rule 3's algebra, which the carry chain depends on.
+
+    C<%carries> is the set of category ids on rule 3's carrying rule —
+    the payment envelope always, plus whichever spend categories this
+    seed flagged. It is passed in rather than read off the facts so the
+    property is checked against what the GENERATOR intended, not
+    against what the derivation decided. )
+sub rollover-error($view, %carries --> Str) {
+    for $view.budget-periods -> $bp {
+        for $bp.category-periods -> $cp {
+            return "{ $bp.period }/{ $cp.category-id }: negative overspend "
+                 ~ "({ $cp.credit-overspend }, { $cp.cash-overspend })"
+                if $cp.credit-overspend < 0 || $cp.cash-overspend < 0;
+
+            my Int $expected = $cp.available + $cp.credit-overspend
+                             + $cp.cash-overspend;
+            return "{ $bp.period }/{ $cp.category-id }: carry-out "
+                 ~ "{ $cp.carry-out } != available + overspends ($expected)"
+                unless $cp.carry-out == $expected;
+
+            if %carries{ $cp.category-id } {
+                # Nothing was written off, so nothing may be charged:
+                # cash overspending on a carrying envelope would take
+                # the hole out of Ready to Assign as well as carrying
+                # it forward.
+                return "{ $bp.period }/{ $cp.category-id }: an envelope that "
+                     ~ "carries reported { $cp.cash-overspend } of cash "
+                     ~ 'overspending'
+                    unless $cp.cash-overspend == 0;
+                next;
+            }
+
+            my Int $floor = max(0, $cp.available);
+            return "{ $bp.period }/{ $cp.category-id }: an ordinary category "
+                 ~ "carried { $cp.carry-out } out of an available of "
+                 ~ "{ $cp.available }"
+                unless $cp.carry-out == $floor;
+        }
+    }
+    '';
+}
+
+for SCHEMES -> $entry {
+    my Str $name = $entry.key;
+    my App::Moneymoor::Util::Period $scheme = $entry.value;
+
+    # Derived, never hard-coded: the run has to end on a real start
+    # under the scheme being tested, and it has to be past the last
+    # date the generator can draw (2026-06-28).
+    my Str $through = $scheme.period-of('2026-07-15');
+
+    subtest "under $name (through $through)" => {
+        plan SEEDS.elems;
+
+        for SEEDS -> $seed {
+            subtest "$name, seed $seed" => {
+                plan 4;
+                my &rng = make-rng($seed);
+                my $f = standard-facts();
+
+                # Rule 3's two answers, drawn per seed. The payment
+                # envelope is in the set by kind and always; the two
+                # spend categories join it on a coin flip, so the eight
+                # seeds cover every mix from "both forcing" to "both
+                # carrying". Drawn BEFORE the steps so the whole run of
+                # facts is generated against a fixed population — a flag
+                # that changed mid-run would be testing the flag rather
+                # than the algebra.
+                #
+                # Two draws are discarded first, and that is not
+                # superstition: an LCG's first outputs from a small
+                # seed are weakly mixed, and taking the flags straight
+                # off it put five of the eight seeds on the same
+                # population and none at all on the default one. The
+                # step stream never noticed, because it is forty-five
+                # draws long; a two-draw decision does.
+                rng(1024) for ^2;
+                my %carries = ( (VISA-PAY) => True );
+                my Str @carrying;
+                for SPEND-CATEGORIES -> $id {
+                    next unless rng(2) == 1;
+                    $f.set-carry-overspend($id, True);
+                    %carries{$id} = True;
+                    @carrying.push($id.Str);
+                }
+                my Str $population = @carrying
+                    ?? 'carrying ' ~ @carrying.join(',') !! 'none carrying';
+
+                my Str @invariant-failures;
+                my Str @ledger-failures;
+                my Str @rollover-failures;
+                my Str @determinism-failures;
+
+                for ^STEPS -> $i {
+                    my Str $label = step($f, &rng, $scheme);
+                    my Str $where = "$name seed $seed [$population] "
+                                  ~ "step $i ($label)";
+                    my $view = $f.compute(through-period => $through, :$scheme);
+
+                    my Str $bad = invariant-error($view);
+                    @invariant-failures.push("$where: $bad") if $bad;
+
+                    $bad = move-ledger-error($view);
+                    @ledger-failures.push("$where: $bad") if $bad;
+
+                    $bad = rollover-error($view, %carries);
+                    @rollover-failures.push("$where: $bad") if $bad;
+
+                    my $shuffled = $f.compute-shuffled(
+                        through-period => $through, :$scheme);
+                    @determinism-failures.push(
+                        "$where: reordering the facts changed the budget")
+                        unless $view.canonical-digest eq
+                               $shuffled.canonical-digest;
+                }
+
+                is @invariant-failures.head // '', '',
+                    "$name: the master invariant holds after every operation";
+                is @ledger-failures.head // '', '',
+                    "$name: the move ledger is a consistent double entry "
+                    ~ 'after every operation';
+                is @rollover-failures.head // '', '',
+                    "$name: rule 3's carry algebra holds after every operation";
+                is @determinism-failures.head // '', '',
+                    "$name: recomputation is order-independent after every "
+                    ~ 'operation';
+            };
+        }
+    };
+}
+

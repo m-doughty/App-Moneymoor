@@ -1,0 +1,169 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Budget;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::RegisterRow;
+use App::Moneymoor::Screen::Main::Modals;
+
+# §4.5's arithmetic and its wording, with no store, no database and no
+# terminal in the way.
+#
+# Everything reconcile mode decides is here: what the frame says, what
+# colour it says it in, which transactions a finish promotes, and what
+# the transaction that squares an out-of-balance account looks like.
+# The flow that calls all four is t/80's.
+#
+# Every date is a literal. `balance-adjustment` takes the date as an
+# argument for exactly this reason — the caller reads the clock, the
+# function does not, and so a test can pin it.
+
+plan 7;
+
+my constant DAY = '2026-03-31';
+
+my $theme = App::Moneymoor::Themes::load('gruvbox');
+
+sub balance(Int $cleared, Int $uncleared = 0) {
+    App::Moneymoor::Service::Budget::AccountBalance.new(
+        account-id => 1, :$cleared, :$uncleared);
+}
+
+sub txn(Int $id, Str $cleared, Int $amount = -100) {
+    App::Moneymoor::Model::Transaction.new(
+        :$id, account-id => 1, date => DAY, :$amount, :$cleared);
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the ordinary title is unchanged by the statement variant' => {
+    plan 4;
+    is register-title('Current', balance(90000, 5000)),
+        'Current · cleared £900.00 · working £950.00',
+        'the account, what has cleared and what it is really worth';
+    is register-title('All Accounts', Nil), 'All Accounts',
+        'no balance, no figures — All Accounts sums nothing';
+    is register-title(Str, balance(0)),
+        'Register · cleared £0.00 · working £0.00',
+        'a nameless pane still says what it is';
+    is register-title('Current', balance(90000, 5000), statement => Int),
+        'Current · cleared £900.00 · working £950.00',
+        'and an undefined statement is not reconcile mode';
+};
+
+subtest 'the reconcile title carries the diff, signed' => {
+    plan 5;
+    is register-title('Current', balance(90000, 5000), statement => 91240),
+        'Reconciling · cleared £900.00 · statement £912.40 · diff +£12.40',
+        'the bank has seen money the register has not cleared';
+    is register-title('Current', balance(90000, 5000), statement => 88760),
+        'Reconciling · cleared £900.00 · statement £887.60 · diff -£12.40',
+        'and the other way round, which is a different problem';
+    is register-title('Current', balance(90000, 5000), statement => 90000),
+        'Reconciling · cleared £900.00 · statement £900.00 · diff £0.00',
+        'balanced, and zero takes no sign at all';
+
+    # The working balance goes: reconciling is a comparison between two
+    # numbers, and the third figure has to be the one that closes the
+    # gap rather than one about money the bank has not seen.
+    nok register-title('Current', balance(90000, 5000),
+                       statement => 91240).contains('working'),
+        'the working balance is not in the reconcile title';
+    nok register-title('Current', balance(90000, 5000),
+                       statement => 91240).contains('Current'),
+        'nor is the account name — the mode is what the frame says now';
+};
+
+subtest 'the diff is statement minus cleared' => {
+    plan 5;
+    is reconcile-diff(91240, balance(90000, 500000)), 1240,
+        'uncleared money is not part of it, however much there is';
+    is reconcile-diff(88760, balance(90000)), -1240, 'and it can go under';
+    is reconcile-diff(90000, balance(90000)), 0, 'or land exactly';
+    is reconcile-diff(1240, Nil), 1240,
+        'a view that has not been computed yet is a zero balance';
+    is reconcile-diff(0, balance(-4500)), 4500,
+        'an overdrawn account is not a special case';
+};
+
+subtest 'the frame is green at zero and red anywhere else' => {
+    plan 4;
+    is reconcile-style(0, :$theme).fg, $theme.fg-green,
+        'balanced is the palette\'s green';
+    is reconcile-style(1, :$theme).fg, $theme.fg-red,
+        'a penny out is red';
+    is reconcile-style(-1, :$theme).fg, $theme.fg-red,
+        'and so is a penny the other way';
+
+    # Red rather than amber: the two overspend colours mean "watch
+    # this", and a statement that does not match is not a forecast.
+    isnt reconcile-style(1, :$theme).fg, $theme.fg-amber,
+        'not amber, which §2 spends on credit overspend';
+};
+
+subtest 'a finish promotes the cleared rows and only those' => {
+    plan 5;
+    my @txns = txn(1, 'cleared'), txn(2, 'uncleared'),
+               txn(3, 'reconciled'), txn(4, 'cleared');
+
+    is-deeply promotable-ids(@txns), (1, 4),
+        'the two the user marked cleared';
+    is-deeply promotable-ids(()), (),
+        'an empty account promotes nothing';
+    is-deeply promotable-ids((txn(9, 'uncleared'),)), (),
+        'a row the statement never mentioned is not reconciled by '
+        ~ 'finishing';
+    is-deeply promotable-ids((txn(9, 'reconciled'),)), (),
+        'and one already reconciled is not written again';
+
+    # A cleared state the engine cannot produce is not a cleared state.
+    is-deeply promotable-ids((txn(9, 'CLEARED'),)), (),
+        'the match is exact, not case-folded';
+};
+
+subtest 'the balance adjustment squares the account' => {
+    plan 9;
+    my %in = App::Moneymoor::Screen::Main::Modals::balance-adjustment(
+        account-id => 7, amount => 1240, date => DAY,
+        payee-id => 3, rta-category-id => 5);
+
+    is %in<txn>.account-id, 7, 'it lands on the account being reconciled';
+    is %in<txn>.amount, 1240,
+        'the diff\'s own sign: more on the statement is money arriving';
+    is %in<txn>.date, DAY, 'dated by the caller, not by the clock';
+    is %in<txn>.cleared, 'reconciled',
+        'and born reconciled — it exists because a statement said so';
+    is %in<txn>.payee-id, 3, 'filed under the Balance Adjustment payee';
+    is %in<splits>.elems, 1, 'one split on an on-budget account';
+    is %in<splits>[0].category-id, 5, 'to Ready to Assign';
+    is %in<splits>[0].amount, 1240,
+        'for the whole amount, because splits must sum to it';
+
+    my %out = App::Moneymoor::Screen::Main::Modals::balance-adjustment(
+        account-id => 7, amount => -1240, date => DAY,
+        rta-category-id => 5);
+    is %out<splits>[0].amount, -1240,
+        'an outward adjustment takes it back out of Ready to Assign';
+};
+
+subtest 'a tracking account\'s adjustment carries no envelope' => {
+    plan 3;
+    # Gateway::Transaction refuses a split on a tracking account
+    # outright, and the derivation excludes them by design — so the
+    # shape has to be different, not just filed elsewhere.
+    my %adj = App::Moneymoor::Screen::Main::Modals::balance-adjustment(
+        account-id => 8, amount => 5000, date => DAY,
+        rta-category-id => 5, on-budget => False);
+    is %adj<splits>.elems, 0, 'no splits at all';
+    is %adj<txn>.amount, 5000, 'the transaction itself is unchanged';
+
+    # And an on-budget account with no rta category to file against —
+    # a budget that has somehow lost its system row — still produces a
+    # transaction rather than a broken split.
+    my %none = App::Moneymoor::Screen::Main::Modals::balance-adjustment(
+        account-id => 8, amount => 5000, date => DAY);
+    is %none<splits>.elems, 0,
+        'and no envelope to name means no split to name it with';
+};

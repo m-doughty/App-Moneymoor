@@ -1,0 +1,269 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Util::Period;
+
+# Property suite for the period scheme: soak every scheme shape the app
+# can offer over two centuries of random dates, and after every draw
+# assert the five things the sequence promises.
+#
+#   1. Partition — every date belongs to exactly one period:
+#        start <= date < next(start), and every date inside that half-
+#        open span answers with the same start.
+#   2. Fixpoint — a period's own start is in it: period-of(S) == S.
+#      This is what makes the start usable as the period's identity.
+#   3. Monotonicity — boundaries strictly increase, and the
+#      'YYYY-MM-DD' strings sort as the dates do. The engine compares,
+#      sorts and hashes period keys as text and never parses them.
+#   4. Inverses — prev(next(S)) == S and next(prev(S)) == S. This is
+#      the clamp test: under anchor 31, next('2026-01-31') is
+#      '2026-02-28', and anything that steps from the CLAMPED date
+#      rather than from the anchor comes back to '2026-01-28' and has
+#      drifted for good.
+#   5. periods-through — the inclusive run is contiguous, starts and
+#      ends where it was asked to, and for a weekly scheme has exactly
+#      span / (7 * weeks) + 1 entries.
+#
+# Failures accumulate into arrays and are asserted empty with the first
+# one as the message, so one bad draw names the scheme and the date
+# that produced it rather than just a count.
+
+plan 6;
+
+constant SEEDS = (20260804, 31, 1_000_003, 8675309, 42, 2_147_483_647);
+
+#| Random dates per scheme, per seed.
+constant CASES = 40;
+
+#| How far each case walks the sequence for the monotonicity and
+#| periods-through properties. Long enough that a monthly chain
+#| crosses a February — which is where the clamp lives.
+constant CHAIN = 14;
+
+# A 64-bit LCG rather than `srand` + `rand`: Rakudo's global PRNG
+# cannot be reliably re-seeded mid-process (a second srand with the
+# same seed does not replay the first sequence), and a property suite
+# whose cases change between runs is not a regression test. This is
+# self-contained, portable, and identical on every platform.
+sub make-rng(Int:D $seed) {
+    my Int $state = $seed;
+    -> Int:D $n {
+        $state = ($state * 6364136223846793005 + 1442695040888963407)
+                 +& 0xFFFF_FFFF_FFFF_FFFF;
+        ($state +> 33) % $n;
+    }
+}
+
+# The draw window: 1900-01-01 plus up to 73048 days, which is
+# 2099-12-31. A fixed base rather than `Date.today` for the same reason
+# the PRNG is hand-rolled — a suite whose cases depend on the day it
+# runs is not a regression test, and a budget written in 2027 would
+# otherwise stop exercising the dates a budget written in 2026 did.
+constant BASE-DATE = Date.new(1900, 1, 1);
+constant WINDOW-DAYS = 73_048;
+
+#| Every scheme shape the app can offer, including the three anchors
+#| that need a clamp (29, 30's neighbour 31, and a month-end weekly
+#| anchor) and both a mid-month and a month-end weekly origin.
+sub schemes() {
+    my constant P = App::Moneymoor::Util::Period;
+    (
+        P.monthly(anchor-day => 1),
+        P.monthly(anchor-day => 14),
+        P.monthly(anchor-day => 29),
+        P.monthly(anchor-day => 31),
+        P.weekly(weeks => 1, anchor => '2026-08-14'),
+        P.weekly(weeks => 2, anchor => '2026-08-14'),
+        P.weekly(weeks => 2, anchor => '1985-02-28'),
+        P.weekly(weeks => 4, anchor => '2026-08-14'),
+        P.weekly(weeks => 4, anchor => Date.new(2000, 1, 31)),
+    );
+}
+
+#| A prefix no period key can carry, marking an answer that is not one.
+constant THREW = '!threw: ';
+
+#|( Call one of the scheme's methods and get its answer, or a
+    THREW-marked description of the exception it raised instead.
+
+    A method that dies where a property says it must not is a failure
+    of that property rather than of the harness: the drifted key an
+    anchor-31 bug produces is caught by C<next-period>'s own start
+    check, which is a throw and not a wrong answer. Recording it
+    alongside the wrong answers is what stops the first bad draw taking
+    the seed down before the rest of the matrix has been asked. )
+sub attempt(&code --> Str) {
+    my $answer = try code();
+    return $answer.Str if $answer.defined;
+    THREW ~ ($! // 'died').Str.lines.head;
+}
+
+for SEEDS -> $seed {
+    subtest "seed $seed" => {
+        plan 5;
+        my &rng = make-rng($seed);
+
+        my Str @partition-failures;
+        my Str @fixpoint-failures;
+        my Str @order-failures;
+        my Str @inverse-failures;
+        my Str @range-failures;
+
+        for schemes() -> $p {
+            for ^CASES {
+                my Date $date  = BASE-DATE + rng(WINDOW-DAYS);
+                my Str  $where = "{ $p.gist } at $date";
+
+                my Str $start = attempt({ $p.period-of($date) });
+                if $start.starts-with(THREW) {
+                    @partition-failures.push("$where: period-of $start");
+                    next;
+                }
+                my Str $next = attempt({ $p.next-period($start) });
+                if $next.starts-with(THREW) {
+                    @partition-failures.push(
+                        "$where: next-period($start) $next");
+                    next;
+                }
+                my Date $sd = Date.new($start);
+                my Date $nd = Date.new($next);
+
+                # --- 1. partition ---------------------------------
+                @partition-failures.push(
+                    "$where: period-of gave $start, which the date is "
+                        ~ 'not inside')
+                    unless $sd <= $date < $nd;
+
+                my Int $len = $nd - $sd;
+                @partition-failures.push(
+                    "$where: period $start has a length of $len")
+                    unless $len > 0;
+
+                if $len > 0 {
+                    my Date $inside = $sd + rng($len);
+                    my Str $bucket = attempt({ $p.period-of($inside) });
+                    @partition-failures.push(
+                        "$where: $inside is inside [$start, $next) but "
+                            ~ "buckets to $bucket")
+                        unless $bucket eq $start;
+                    # The day before the start, and the next start
+                    # itself, must be in the neighbouring periods —
+                    # the seam is where an off-by-one hides.
+                    @partition-failures.push(
+                        "$where: the day before $start is in it")
+                        if attempt({ $p.period-of($sd - 1) }) eq $start;
+                    my Str $own = attempt({ $p.period-of($next) });
+                    @partition-failures.push(
+                        "$where: $next buckets to $own, not itself")
+                        unless $own eq $next;
+                }
+
+                # --- 2. fixpoint ----------------------------------
+                my Str $fix = attempt({ $p.period-of($start) });
+                @fixpoint-failures.push(
+                    "$where: period-of($start) gave $fix")
+                    unless $fix eq $start;
+
+                # --- 4. inverses ----------------------------------
+                my Str $back = attempt({ $p.prev-period($next) });
+                @inverse-failures.push(
+                    "$where: prev(next($start)) gave $back")
+                    unless $back eq $start;
+                my Str $prev = attempt({ $p.prev-period($start) });
+                my Str $forward = $prev.starts-with(THREW)
+                    ?? $prev
+                    !! attempt({ $p.next-period($prev) });
+                @inverse-failures.push(
+                    "$where: next(prev($start)) gave $forward")
+                    unless $forward eq $start;
+
+                # --- 3. monotonicity ------------------------------
+                my Str @chain = $start;
+                my Bool $chain-ok = True;
+                for ^(CHAIN - 1) {
+                    my Str $step = attempt({ $p.next-period(@chain[*-1]) });
+                    if $step.starts-with(THREW) {
+                        @order-failures.push(
+                            "$where: stepping on from { @chain[*-1] } $step");
+                        $chain-ok = False;
+                        last;
+                    }
+                    @chain.push($step);
+                }
+                next unless $chain-ok;
+
+                for 1 ..^ @chain.elems -> $i {
+                    my Str $a = @chain[$i - 1];
+                    my Str $b = @chain[$i];
+                    @order-failures.push(
+                        "$where: $a is not before $b as a date")
+                        unless Date.new($a) < Date.new($b);
+                    @order-failures.push(
+                        "$where: $a does not sort before $b as a string")
+                        unless $a lt $b;
+                }
+
+                # Text order and date order must agree for any pair,
+                # not just neighbours: the derivation compares a viewed
+                # key against a through-key with `le`.
+                my Int $i = rng(@chain.elems);
+                my Int $j = rng(@chain.elems);
+                my Str $a = @chain[$i];
+                my Str $b = @chain[$j];
+                @order-failures.push(
+                    "$where: '$a' cmp '$b' as text disagrees with the "
+                        ~ 'dates')
+                    unless ($a cmp $b) == (Date.new($a) cmp Date.new($b));
+
+                # --- 5. periods-through ---------------------------
+                my Str $last = @chain[*-1];
+                my $result = try $p.periods-through($start, $last);
+                without $result {
+                    @range-failures.push(
+                        "$where: periods-through($start, $last) threw: "
+                            ~ ($! // 'died').Str.lines.head);
+                    next;
+                }
+                my @through = $result.List;
+                @range-failures.push(
+                    "$where: periods-through($start, $last) gave "
+                        ~ "{ @through.elems } entries, not { @chain.elems }")
+                    unless @through.elems == @chain.elems;
+                @range-failures.push(
+                    "$where: periods-through($start, $last) is not the "
+                        ~ 'sequence itself')
+                    unless @through.List eqv @chain.List;
+                @range-failures.push(
+                    "$where: periods-through($start, $last) starts at "
+                        ~ "{ @through[0] } and ends at { @through[*-1] }")
+                    unless @through[0] eq $start && @through[*-1] eq $last;
+                for 1 ..^ @through.elems -> $k {
+                    @range-failures.push(
+                        "$where: periods-through has a gap between "
+                            ~ "{ @through[$k - 1] } and { @through[$k] }")
+                        unless attempt({ $p.next-period(@through[$k - 1]) })
+                            eq @through[$k];
+                }
+                if $p.type eq 'weekly' {
+                    my Int $span = Date.new($last) - Date.new($start);
+                    my Int $want = $span div (7 * $p.weeks) + 1;
+                    @range-failures.push(
+                        "$where: a { $span }-day weekly run gave "
+                            ~ "{ @through.elems } periods, not $want")
+                        unless @through.elems == $want;
+                }
+            }
+        }
+
+        is @partition-failures.head // '', '',
+            'every date is in exactly one period';
+        is @fixpoint-failures.head // '', '',
+            "a period's own start buckets to itself";
+        is @order-failures.head // '', '',
+            'boundaries increase, and text order is date order';
+        is @inverse-failures.head // '', '',
+            'next and prev invert each other, clamps included';
+        is @range-failures.head // '', '',
+            'periods-through is the contiguous run it was asked for';
+    };
+}

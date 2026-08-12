@@ -1,0 +1,386 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Util::Period;
+
+# The period scheme, case by case. Every expectation here is written
+# out by hand rather than derived, because the whole point of the
+# module is that the sequence is the one a human with a payday would
+# write down.
+#
+# The claim that `monthly/1` is EXACTLY the calendar-month behaviour
+# the app already had used to be checked against the UI's `month-label`
+# directly. That cross-check is gone with the engine's re-key to
+# periods — `month-label` takes a 'YYYY-MM' string, which is no longer
+# a key anything in the engine produces, and the label it computes is
+# the one `Period.label` now owns. What stands in its place is the
+# incumbent's ALGORITHM, written out here as a table: the same twelve
+# English month names, the same four-digit year, the same separator.
+
+plan 13;
+
+my constant P = App::Moneymoor::Util::Period;
+
+subtest 'monthly/1 is the calendar month' => {
+    plan 10;
+    my $p = P.default-scheme;
+
+    is $p.type, 'monthly', 'the default scheme is monthly';
+    is $p.anchor-day, 1, 'anchored on the 1st';
+
+    is $p.period-of('2026-08-01'), '2026-08-01', 'the 1st starts its month';
+    is $p.period-of('2026-08-19'), '2026-08-01', 'a mid-month date';
+    is $p.period-of('2026-08-31'), '2026-08-01', 'the last day of a long month';
+    is $p.period-of('2026-02-28'), '2026-02-01', 'the last day of February';
+
+    is $p.next-period('2026-12-01'), '2027-01-01',
+        'next crosses the year end';
+    is $p.prev-period('2027-01-01'), '2026-12-01',
+        'and prev comes back over it';
+
+    is-deeply $p.periods-through('2026-11-01', '2027-02-01').List,
+        <2026-11-01 2026-12-01 2027-01-01 2027-02-01>.List,
+        'periods-through spans a year boundary';
+
+    is-deeply $p.periods-through('2026-08-01', '2026-08-01').List,
+        <2026-08-01>.List,
+        'a single-period range is the period itself';
+};
+
+subtest 'monthly/1 labels are the labels the app already showed' => {
+    plan 15;
+    my $p = P.default-scheme;
+
+    is $p.label('2026-08-01'), 'August 2026', 'August 2026';
+    is $p.label('2027-01-01'), 'January 2027', 'January 2027';
+    is $p.label('2026-12-01'), 'December 2026', 'December 2026';
+
+    # Written the long way round: the incumbent `month-label` composed
+    # "<English month name> <four-digit year>" from a table of the
+    # twelve names, and `monthly/1` is only a no-op change if it agrees
+    # with that for every month of a year.
+    my @names = <January February March April May June
+                 July August September October November December>;
+    for 1 .. 12 -> $m {
+        my Str $period = sprintf('2026-%02d-01', $m);
+        is $p.label($period), "{ @names[$m - 1] } 2026",
+            "$period agrees with the label the app already showed";
+    }
+};
+
+subtest 'monthly/31 clamps short months and never drifts' => {
+    plan 5;
+    my $p = P.monthly(anchor-day => 31);
+
+    # 2026 is not a leap year: February clamps to the 28th, and March
+    # goes straight back to the 31st. Stepping from the clamped date
+    # by days or by `.later(:1month)` would give 2026-03-28 and keep
+    # the drift for the rest of the year.
+    my Str @forward;
+    my Str $cursor = '2025-12-31';
+    for ^7 { @forward.push($cursor); $cursor = $p.next-period($cursor) }
+    is-deeply @forward.List,
+        <2025-12-31 2026-01-31 2026-02-28 2026-03-31 2026-04-30
+         2026-05-31 2026-06-30>.List,
+        'forward across a non-leap February';
+
+    my Str @back;
+    $cursor = '2026-06-30';
+    for ^7 { @back.push($cursor); $cursor = $p.prev-period($cursor) }
+    is-deeply @back.List,
+        <2026-06-30 2026-05-31 2026-04-30 2026-03-31 2026-02-28
+         2026-01-31 2025-12-31>.List,
+        'and backward, recovering the same clamped chain';
+
+    is-deeply $p.periods-through('2027-12-31', '2028-04-30').List,
+        <2027-12-31 2028-01-31 2028-02-29 2028-03-31 2028-04-30>.List,
+        'a leap February clamps to the 29th';
+
+    is $p.next-period('2028-01-31'), '2028-02-29', 'leap: next is the 29th';
+    is $p.prev-period('2028-03-31'), '2028-02-29', 'leap: and prev is too';
+};
+
+subtest 'monthly/29 and monthly/30 across February' => {
+    plan 8;
+    my $p29 = P.monthly(anchor-day => 29);
+    my $p30 = P.monthly(anchor-day => 30);
+
+    is-deeply $p29.periods-through('2026-01-29', '2026-04-29').List,
+        <2026-01-29 2026-02-28 2026-03-29 2026-04-29>.List,
+        'the 29th clamps to the 28th in a non-leap February';
+    is-deeply $p29.periods-through('2028-01-29', '2028-03-29').List,
+        <2028-01-29 2028-02-29 2028-03-29>.List,
+        'and needs no clamp in a leap one';
+    is-deeply $p30.periods-through('2026-01-30', '2026-04-30').List,
+        <2026-01-30 2026-02-28 2026-03-30 2026-04-30>.List,
+        'the 30th clamps too, and recovers in March';
+
+    # The clamped date is a real period start under that scheme, not a
+    # near-miss: everything downstream keys on it.
+    is $p29.period-of('2026-02-28'), '2026-02-28',
+        "the clamped day IS the period's start";
+    is $p29.period-of('2026-03-01'), '2026-02-28',
+        'and the days after it are still in that period';
+    is $p29.period-of('2026-03-28'), '2026-02-28',
+        'right up to the day before the next anchor';
+    is $p29.period-of('2026-03-29'), '2026-03-29',
+        'where the next one starts';
+    is $p29.period-of('2026-02-27'), '2026-01-29',
+        'the day before the clamped start belongs to January';
+};
+
+subtest 'the anchor day belongs to the period it starts' => {
+    plan 8;
+    my $p = P.monthly(anchor-day => 14);
+
+    is $p.type, 'monthly', 'monthly';
+    is $p.anchor-day, 14, 'anchored on the 14th';
+
+    is $p.period-of('2026-08-14'), '2026-08-14',
+        'payday itself opens the new period';
+    is $p.period-of('2026-08-13'), '2026-07-14',
+        'and the day before closes the old one';
+    is $p.period-of('2026-08-15'), '2026-08-14', 'the day after';
+    is $p.period-of('2026-09-13'), '2026-08-14', 'the last day of it';
+
+    is $p.next-period('2026-08-14'), '2026-09-14', 'next payday';
+    is $p.prev-period('2026-08-14'), '2026-07-14', 'the one before';
+};
+
+subtest 'weekly schemes' => {
+    plan 14;
+    my $w1 = P.weekly(weeks => 1, anchor => '2026-08-14');
+    my $w2 = P.weekly(weeks => 2, anchor => '2026-08-14');
+    my $w4 = P.weekly(weeks => 4, anchor => Date.new(2000, 1, 31));
+
+    is $w2.type, 'weekly', 'weekly';
+    is $w2.weeks, 2, 'every two weeks';
+    is $w2.anchor, Date.new(2026, 8, 14), 'from the first payday';
+
+    is-deeply $w1.periods-through('2026-08-14', '2026-09-11').List,
+        <2026-08-14 2026-08-21 2026-08-28 2026-09-04 2026-09-11>.List,
+        'weekly: five consecutive Fridays';
+    is-deeply $w2.periods-through('2026-08-14', '2026-10-09').List,
+        <2026-08-14 2026-08-28 2026-09-11 2026-09-25 2026-10-09>.List,
+        'fortnightly';
+    is-deeply $w4.periods-through('2000-01-31', '2000-05-22').List,
+        <2000-01-31 2000-02-28 2000-03-27 2000-04-24 2000-05-22>.List,
+        'four-weekly, from a month-end anchor, ignores months entirely';
+
+    is $w2.period-of('2026-08-14'), '2026-08-14', 'the anchor is a start';
+    is $w2.period-of('2026-08-27'), '2026-08-14', 'the last day of it';
+    is $w2.period-of('2026-08-28'), '2026-08-28', 'the next start';
+
+    # Negative k. A budget whose owner sets their scheme up today and
+    # then imports two years of statements must not fall off the front
+    # of the sequence.
+    is $w2.period-of('2026-08-13'), '2026-07-31',
+        'the day before the anchor is in the period that ends on it';
+    is $w1.period-of('2020-01-01'), '2019-12-27',
+        'weekly, six years before the anchor';
+    is $w2.period-of('1999-12-25'), '1999-12-24',
+        'fortnightly, twenty-six years before the anchor';
+    is $w4.period-of('1980-06-15'), '1980-05-19',
+        'four-weekly, twenty years before the anchor';
+    is $w4.period-of('2026-08-14'), '2026-08-10',
+        'and twenty-six years after it';
+};
+
+subtest 'labels' => {
+    plan 9;
+
+    is P.monthly(anchor-day => 14).label('2026-08-14'),
+        '14 Aug – 13 Sep 2026',
+        'a monthly range names both months and the shared year';
+    is P.monthly(anchor-day => 14).label('2026-12-14'),
+        '14 Dec 2026 – 13 Jan 2027',
+        'and both years when it crosses one';
+    is P.weekly(weeks => 2, anchor => '2026-08-14').label('2026-08-14'),
+        '14 – 27 Aug 2026',
+        'a range inside one month names the month once';
+    is P.monthly(anchor-day => 31).label('2026-02-28'),
+        '28 Feb – 30 Mar 2026',
+        "a clamped period's label ends the day before the next start";
+    is P.weekly(weeks => 4, anchor => Date.new(2000, 1, 31)).label('2000-01-31'),
+        '31 Jan – 27 Feb 2000',
+        'four-weekly';
+    is P.weekly(weeks => 2, anchor => '2026-08-14').label('2026-12-18'),
+        '18 – 31 Dec 2026',
+        'the last fortnight of a year';
+
+    # Never throws: the label is composed inside a store selector.
+    my $p = P.default-scheme;
+    is $p.label(''), '', 'the empty string labels as nothing';
+    is $p.label('not a date'), '', 'and so does garbage';
+    is $p.label('2026-08-15'), '',
+        'and so does a real date that is not a period start';
+};
+
+subtest 'describe names the scheme, not a period' => {
+    plan 17;
+    # `label` names one window; `describe` names the rule that cuts
+    # them. The Settings line, the picker's preselect and the toast
+    # that confirms a change all want the second one.
+    is P.default-scheme.describe, 'Calendar month',
+        'the default is named as what it is, not as "monthly from the 1st"';
+    is P.monthly(anchor-day => 1).describe, 'Calendar month',
+        'and so is the same scheme built the long way round';
+
+    # The ordinal suffix is the real English rule, teens included: an
+    # anchor day is a number the user typed, and "the 11st" would read
+    # as a bug in everything around it.
+    is P.monthly(anchor-day => 2).describe,  'Monthly from the 2nd',  '2nd';
+    is P.monthly(anchor-day => 3).describe,  'Monthly from the 3rd',  '3rd';
+    is P.monthly(anchor-day => 4).describe,  'Monthly from the 4th',  '4th';
+    is P.monthly(anchor-day => 11).describe, 'Monthly from the 11th', '11th';
+    is P.monthly(anchor-day => 12).describe, 'Monthly from the 12th', '12th';
+    is P.monthly(anchor-day => 13).describe, 'Monthly from the 13th', '13th';
+    is P.monthly(anchor-day => 14).describe, 'Monthly from the 14th', '14th';
+    is P.monthly(anchor-day => 21).describe, 'Monthly from the 21st', '21st';
+    is P.monthly(anchor-day => 22).describe, 'Monthly from the 22nd', '22nd';
+    is P.monthly(anchor-day => 23).describe, 'Monthly from the 23rd', '23rd';
+    is P.monthly(anchor-day => 31).describe, 'Monthly from the 31st', '31st';
+
+    # The weekly form carries its origin, in `label`'s date style: the
+    # two strings sit inches apart in the Settings dialog.
+    is P.weekly(weeks => 1, anchor => '2026-08-14').describe,
+        'Every week from 14 Aug 2026',
+        'one week drops the count rather than saying "every 1 weeks"';
+    is P.weekly(weeks => 2, anchor => '2026-08-14').describe,
+        'Every 2 weeks from 14 Aug 2026', 'a fortnight';
+    is P.weekly(weeks => 4, anchor => Date.new(2026, 8, 4)).describe,
+        'Every 4 weeks from 4 Aug 2026',
+        'four weeks, with the day unpadded like every other label';
+    is P.weekly(weeks => 4, anchor => '2027-01-01').describe,
+        'Every 4 weeks from 1 Jan 2027',
+        'and the year written out, because the anchor may be years back';
+};
+
+subtest 'the constructors refuse a scheme that is not one' => {
+    plan 9;
+    dies-ok { P.monthly(anchor-day => 0) },  'anchor-day 0';
+    dies-ok { P.monthly(anchor-day => 32) }, 'anchor-day 32';
+    dies-ok { P.monthly(anchor-day => -1) }, 'a negative anchor-day';
+    dies-ok { P.weekly(weeks => 0, anchor => '2026-08-14') }, 'weeks 0';
+    dies-ok { P.weekly(weeks => -2, anchor => '2026-08-14') },
+        'negative weeks';
+    dies-ok { P.weekly(weeks => 2, anchor => '2026-02-30') },
+        'an anchor that is not a date';
+    dies-ok { P.weekly(weeks => 2, anchor => '2026-8-14') },
+        'an anchor that is not written the one way';
+    dies-ok { P.weekly(weeks => 2, anchor => Str) }, 'a missing anchor';
+    dies-ok { P.new },
+        '.new — there is no shape of Period that is not a scheme';
+};
+
+subtest 'to-hash / from-hash' => {
+    plan 15;
+    my $monthly = P.monthly(anchor-day => 14);
+    my $weekly  = P.weekly(weeks => 4, anchor => '2026-08-14');
+
+    is-deeply $monthly.to-hash,
+        { type => 'monthly', anchor_day => 14 },
+        'the monthly shape, in the keys the budget file stores';
+    is-deeply $weekly.to-hash,
+        { type => 'weekly', weeks => 4, anchor => '2026-08-14' },
+        'and the weekly one, with the anchor as a string';
+
+    my $m2 = P.from-hash($monthly.to-hash);
+    is $m2.type, 'monthly', 'monthly round-trips: type';
+    is $m2.anchor-day, 14, 'monthly round-trips: anchor-day';
+    is-deeply $m2.to-hash, $monthly.to-hash, 'and back to the same hash';
+
+    my $w2 = P.from-hash($weekly.to-hash);
+    is $w2.type, 'weekly', 'weekly round-trips: type';
+    is $w2.weeks, 4, 'weekly round-trips: weeks';
+    is $w2.anchor, Date.new(2026, 8, 14), 'weekly round-trips: anchor';
+    is-deeply $w2.to-hash, $weekly.to-hash, 'and back to the same hash';
+
+    # A JSON round-trip through a text column is entitled to stringify
+    # a number.
+    is P.from-hash({ type => 'monthly', anchor_day => '14' }).anchor-day, 14,
+        'a stringified anchor_day is read as a number';
+    is P.from-hash(
+        { type => 'weekly', weeks => '2', anchor => '2026-08-14' }).weeks, 2,
+        'a stringified weeks too';
+
+    # A key from a later version must not stop the file opening.
+    is P.from-hash(
+        { type => 'monthly', anchor_day => 3, future_field => 'x' }
+    ).anchor-day, 3, 'an unknown key is ignored';
+
+    is P.default-scheme.to-hash, { type => 'monthly', anchor_day => 1 },
+        'the default scheme serialises as monthly/1';
+    is P.from-hash(P.default-scheme.to-hash).anchor-day, 1,
+        'and reads back as it';
+    is P.default-scheme.period-of('2026-08-19'), '2026-08-01',
+        'which is the calendar month';
+};
+
+subtest 'from-hash refuses what it cannot honour' => {
+    plan 11;
+    dies-ok { P.from-hash({ type => 'fortnightly' }) }, 'an unknown type';
+    dies-ok { P.from-hash({ anchor_day => 14 }) },      'no type at all';
+    dies-ok { P.from-hash({ type => 42 }) },  'a type that is not a string';
+    dies-ok { P.from-hash({ type => 'monthly' }) },
+        'monthly with no anchor_day';
+    dies-ok { P.from-hash({ type => 'monthly', anchor_day => 0 }) },
+        'monthly with an out-of-range anchor_day';
+    dies-ok { P.from-hash({ type => 'monthly', anchor_day => 'the 14th' }) },
+        'monthly with an unreadable anchor_day';
+    dies-ok { P.from-hash({ type => 'monthly', anchor_day => True }) },
+        'monthly with a Bool anchor_day (True ~~ Int is True in Raku)';
+    dies-ok { P.from-hash({ type => 'weekly', anchor => '2026-08-14' }) },
+        'weekly with no weeks';
+    dies-ok { P.from-hash({ type => 'weekly', weeks => 2 }) },
+        'weekly with no anchor';
+    dies-ok {
+        P.from-hash({ type => 'weekly', weeks => 2, anchor => '14/08/2026' })
+    }, 'weekly with a malformed anchor';
+    dies-ok { P.from-hash('monthly') }, 'a scheme that is not a hash at all';
+};
+
+subtest 'navigation refuses a key that is not a period start' => {
+    plan 12;
+    my $p = P.monthly(anchor-day => 14);
+    my $w = P.weekly(weeks => 2, anchor => '2026-08-14');
+
+    dies-ok { $p.next-period('2026-08-15') },
+        'next-period of a date inside a period';
+    dies-ok { $p.prev-period('2026-08-15') },
+        'prev-period of a date inside a period';
+    dies-ok { $p.next-period('2026-08') },
+        "next-period of a 'YYYY-MM' month that never got migrated";
+    dies-ok { $p.next-period('') }, 'next-period of the empty string';
+    dies-ok { $w.next-period('2026-08-15') },
+        'weekly: next-period of a date inside a period';
+    dies-ok { $w.prev-period('2026-08-21') },
+        'weekly: a start of the wrong scheme (weeks => 1)';
+
+    dies-ok { $p.periods-through('2026-08-15', '2026-10-14') },
+        'periods-through from a non-start';
+    dies-ok { $p.periods-through('2026-08-14', '2026-10-15') },
+        'periods-through to a non-start';
+    dies-ok { $p.periods-through('2026-10-14', '2026-08-14') },
+        'periods-through with the ends the wrong way round';
+
+    dies-ok { $p.period-of('2026-13-01') }, 'period-of a month that is not one';
+    dies-ok { $p.period-of('2026-02-30') }, 'period-of a day that is not one';
+    dies-ok { $p.period-of('yesterday') },  'period-of a word';
+};
+
+subtest 'period-of takes a Date or a string' => {
+    plan 6;
+    my $p = P.monthly(anchor-day => 14);
+    my $w = P.weekly(weeks => 2, anchor => Date.new(2026, 8, 14));
+
+    is $p.period-of(Date.new(2026, 8, 19)), '2026-08-14', 'monthly: a Date';
+    is $p.period-of('2026-08-19'), '2026-08-14', 'monthly: the same string';
+    is $w.period-of(Date.new(2026, 8, 19)), '2026-08-14', 'weekly: a Date';
+    is $w.period-of('2026-08-19'), '2026-08-14', 'weekly: the same string';
+
+    # The anchor may be given either way and means the same thing.
+    is-deeply P.weekly(weeks => 2, anchor => '2026-08-14').to-hash,
+        $w.to-hash, 'a string anchor and a Date anchor build one scheme';
+    is $w.anchor.WHAT.^name, 'Date', 'and the accessor gives back a Date';
+};

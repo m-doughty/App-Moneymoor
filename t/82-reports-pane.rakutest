@@ -1,0 +1,443 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::BarChart;
+use Selkie::Widget::Border;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::EmptyState;
+use App::Moneymoor::View::ReportRow;
+use App::Moneymoor::Screen::Reports;
+
+# The reports tab, mounted and driven through a store, with no
+# terminal — t/76's treatment for §4.6.
+#
+# t/81 proves the figures; this proves the tab plugs them into a
+# BarChart and a RichText and keeps them in step with the period, the
+# aggregation toggle and the pane's own height.
+#
+# Screen::Main cannot be constructed without a notcurses App, so the
+# tab is given a stand-in that answers the same accessors — which is
+# also the point: the tab reaches Main through a documented handful of
+# methods, and t/83 checks that list against the real Screen::Main.
+
+plan 10;
+
+my constant PERIOD = '2026-03-01';
+my constant APRIL  = '2026-04-01';
+my constant QUIET  = '2026-02-01';
+my constant CROWD  = '2026-05-01';
+
+my $db-path = $*TMPDIR.add("moneymoor-reports-pane-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash', sort-order => 1));
+my $savings = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Savings', type => 'cash', sort-order => 2));
+my $house = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'House', type => 'tracking', sort-order => 3));
+
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $fun = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Fun Money',
+                                             sort-order => 2));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+my $water = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Water', group-id => $bills.id, sort-order => 2));
+my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Dining Out', group-id => $fun.id, sort-order => 3));
+my $rta = $ws.categories.rta-category;
+
+sub spend(Str:D $date, Int:D $amount, $category, :$account = $current) {
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $account.id, :$date, amount => -$amount),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $category.id, amount => -$amount)],
+    );
+}
+
+# March: £2,000 in, £42.10 of groceries, £18.00 of water, £22.00 out
+# to dinner, and a £500 sweep to savings that is not cash flow at all.
+$ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => '2026-03-01', amount => 200000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 200000)],
+);
+spend('2026-03-04', 4210, $groceries);
+spend('2026-03-06', 1800, $water);
+spend('2026-03-09', 2200, $dining);
+$ws.transactions.create-transfer(
+    from-account-id => $current.id, to-account-id => $savings.id,
+    date => '2026-03-10', amount => 50000, memo => 'sweep');
+
+# April: one spend, so period navigation has somewhere to go.
+spend('2026-04-03', 9900, $dining);
+
+# May: more envelopes than a short pane can draw.
+my @crowd = (1 .. 14).map(-> $i {
+    my $c = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => "Crowd $i", group-id => $fun.id, sort-order => 100 + $i));
+    spend('2026-05-0' ~ (($i % 9) + 1), 100 * $i, $c);
+    $c;
+});
+
+# --- The stand-in screen ----------------------------------------------
+
+my class FakeApp {
+    has @.toasts;
+    method toast(Str $m) { @!toasts.push($m) }
+}
+
+#| Exactly the surface App::Moneymoor::Screen::Reports reaches through.
+my class FakeMain {
+    has $.app is required;
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.view is rw;
+    has %.categories-by-id;
+    has %.groups-by-id;
+    has %.accounts-by-id;
+    has @.mounted;
+
+    method icons() { icons() }
+    method categories(--> List) { %!categories-by-id.values.List }
+    method groups(--> List)     { %!groups-by-id.values.List     }
+    method accounts(--> List)   { %!accounts-by-id.values.List   }
+
+    method viewed-period(--> Str) {
+        ($!store.get-in('app', 'period') // $!workspace.current-period).Str;
+    }
+
+    method set-view($view --> Nil) {
+        $!view = $view;
+        %!categories-by-id = $!workspace.categories.find-all(:include-hidden)
+                                 .map({ .id => $_ }).Hash;
+        %!groups-by-id = $!workspace.categories.find-groups(:include-hidden)
+                             .map({ .id => $_ }).Hash;
+        %!accounts-by-id = $!workspace.accounts.find-all(:include-closed)
+                               .map({ .id => $_ }).Hash;
+        Nil
+    }
+
+    method pane-border(Str:D $title, $sizing --> Selkie::Widget::Border) {
+        Selkie::Widget::Border.new(:$sizing, :$title, padding => 1);
+    }
+
+    method mount-pane($parent, Selkie::Widget::Border $border,
+                      $pane, Str:D $context --> Nil) {
+        $border.set-content($pane);
+        $parent.add($border);
+        $border.set-store($!store);
+        @!mounted.push($pane => $context);
+        Nil
+    }
+}
+
+sub mounted-tab(Str :$period = PERIOD --> Hash) {
+    my $host  = Selkie::Layout::VBox.new(sizing => Sizing.flex);
+    my $store = mock-store;
+    my $app   = FakeApp.new;
+    my $main  = FakeMain.new(
+        :$app, :$store, workspace => $ws,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws, on-view => -> $v { $main.set-view($v) },
+    ).register($store);
+    $host.set-store($store);
+
+    my $tab = App::Moneymoor::Screen::Reports.new(main => $main);
+    $tab.build($host);
+    $tab.install-subscriptions;
+    $tab.install-keybinds;
+
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', :$period);
+    { :$tab, :$main, :$store, :$app, :$host };
+}
+
+sub labels-of($tab --> List) { $tab.chart.data.map({ $_<label> }).List }
+sub strip-of($tab --> Str)   { $tab.summary.spans.map(*.text).join }
+sub chart-frame($tab)        { $tab.chart.parent }
+sub summary-frame($tab)      { $tab.summary.parent }
+
+#| Give the tab a terminal to be laid out in. Nothing here has a
+#| notcurses plane, so the widths are set the way a layout pass would
+#| set them: on the host, which is the box the panes take their width
+#| from, and which outlives every tab switch in the real shell.
+sub lay-out(%m, Int $cols, Int $rows = 30 --> Nil) {
+    %m<host>.handle-resize($rows, $cols);
+    Nil
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the tab mounts a strip and a chart' => {
+    plan 7;
+    my %m = mounted-tab();
+
+    is %m<host>.children.elems, 2, 'two panes, stacked';
+    is %m<host>.children[0].sizing.value, SUMMARY-ROWS,
+        'the summary is four rows, frame included';
+
+    # Only one of them is a pane in the hint-context sense: the strip
+    # is a caption, and making it focusable would put a Tab stop on
+    # something with nothing to do.
+    is %m<main>.mounted.elems, 1, 'one focusable pane';
+    is %m<main>.mounted[0].value, 'reports',
+        'registered under the reports hint context';
+    ok %m<main>.mounted[0].key === %m<tab>.chart, 'and it is the chart';
+    ok %m<tab>.chart.focusable,
+        'which is focusable, or `b` would be unreachable';
+    is %m<tab>.chart.orientation, 'horizontal',
+        'horizontal bars, as §4.6 draws them';
+};
+
+subtest 'the first tick charts the period' => {
+    plan 6;
+    my %m = mounted-tab();
+
+    is-deeply labels-of(%m<tab>),
+        ('£42.10  Groceries', '£22.00  Dining Out', '£18.00  Water'),
+        'one bar per envelope that spent, biggest first, figure first';
+    is %m<tab>.chart.data[0]<value>, 42.1,
+        'valued in pounds, so the axis reads as money';
+    is chart-frame(%m<tab>).title, 'Spending by category',
+        'under §4.6\'s title';
+    is chart-frame(%m<tab>).bottom-title, '',
+        'and no "more" caption, because nothing was cut';
+
+    is strip-of(%m<tab>),
+        'Inflow £2,000.00 · Outflow £82.10 · Net £1,917.90   '
+        ~ 'Assigned £0.00 · Spent £82.10',
+        'the strip adds up the same period';
+    is %m<tab>.summary.parent.title, 'March 2026 summary',
+        'named for the period it is about';
+};
+
+subtest 'an internal transfer is not in the strip' => {
+    plan 2;
+    my %m = mounted-tab();
+    # £500 moved from Current to Savings on the 10th. Both are
+    # on-budget, so counting the pair would put £500 in each column
+    # while nothing entered or left the budget.
+    ok strip-of(%m<tab>).contains('Inflow £2,000.00'),
+        'the sweep did not inflate inflow';
+    ok strip-of(%m<tab>).contains('Outflow £82.10'),
+        'nor outflow';
+};
+
+subtest 'b toggles the aggregation and repaints' => {
+    plan 6;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    ok press-key(%m<tab>.chart, 'b'), 'the chart consumed the key';
+    $store.tick;
+
+    ok state-at($store, 'reports', 'by-group'),
+        'the toggle went through the store, not a direct call';
+    is-deeply labels-of(%m<tab>),
+        ('£60.10  Monthly Bills', '£22.00  Fun Money'),
+        'groceries and water are added up under their group';
+    is chart-frame(%m<tab>).title, 'Spending by group',
+        'and the frame says which way it is pointing';
+    ok %m<app>.toasts.tail.contains('group'), 'with a toast to match';
+
+    press-key(%m<tab>.chart, 'b');
+    $store.tick;
+    is-deeply labels-of(%m<tab>),
+        ('£42.10  Groceries', '£22.00  Dining Out', '£18.00  Water'),
+        'and it toggles back';
+};
+
+subtest 'period navigation repaints both panes' => {
+    plan 4;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    dispatch-and-tick($store, 'app/period-next');
+    is-deeply labels-of(%m<tab>), ('£99.00  Dining Out',),
+        'April has its own spending';
+    is %m<tab>.summary.parent.title, 'April 2026 summary',
+        'and the strip is renamed with it';
+    ok strip-of(%m<tab>).contains('Spent £99.00'),
+        'the spent figure is the sum of exactly what is charted';
+
+    dispatch-and-tick($store, 'app/period-prev');
+    is-deeply labels-of(%m<tab>),
+        ('£42.10  Groceries', '£22.00  Dining Out', '£18.00  Water'),
+        'and back again';
+};
+
+subtest 'a period with no spending shows the empty state' => {
+    plan 4;
+    my %m = mounted-tab(period => QUIET);
+
+    is %m<tab>.chart.data.elems, 0, 'no bars at all';
+    is %m<tab>.chart.empty-message, empty-state-for('reports').head,
+        'and the chart says the app\'s own words instead';
+    is %m<tab>.rows.elems, 0, 'nothing behind them either';
+    ok strip-of(%m<tab>).contains('Spent £0.00'),
+        'while the strip still adds up to nothing, rather than blank';
+};
+
+subtest 'more envelopes than rows are cut, and counted' => {
+    plan 5;
+    my %m = mounted-tab(period => CROWD);
+    my $tab = %m<tab>;
+
+    is $tab.rows.elems, 14, 'fourteen envelopes spent in May';
+    # A widget with no plane reports zero rows, so the tab falls back
+    # to a full-screen terminal's worth rather than charting nothing.
+    is $tab.chart.data.elems, CHART-FALLBACK-ROWS,
+        'and the chart holds as many as it believes it has room for';
+    is $tab.hidden-count, 14 - CHART-FALLBACK-ROWS, 'the rest are counted';
+    is chart-frame($tab).bottom-title, '+2 more…',
+        'and named in the pane\'s bottom title, where they cost no row';
+
+    # The two that fell off are the two smallest — which is what makes
+    # the cut defensible.
+    nok labels-of($tab).grep({ .contains('Crowd 1 ') || .contains('Crowd 2 ') })
+        .elems, 'the smallest spends are the ones dropped';
+};
+
+subtest 'a resize that changes the cut repaints, and one that does not, does not'
+        => {
+    plan 3;
+    my %m = mounted-tab(period => CROWD);
+    my $tab = %m<tab>;
+
+    # No plane, so the chart's own height never moves and the fallback
+    # is what both calls see: the resize has to be a no-op rather than
+    # a repaint per resize event.
+    my $before = $tab.chart.data;
+    $tab.handle-resize(40, 120);
+    ok $tab.chart.data === $before,
+        'a resize that leaves the cut alone touches nothing';
+
+    # Forcing the cut through the public repaint proves the other half:
+    # the caption and the bar count move together.
+    dispatch-and-tick(%m<store>, 'reports/toggle-by-group');
+    is $tab.chart.data.elems, 1, 'grouped, everything is one bar';
+    is chart-frame($tab).bottom-title, '',
+        'and the caption goes with the cut';
+};
+
+subtest 'the summary box is as deep as the strip, and no deeper' => {
+    plan 8;
+    my %m = mounted-tab();
+    my $tab = %m<tab>;
+
+    # Nothing has been laid out, so nothing has a width: the pane keeps
+    # the four rows it was built with rather than guessing short and
+    # cutting the strip on the frame the tab is mounted.
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS,
+        'an unmeasured pane keeps the height it was built with';
+
+    # A terminal wide enough for the strip. The pane's frame takes two
+    # cells and its side padding another two, so a 100-column tab
+    # measures 96 — and the strip is nowhere near that.
+    my Str $strip = strip-of($tab);
+    lay-out(%m, 100);
+    dispatch-and-tick(%m<store>, 'app/period-next');
+    dispatch-and-tick(%m<store>, 'app/period-prev');
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS-MIN,
+        'a repaint at a width that fits takes the spare row back';
+    is strip-of($tab), $strip,
+        'and the strip it is holding is untouched by the resize';
+
+    # The boundary, through the real widget stack: four cells of chrome
+    # plus the strip is exactly enough, and one cell less is not.
+    lay-out(%m, $strip.chars + 4);
+    $tab.handle-resize(30, $strip.chars + 4);
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS-MIN,
+        'a box the strip fits exactly stays at three rows';
+
+    lay-out(%m, $strip.chars + 3);
+    $tab.handle-resize(30, $strip.chars + 3);
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS,
+        'and one cell narrower buys the row the wrap needs';
+
+    lay-out(%m, 40);
+    dispatch-and-tick(%m<store>, 'app/period-next');
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS,
+        'as does a narrow terminal on the repaint path';
+
+    # Once the pane has been through a layout pass it has a width of
+    # its own, and that is the one that counts — the host's is only the
+    # stand-in for the frames before the first one.
+    dispatch-and-tick(%m<store>, 'app/period-prev');
+    lay-out(%m, 100);
+    $tab.handle-resize(30, 100);
+    summary-frame($tab).handle-resize(SUMMARY-ROWS, 40);
+    $tab.handle-resize(30, 100);
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS,
+        'a pane narrower than its host is measured on its own width';
+
+    summary-frame($tab).handle-resize(SUMMARY-ROWS, 100);
+    $tab.handle-resize(30, 100);
+    is summary-frame($tab).sizing.value, SUMMARY-ROWS-MIN,
+        'and it hands the row back when its own width fits the strip';
+};
+
+subtest 'a resize re-checks the strip and the cut independently' => {
+    plan 5;
+    my %m = mounted-tab(period => CROWD);
+    my $tab = %m<tab>;
+    my $box = summary-frame($tab);
+
+    # A width-only change. The chart has no plane, so the number of
+    # bars that fit cannot move — which is exactly the case the old
+    # early return swallowed the strip's re-measure in.
+    my $bars = $tab.chart.data;
+    lay-out(%m, 100);
+    $box.clear-dirty;
+    $tab.handle-resize(30, 100);
+
+    is $box.sizing.value, SUMMARY-ROWS-MIN,
+        'the strip is re-fitted even though the cut did not move';
+    ok $box.is-dirty,
+        'and the reflow is asked for, or the layout never reads the new sizing';
+    ok $tab.chart.data === $bars,
+        'while the bars are left exactly as they were';
+
+    # Same terminal a second time: the height has not moved, so nothing
+    # should be asked of the layout.
+    $box.clear-dirty;
+    $tab.handle-resize(30, 100);
+    nok $box.is-dirty, 'a resize that changes no height asks for no reflow';
+
+    lay-out(%m, 40);
+    $tab.handle-resize(30, 40);
+    is $box.sizing.value, SUMMARY-ROWS,
+        'and a narrower one hands the row back';
+};

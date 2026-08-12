@@ -1,0 +1,113 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Gateway::Account;
+use App::Moneymoor::Gateway::Category;
+use App::Moneymoor::Gateway::Payee;
+use App::Moneymoor::Gateway::Transaction;
+
+plan 6;
+
+my $db-path = $*TMPDIR.add("moneymoor-gw-payee-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $gw = App::Moneymoor::Gateway::Payee.new(:$db);
+
+subtest 'create and find' => {
+    plan 5;
+    my $tesco = $gw.create('Tesco');
+    ok $tesco.id.defined, 'create returns the stored row';
+    is $tesco.name, 'Tesco', 'name preserved';
+    is $gw.find-by-id($tesco.id).name, 'Tesco', 'find-by-id works';
+    is $gw.find-by-name('Tesco').id, $tesco.id, 'find-by-name works';
+    nok $gw.find-by-id(99999).defined, 'a missing payee is a type object';
+};
+
+subtest 'names are trimmed and unique' => {
+    plan 4;
+    my $dup = $gw.create('Tesco');
+    ok $dup ~~ Failure, 'a duplicate name is refused';
+    $dup.so;
+
+    my $padded = $gw.create('  Sainsburys  ');
+    is $padded.name, 'Sainsburys', 'names are trimmed on create';
+    is $gw.find-by-name(' Sainsburys ').id, $padded.id,
+        'and on lookup';
+
+    my $empty = $gw.create('   ');
+    ok $empty ~~ Failure, 'an empty name is refused';
+    $empty.so;
+};
+
+subtest 'find-or-create' => {
+    plan 3;
+    my $first = $gw.find-or-create('Waitrose');
+    my $again = $gw.find-or-create('  Waitrose ');
+    is $again.id, $first.id, 'the second call finds rather than creates';
+    ok $gw.find-or-create('Ocado').id.defined, 'a new name is created';
+
+    my $empty = $gw.find-or-create('');
+    ok $empty ~~ Failure, 'an empty name is still refused';
+    $empty.so;
+};
+
+subtest 'find-all is ordered by name' => {
+    plan 1;
+    my @names = $gw.find-all.map(*.name);
+    is-deeply @names.Array, @names.sort.Array, 'alphabetical';
+};
+
+subtest 'rename' => {
+    plan 4;
+    my $ocado = $gw.find-by-name('Ocado');
+    ok $gw.rename($ocado.id, 'Ocado Retail'), 'rename succeeds';
+    is $gw.find-by-id($ocado.id).name, 'Ocado Retail', 'the new name landed';
+
+    my $clash = $gw.rename($ocado.id, 'Tesco');
+    ok $clash ~~ Failure, 'renaming onto an existing name is refused';
+    $clash.so;
+
+    my $missing = $gw.rename(99999, 'Nobody');
+    ok $missing ~~ Failure, 'renaming a missing payee is refused';
+    $missing.so;
+};
+
+subtest 'delete keeps the transactions, drops the name' => {
+    plan 4;
+    my $accounts = App::Moneymoor::Gateway::Account.new(:$db);
+    my $categories = App::Moneymoor::Gateway::Category.new(:$db);
+    my $transactions = App::Moneymoor::Gateway::Transaction.new(:$db);
+
+    my $account = $accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Current', type => 'cash'));
+    my $category = $categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Groceries'));
+    my $payee = $gw.find-by-name('Tesco');
+
+    my $txn = $transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $account.id, date => '2026-03-14',
+            payee-id => $payee.id, amount => -4250),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $category.id, amount => -4250)],
+    );
+    is $gw.usage-count($payee.id), 1, 'usage-count sees the transaction';
+
+    ok $gw.delete($payee.id), 'delete succeeds';
+    nok $gw.find-by-id($payee.id).defined, 'the payee is gone';
+
+    my $reloaded = $transactions.find-by-id($txn.id);
+    ok $reloaded.defined && !$reloaded.payee-id.defined,
+        'its transaction survives with a null payee';
+};

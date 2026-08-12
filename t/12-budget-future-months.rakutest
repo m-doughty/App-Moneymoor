@@ -1,0 +1,106 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+
+plan 6;
+
+subtest 'funding December in August works, and August notices' => {
+    plan 6;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-08-25', amount => 180000);
+    $f.assign('2026-08-01', GROCERIES, 60000);
+    $f.assign('2026-12-01', DINING, 30000);   # December's council tax fund
+
+    my $view = $f.compute(through-period => '2026-12-01');
+    is $view.rta('2026-08-01'), 90000,
+        'August offers what is left after both assignments';
+    is $view.period('2026-08-01').assigned-future, 30000,
+        'and knows how much of that is promised to later periods';
+    nok $view.period('2026-08-01').has-category(DINING),
+        'the future assignment does not appear in August';
+    is $view.category('2026-12-01', DINING).assigned, 30000,
+        'it appears in December, where it was made';
+    is $view.category('2026-12-01', DINING).available, 30000,
+        'with the money in it';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds every month';
+};
+
+subtest 'a future assignment is deducted once, not once per month' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-08-25', amount => 100000);
+    $f.assign('2026-12-01', DINING, 30000);
+
+    my $view = $f.compute(through-period => '2027-01-01');
+    is $view.rta('2026-08-01'), 70000, 'August';
+    is $view.rta('2026-09-01'), 70000, 'September, unchanged';
+    is $view.rta('2026-11-01'), 70000, 'November, still unchanged';
+    is $view.rta('2026-12-01'), 70000, 'December, where the money lands';
+    is $view.rta('2027-01-01'), 70000, 'and January afterwards';
+};
+
+subtest 'over-assigning the future drives Ready to Assign negative' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-08-25', amount => 50000);
+    $f.assign('2026-08-01', GROCERIES, 40000);
+    $f.assign('2026-09-01', GROCERIES, 40000);
+
+    my $view = $f.compute(through-period => '2026-09-01');
+    is $view.rta('2026-08-01'), -30000,
+        'you have assigned money you do not have';
+    ok $view.period('2026-08-01').has-flag('rta-negative'),
+        'and the month says so';
+    is $view.rta('2026-09-01'), -30000,
+        'September inherits the problem rather than hiding it';
+    is $view.category('2026-09-01', GROCERIES).available, 80000,
+        'the envelope still shows both assignments';
+    is $view.invariant-errors.join('; '), '',
+        'and the invariant still holds — the money is accounted for, '
+        ~ 'it just is not there';
+};
+
+subtest 'the derived range stretches to the furthest assignment' => {
+    plan 3;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-08-25', amount => 100000);
+    $f.assign('2027-03-01', GROCERIES, 10000);
+
+    my $view = $f.compute;
+    is $view.periods[0], '2026-08-01', 'from the earliest fact';
+    is $view.periods[*-1], '2027-03-01', 'to the latest, with no through-period';
+    is $view.periods.elems, 8, 'every month in between is derived';
+};
+
+subtest 'through-period can also reach backwards' => {
+    plan 3;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-08-25', amount => 100000);
+
+    my $view = $f.compute(through-period => '2026-06-01');
+    is $view.periods[0], '2026-06-01', 'the range starts at through-period';
+    is $view.rta('2026-06-01'), 0, 'a month before any income has nothing';
+    is $view.rta('2026-08-01'), 100000, 'and the income still lands in August';
+};
+
+subtest 'future spending against a future assignment' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-08-25', amount => 100000);
+    $f.assign('2026-09-01', GROCERIES, 40000);
+    # A direct debit already scheduled and entered in advance:
+    $f.spend(account => CURRENT, date => '2026-09-05', amount => 12000,
+             category => GROCERIES);
+
+    my $view = $f.compute(through-period => '2026-09-01');
+    is $view.rta('2026-08-01'), 60000, 'August has already given the money up';
+    is $view.period('2026-08-01').cash-balance, 100000,
+        'even though the cash has not left yet';
+    is $view.category('2026-09-01', GROCERIES).available, 28000,
+        'September spends it';
+    is $view.invariant-errors.join('; '), '',
+        'the invariant holds in both periods, future assignment and all';
+};

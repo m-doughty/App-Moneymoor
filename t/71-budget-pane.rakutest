@@ -1,0 +1,409 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Notcurses::Native::Types;
+
+use Selkie::Event;
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Store;
+use Selkie::Widget::Border;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::BudgetRow;
+use App::Moneymoor::Screen::Budget;
+
+# The wiring, end to end, without a terminal.
+#
+# t/67 and t/68 prove the row and rail builders are right; this proves
+# the tab actually plugs them into a Table and a store. Everything
+# between a dispatch and a repainted row is here: the four
+# subscriptions, their selectors, the cursor restore across a rebuild,
+# and the columns the money cells are aligned into.
+#
+# Screen::Main cannot be constructed without a notcurses App, so the
+# tab is given a stand-in that answers the same accessors — which is
+# also the point: the tab reaches Main through a documented handful of
+# methods, and this test is what pins that list.
+#
+# The store, the workspace and the derivation are all real; only the
+# screen is faked.
+
+plan 10;
+
+my constant PERIOD = '2026-03-01';
+
+# --- A real budget ---------------------------------------------------
+
+my $db-path = $*TMPDIR.add("moneymoor-budget-pane-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $fun = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Fun Money',
+                                             sort-order => 2));
+my $rent = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Rent', group-id => $bills.id, sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 2));
+my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Dining Out', group-id => $fun.id, sort-order => 1));
+my $retired = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Gym', group-id => $fun.id, sort-order => 2));
+$ws.categories.hide($retired.id);
+my $rta = $ws.categories.rta-category;
+
+$ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => '2026-03-01', amount => 200000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 200000)],
+);
+$ws.set-assigned(PERIOD, $rent.id, 75000);
+$ws.set-assigned(PERIOD, $groceries.id, 40000);
+
+# --- The stand-in screen ---------------------------------------------
+
+#| Exactly the surface App::Moneymoor::Screen::Budget reaches through.
+#| If the tab grows a new `$main.` call, this class is where the test
+#| suite finds out (and t/69 checks the same list against the real
+#| Screen::Main).
+my class FakeMain {
+    has $.app;                  # Nil — the tab guards every toast
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.content-host is required;
+    has $.view is rw;
+    has %.categories-by-id;
+    has %.groups-by-id;
+    has @.mounted;              # [ pane => context ]
+    has Int $.rebuilds is rw = 0;
+
+    method icons() { icons() }
+    method current-tab(--> Str) { 'budget' }
+    method viewed-period(--> Str) {
+        ($!store.get-in('app', 'period') // PERIOD).Str;
+    }
+    method category(Int $id) { $id.defined ?? %!categories-by-id{$id} !! Nil }
+    method group(Int $id)    { $id.defined ?? %!groups-by-id{$id}     !! Nil }
+    method categories(--> List) { %!categories-by-id.values.List }
+    method groups(--> List)     { %!groups-by-id.values.List }
+    method rebuild-content(--> Nil) { $!rebuilds++; Nil }
+
+    method set-view($view --> Nil) {
+        $!view = $view;
+        %!categories-by-id = $!workspace.categories.find-all(:include-hidden)
+                                .map({ .id => $_ }).Hash;
+        %!groups-by-id = $!workspace.categories.find-groups(:include-hidden)
+                            .map({ .id => $_ }).Hash;
+        Nil
+    }
+
+    method pane-border(Str:D $title, $sizing --> Selkie::Widget::Border) {
+        Selkie::Widget::Border.new(:$sizing, :$title, padding => 1);
+    }
+
+    method mount-pane($parent, Selkie::Widget::Border $border,
+                      $pane, Str:D $context --> Nil) {
+        $border.set-content($pane);
+        $parent.add($border);
+        $border.set-store($!store);
+        @!mounted.push($pane => $context);
+        Nil
+    }
+}
+
+# A built, subscribed, keybound budget tab over a fresh store.
+#
+# The palette is installed on the host as a Selkie theme as well as
+# handed to the tab, because that is what Screen::Main does with it:
+# the tab paints its own cells from the App::Moneymoor::Theme, and every
+# generic Selkie widget under it — the Table's cursor row included —
+# reads the Selkie::Theme off the widget tree. Leaving the host
+# unthemed would test the tab against Selkie's built-in blue-grey.
+sub mounted-tab(Str :$palette = 'gruvbox' --> Hash) {
+    my $host  = Selkie::Layout::VBox.new(sizing => Sizing.flex);
+    my $store = mock-store;
+    my $theme = App::Moneymoor::Themes::load($palette);
+    $host.set-theme($theme.to-selkie);
+    my $main  = FakeMain.new(
+        :$store, workspace => $ws, content-host => $host,
+        theme => $theme,
+    );
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws, on-view => -> $v { $main.set-view($v) },
+    ).register($store);
+    $host.set-store($store);
+
+    my $tab = App::Moneymoor::Screen::Budget.new(main => $main);
+    $tab.build($host);
+    $tab.install-subscriptions;
+    $tab.install-keybinds;
+
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PERIOD);
+    { :$tab, :$main, :$store, :$host };
+}
+
+sub row-names($tab --> List) { $tab.table.rows.map(*.<category>).List }
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the tab mounts the panes the spec draws' => {
+    plan 6;
+    my %m = mounted-tab();
+
+    is %m<host>.children.elems, 2,
+        'the pill and the body row are the content host\'s children';
+    is %m<host>.children[0].sizing.value, 3,
+        'the pill is three rows — a frame and one line';
+    is %m<main>.mounted.elems, 1, 'one focusable pane';
+    is %m<main>.mounted[0].value, 'budget',
+        'registered under the budget hint context';
+    ok %m<main>.mounted[0].key === %m<tab>.table,
+        'and it is the table itself';
+    ok %m<tab>.inspector-mounted,
+        'the rail is up, because budget/inspector defaults to on';
+};
+
+subtest 'the columns are the five §4.3 names, at the §4.3 widths' => {
+    plan 8;
+    my @cols = mounted-tab()<tab>.table.columns;
+    is-deeply @cols.map(*.name).List,
+        ('category', 'assigned', 'activity', 'available', 'target'), 'names';
+    is @cols[1].sizing.value, ASSIGNED-COLS,  'assigned is 11';
+    is @cols[2].sizing.value, ACTIVITY-COLS,  'activity is 11';
+    is @cols[3].sizing.value, AVAILABLE-COLS, 'available is 12';
+    # Target is rightmost: it is the column the eye needs least often,
+    # and available is the one you budget against.
+    is @cols[4].sizing.value, TARGET-COLS,    'target is 11';
+    is @cols.grep(*.sortable).elems, 0,
+        'nothing is sortable — sorting would scatter rows away from '
+            ~ 'their group headers';
+    is @cols[3].label, money-header('Available', AVAILABLE-COLS),
+        'and the header is padded to sit over its own digits';
+    is @cols[4].label, money-header('Target', TARGET-COLS),
+        'the target header the same way';
+};
+
+subtest 'the first tick paints real rows' => {
+    plan 4;
+    my %m = mounted-tab();
+    is-deeply row-names(%m<tab>),
+        ('▾ Monthly Bills', '  Rent', '  Groceries',
+         '▾ Fun Money', '  Dining Out'),
+        'headers and their envelopes, hidden ones left out';
+
+    my $rent-row = %m<tab>.table.rows.first({ $_<id> == $rent.id
+                                              && $_<kind> eq 'category' });
+    is $rent-row<assigned>, money-cell(75000, ASSIGNED-COLS),
+        'money cells come from the cached derivation';
+    is $rent-row<severity>, 'positive', 'and carry their §2 state';
+
+    is %m<tab>.table.rows[0]<available>,
+        money-cell(115000, AVAILABLE-COLS),
+        'the group header totals its own envelopes';
+};
+
+subtest 'moving the cursor writes the selection to the store' => {
+    plan 4;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    # Row 0 is a group header: not a category, so the rail must be told
+    # there is nothing to describe.
+    nok state-at($store, 'budget', 'selected-category-id').defined,
+        'the cursor starts on a header, and the store says so';
+
+    %m<tab>.table.select-index(1);
+    $store.tick;
+    is state-at($store, 'budget', 'selected-category-id'), $rent.id,
+        'arrowing onto an envelope announces it';
+
+    %m<tab>.table.select-index(3);
+    $store.tick;
+    nok state-at($store, 'budget', 'selected-category-id').defined,
+        'and arrowing onto the next header clears it again';
+
+    %m<tab>.table.select-index(4);
+    $store.tick;
+    is state-at($store, 'budget', 'selected-category-id'), $dining.id,
+        'and onto the envelope under it announces that one';
+};
+
+subtest 'folding a group repaints the grid' => {
+    plan 3;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => $bills.id);
+    is-deeply row-names(%m<tab>),
+        ('▸ Monthly Bills', '▾ Fun Money', '  Dining Out'),
+        'the fold reached the table through the store, not a direct call';
+
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => $bills.id);
+    is row-names(%m<tab>).elems, 5, 'and unfolding brings them back';
+
+    dispatch-and-tick($store, 'budget/toggle-hidden');
+    ok row-names(%m<tab>).first({ $_.contains('(hidden)') }).defined,
+        'u shows the retired envelope, suffixed';
+};
+
+subtest 'the cursor survives a rebuild that moves it' => {
+    plan 3;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    %m<tab>.table.select-index(4);          # Dining Out, the last row
+    $store.tick;
+    is state-at($store, 'budget', 'selected-category-id'), $dining.id,
+        'parked on the last envelope';
+
+    # Folding the group above it shifts every index below by two. An
+    # index-based restore would land on a different envelope; the tab
+    # restores by id.
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => $bills.id);
+    is state-at($store, 'budget', 'selected-category-id'), $dining.id,
+        'still the same envelope after the rows moved under it';
+    is %m<tab>.table.selected-row<id>, $dining.id,
+        'and the table cursor is on its new index';
+
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => $bills.id);
+};
+
+subtest 'the pill and the rail follow the same tick' => {
+    plan 4;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    # £2,000 in, £1,150 assigned.
+    my $pill = %m<host>.children[0].content.children[0];
+    is $pill.spans.map(*.text).join, 'Ready to Assign  £850.00',
+        'the pill carries the period\'s Ready to Assign';
+    is %m<host>.children[0].title, 'March 2026',
+        'and the frame carries the period, labelled by the scheme';
+
+    %m<tab>.table.select-index(1);          # Rent
+    $store.tick;
+    my $rail = %m<tab>.table.parent.parent.children[1];
+    is $rail.title, 'Rent', 'the rail\'s frame names the selected envelope';
+    my $text = $rail.content.spans.map(*.text).join;
+    ok $text.contains('Assigned') && $text.contains('£750.00'),
+        'and its equation is that envelope\'s';
+};
+
+subtest 'Enter folds a group, through the widget\'s own activate path' => {
+    plan 3;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+    my $enter = Selkie::Event.new(
+        id => NCKEY_ENTER, event-type => KeyEvent, modifiers => Set.new,
+    );
+
+    # Table checks its keybinds before its own navigation, so `enter`
+    # is deliberately NOT bound — this goes through handle-event and
+    # out of the on-activate supply, which is the path a real keypress
+    # takes.
+    ok %m<tab>.table.handle-event($enter), 'the table consumed the key';
+    $store.tick;
+    ok state-at($store, 'budget', 'collapsed-groups'){ $bills.id.Str },
+        'the group under the cursor folded';
+    is-deeply row-names(%m<tab>),
+        ('▸ Monthly Bills', '▾ Fun Money', '  Dining Out'),
+        'and the grid repainted without it';
+};
+
+subtest 'the cursor is visible on every kind of row' => {
+    plan 8;
+    # The regression a user hit: group headers are painted fg-bright on
+    # bg-surface and bold, and merging that over the old cursor base
+    # produced exactly the style it produced over the body base — the
+    # cursor row on a header was byte-for-byte its uncursored self, so
+    # the cursor simply vanished when you arrowed onto a group.
+    #
+    # Selkie::Widget::Table.effective-row-style is the seam: it is
+    # public so this is assertable without a terminal, and it is the
+    # same call the renderer makes.
+    sub renders-alike($a, $b --> Bool) {
+        ($a.fg // -1) == ($b.fg // -1)
+            && ($a.bg // -1) == ($b.bg // -1)
+            && $a.styles == $b.styles;
+    }
+
+    my %m = mounted-tab();
+    my $table = %m<tab>.table;
+    my $selkie = App::Moneymoor::Themes::load('gruvbox').to-selkie;
+
+    my %header = $table.rows.first({ $_<kind> eq 'group' });
+    my %row    = $table.rows.first({ $_<kind> eq 'category' });
+    is %header<severity>, 'header', 'the header row is styled as one';
+
+    my $off = $table.effective-row-style(%header);
+    my $on  = $table.effective-row-style(%header, :is-cursor);
+    nok renders-alike($on, $off),
+        'a group header under the cursor does not render as itself';
+    ok $on.bold, 'and keeps the header\'s bold';
+    is $on.fg, $off.fg, 'and its foreground';
+
+    # Gruvbox is one of the palettes whose bg-highlight IS bg-surface —
+    # the header's own background — so the highlight background alone
+    # cannot separate them and Selkie escalates to the selection pair.
+    is $on.bg, $selkie.selection.bg,
+        'the cursor falls back to the selection background';
+
+    # A palette that keeps the two apart takes the ordinary path.
+    my %d = mounted-tab(palette => 'dracula');
+    my $dracula = App::Moneymoor::Themes::load('dracula').to-selkie;
+    my %d-header = %d<tab>.table.rows.first({ $_<kind> eq 'group' });
+    is %d<tab>.table.effective-row-style(%d-header, :is-cursor).bg,
+        $dracula.text-highlight.bg,
+        'where bg-highlight differs from bg-surface, that is the cursor bg';
+
+    # Envelope rows were never invisible (their styles set no
+    # background), but they must still be told apart from their
+    # neighbours, and must keep their §2 severity colour.
+    my $row-off = $table.effective-row-style(%row);
+    my $row-on  = $table.effective-row-style(%row, :is-cursor);
+    nok renders-alike($row-on, $row-off),
+        'an envelope row differs under the cursor too';
+    is $row-on.fg, $row-off.fg,
+        'and keeps whatever colour its state gave it';
+};
+
+subtest 'a budget with no envelopes says so' => {
+    plan 2;
+    # The empty state is a row rather than a swapped-in widget, so the
+    # grid keeps one cursor and one scrollbar. It must not be
+    # actionable.
+    my %m = mounted-tab();
+    my $main = %m<main>;
+    $main.categories-by-id = %();
+    $main.groups-by-id = %();
+    %m<tab>.refresh-rows;
+
+    is row-names(%m<tab>), ('No envelopes yet — n to create one',),
+        'the EmptyState copy, in the grid';
+    nok %m<tab>.selected-category-id.defined,
+        'and nothing is selectable on it';
+};

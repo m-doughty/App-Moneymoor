@@ -1,0 +1,168 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+
+plan 7;
+
+subtest 'moving money between two cash accounts is invisible to envelopes' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.transfer(from => CURRENT, to => SAVINGS, date => '2026-03-10',
+                amount => 30000);
+
+    my $view = $f.compute;
+    is $view.period('2026-03-01').category-periods.elems, 1,
+        'only the funded envelope has a row — the transfer created none';
+    is $view.category('2026-03-01', GROCERIES).available, 40000,
+        'the envelope is untouched';
+    is $view.rta('2026-03-01'), 60000, 'so is Ready to Assign';
+    is $view.period('2026-03-01').cash-balance, 100000,
+        'and the money is still in the budget, just somewhere else';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'moving money to a tracking account is spending' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 20000);
+    $f.assign('2026-03-01', DINING, 30000);
+    # The on-budget leg carries the category: this money has left the
+    # budget for good.
+    $f.transfer(from => CURRENT, to => ISA, date => '2026-03-10',
+                amount => 25000, parts => [(DINING) => -25000]);
+
+    my $view = $f.compute;
+    is $view.category('2026-03-01', DINING).activity, -25000,
+        'the envelope paid for it';
+    is $view.category('2026-03-01', DINING).available, 5000, 'and is down to 50.00';
+    is $view.period('2026-03-01').cash-balance, 75000, 'the cash left the budget';
+    is $view.account-balance(ISA).working, 25000,
+        'and turned up in the tracking account';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'moving money from a tracking account is income' => {
+    plan 4;
+    my $f = standard-facts();
+    # Selling investments: the cash leg is the on-budget one, and it is
+    # categorized to Ready to Assign because this is new money to
+    # budget.
+    $f.transfer(from => ISA, to => CURRENT, date => '2026-03-10',
+                amount => 40000, parts => [(RTA) => 40000],
+                categorize-from => False);
+
+    my $view = $f.compute;
+    is $view.rta('2026-03-01'), 40000, 'the money is now assignable';
+    is $view.period('2026-03-01').cash-balance, 40000, 'and it is cash';
+    is $view.account-balance(ISA).working, -40000,
+        'while the tracking account is down by the same amount';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'spending a card at a tracking account is still card spending' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', DINING, 20000);
+    # A cash-like transfer from the card into an investment account:
+    # the credit leg is categorized, so the usual coverage rule runs.
+    $f.transfer(from => VISA, to => ISA, date => '2026-03-12',
+                amount => 15000, parts => [(DINING) => -15000]);
+
+    my $view = $f.compute;
+    is $view.category('2026-03-01', DINING).available, 5000,
+        'the envelope paid for it';
+    is $view.category('2026-03-01', VISA-PAY).available, 15000,
+        'and the cash is reserved to pay the card';
+    is $view.period('2026-03-01').cash-balance, 100000, 'no cash moved yet';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a chain of transfers nets out' => {
+    plan 3;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.transfer(from => CURRENT, to => SAVINGS, date => '2026-03-05',
+                amount => 60000);
+    $f.transfer(from => SAVINGS, to => CURRENT, date => '2026-03-06',
+                amount => 20000);
+    $f.transfer(from => SAVINGS, to => CURRENT, date => '2026-03-07',
+                amount => 40000);
+
+    my $view = $f.compute;
+    is $view.period('2026-03-01').cash-balance, 100000, 'the total is unchanged';
+    is $view.rta('2026-03-01'), 100000, 'and it is all still assignable';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'transfers across a month boundary' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.spend(account => VISA, date => '2026-03-20', amount => 15000,
+             category => GROCERIES);
+    # Paying March's statement in April, as everybody does:
+    $f.transfer(from => CURRENT, to => VISA, date => '2026-04-05',
+                amount => 15000);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    is $view.category('2026-03-01', VISA-PAY).available, 15000,
+        'March reserves the money';
+    is $view.category('2026-04-01', VISA-PAY).carry-in, 15000,
+        'April inherits the reserve';
+    is $view.category('2026-04-01', VISA-PAY).available, 0,
+        'and spends it paying the card';
+    is $view.invariant-errors.join('; '), '',
+        'the invariant holds on both sides of the boundary';
+};
+
+subtest 'facts the gateways would never write become warnings, not wrong numbers' => {
+    plan 8;
+    my $f = standard-facts();
+    # A transfer leg pointing at a peer that is not in the fact set.
+    $f.txn(account => CURRENT, date => '2026-03-01', amount => -5000,
+           parts => [(GROCERIES) => -5000], peer => 9999);
+    # An uncategorized transaction on an on-budget account.
+    $f.txn(account => CURRENT, date => '2026-03-02', amount => -1000);
+    # Splits that do not sum to their transaction.
+    $f.txn(account => CURRENT, date => '2026-03-03', amount => -2000,
+           parts => [(GROCERIES) => -1500]);
+    # A split against a category that does not exist.
+    $f.txn(account => CURRENT, date => '2026-03-04', amount => -700,
+           parts => [(4242) => -700]);
+    # An impossible date.
+    $f.txn(account => CURRENT, date => '2026-02-30', amount => -100,
+           parts => [(GROCERIES) => -100]);
+    # A categorized transaction on an off-budget account.
+    $f.txn(account => ISA, date => '2026-03-05', amount => -900,
+           parts => [(GROCERIES) => -900]);
+
+    my $view = $f.compute;
+    my $warnings = $view.warnings.join(' | ');
+    like $warnings, /'missing transfer peer'/, 'the dangling peer is reported';
+    like $warnings, /'has no splits'/, 'the uncategorized transaction too';
+    like $warnings, /'splits sum to'/, 'and the mismatched split set';
+    like $warnings, /'unknown category'/, 'and the unknown category';
+    like $warnings, /'malformed date'/, 'and the impossible date';
+    like $warnings, /'off' \s 'budget'/,
+        'and the categorized tracking-account transaction';
+
+    # The dangling-peer transaction is still categorized, so it is
+    # treated as ordinary spending rather than being dropped: the
+    # warning is about the peer, not about the money.
+    is $view.category('2026-03-01', GROCERIES).activity, -6500,
+        'every interpretable split still reaches the budget';
+    # The invariant cannot hold over facts that do not balance, and it
+    # says so rather than papering over them: 10.00 uncategorized,
+    # 5.00 of unmatched split, and 7.00 to a category that is not
+    # there is exactly 22.00 of cash the envelopes never saw.
+    like $view.invariant-errors.join('; '), /'off by 2200'/,
+        'and the invariant reports precisely the money that went missing';
+};

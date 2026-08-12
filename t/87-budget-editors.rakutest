@@ -1,0 +1,723 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Checkbox;
+use Selkie::Widget::Select;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The envelope and group editors, filled in and saved against a real
+# SQLCipher file — the budget-side twins of t/78's account dialogs.
+#
+# Both of them save on Enter as well as on Ctrl+S (every field is
+# single-line), and both refuse the same things either way. The system
+# rows are here too: the engine permits only a sort-order change on
+# them, so the dialogs offer only that, and a test that stops looking
+# after the happy path is how a form ends up promising something the
+# gateway then refuses.
+
+plan 13;
+
+my $db-path = $*TMPDIR.add("moneymoor-budget-editors-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $rta = $ws.categories.rta-category;
+
+# --- The stand-in screen ---------------------------------------------
+
+my class FakeMain {
+    has $.app;                     # Nil — every toast is guarded
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has @.modals;
+
+    method icons() { icons() }
+    method category(Int $id) {
+        $id.defined
+            ?? $!workspace.categories.find-all(:include-hidden)
+                   .first({ .id == $id })
+            !! Nil;
+    }
+    method group(Int $id) {
+        $id.defined
+            ?? $!workspace.categories.find-groups(:include-hidden)
+                   .first({ .id == $id })
+            !! Nil;
+    }
+    method categories(--> List) {
+        $!workspace.categories.find-all(:include-hidden).List;
+    }
+    method groups(--> List) {
+        $!workspace.categories.find-groups(:include-hidden).List;
+    }
+    method view() { Nil }
+
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { body($emitted) };
+    }
+}
+
+sub fixture(--> Hash) {
+    my $store = mock-store;
+    my @toasts;
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws, toast => -> Str $m { @toasts.push($m) },
+    ).register($store);
+    my $main = FakeMain.new(
+        :$store, workspace => $ws,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    dispatch-and-tick($store, 'app/init');
+    { :$store, :$main, :@toasts };
+}
+
+#| Every labelled field, keyed by its caption — the editors' rows are
+#| two-child VBoxes, a Text caption over its control.
+sub fields($modal --> Hash) {
+    my %out;
+    for $modal.content.children -> $child {
+        next unless $child.can('children');
+        my @kids = $child.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %out{ @kids[0].text } = @kids[1];
+    }
+    %out;
+}
+
+#| The Group picker is not a labelled row: the editor adds its caption
+#| and its Select as siblings, so it is found by type instead.
+sub widget-of($modal, $type) {
+    $modal.content.children.first({ $_ ~~ $type });
+}
+
+#| The pickers, in the order the dialog stacks them: Group, then Kind.
+#| Both are caption-plus-Select sibling pairs.
+sub selects($modal --> List) {
+    $modal.content.children.grep({ $_ ~~ Selkie::Widget::Select }).List;
+}
+
+sub kind-select($modal) { selects($modal)[1] }
+
+#| The carry-overspending toggle: a Checkbox carries its own label, so
+#| it is a bare child of the content rather than a labelled row — found
+#| by type, like the Group picker, and a type object on a system row
+#| where the dialog does not offer it at all.
+sub carry-check($modal) { widget-of($modal, Selkie::Widget::Checkbox) }
+
+#|( The container the editor swaps the goal rows in and out of: the one
+    VBox among the content's children that is B<not> a labelled row —
+    a labelled row is a caption Text over its control, and this holds
+    whole rows (or nothing at all). )
+sub goal-box($modal) {
+    $modal.content.children
+        .grep({ $_ ~~ Selkie::Layout::VBox })
+        .first({ !(.children.elems == 2
+                   && .children[0] ~~ Selkie::Widget::Text) });
+}
+
+#| The captions of the goal rows currently on the dialog, in order.
+sub goal-captions($modal --> List) {
+    goal-box($modal).children.map({ .children[0].text }).List;
+}
+
+#| The goal rows' inputs, keyed by caption.
+sub goal-fields($modal --> Hash) {
+    my %out;
+    for goal-box($modal).children -> $row {
+        my @kids = $row.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %out{ @kids[0].text } = @kids[1];
+    }
+    %out;
+}
+
+#| Every TextInput anywhere in the modal, so "there is no Goal period
+#| field" can be asserted against the whole tree rather than against
+#| the one place it would live.
+sub inputs($modal --> List) {
+    my @found;
+    my @queue = $modal.content;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @found.push($w) if $w ~~ Selkie::Widget::TextInput;
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @found.List;
+}
+
+#| The status line: the last flex Text, where every refusal lands.
+sub status($modal --> Str) {
+    my @texts = $modal.content.children.grep({ $_ ~~ Selkie::Widget::Text });
+    (@texts.tail andthen .text) // '';
+}
+
+sub envelope(Str $name) {
+    $ws.categories.find-all(:include-hidden).first({ .name eq $name });
+}
+
+sub submit($input --> Nil) {
+    $input.set-focused(True);
+    press-key($input, 'enter');
+    $input.set-focused(False);
+    Nil
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'a new envelope, typed and saved with ctrl+s' => {
+    plan 4;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    is $modal.frame-title, 'New envelope', 'the dialog knows what it is';
+    ok $modal.frame-bottom-title.contains('enter/^s save'),
+        'and advertises both save keys';
+
+    %field<Name>.set-text('Water');
+    %field{'Sort order'}.set-text('4');
+    my $group-select = widget-of($modal, Selkie::Widget::Select);
+    $group-select.select-index(
+        ($group-select.items.first({ $_ eq 'Monthly Bills' }, :k) // 0).UInt);
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $saved = envelope('Water');
+    ok $saved.defined && $saved.sort-order == 4, 'it reached the database';
+    is $saved.group-id, $bills.id, 'in the group that was picked';
+};
+
+subtest 'Enter in a field saves the envelope editor' => {
+    plan 3;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    %field<Name>.set-text('Broadband');
+    submit(%field<Name>);
+    %f<store>.tick;
+    ok envelope('Broadband').defined, 'Enter in the name field writes it';
+
+    # Enter on the group picker is the picker's, not the form's.
+    my %g = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(%g<main>);
+    my %gf = fields(%g<main>.modals[0]);
+    %gf<Name>.set-text('Not Yet');
+    my $picker = widget-of(%g<main>.modals[0], Selkie::Widget::Select);
+    $picker.set-focused(True);
+    press-key($picker, 'enter');
+    %g<store>.tick;
+    nok envelope('Not Yet').defined, 'Enter on the Group picker saves nothing';
+    ok $picker.is-open, 'it opens the dropdown instead';
+};
+
+subtest 'the envelope editor refuses the same things either way' => {
+    plan 4;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my Int $before = $ws.categories.find-all(:include-hidden).elems;
+
+    submit(%field<Name>);              # empty
+    %f<store>.tick;
+    is $ws.categories.find-all(:include-hidden).elems, $before,
+        'an unnamed envelope is not written';
+    ok status($modal).contains('needs a name'), 'and the dialog says why';
+
+    %field<Name>.set-text('Half Typed');
+    %field{'Sort order'}.set-text('soon');
+    submit(%field{'Sort order'});
+    %f<store>.tick;
+    is $ws.categories.find-all(:include-hidden).elems, $before,
+        'nor one whose sort order is not a number';
+    ok status($modal).contains('whole number'), 'with the other message';
+};
+
+subtest 'editing an existing envelope, and a system one' => {
+    plan 4;
+    my $target = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Renamed Me', group-id => $bills.id, sort-order => 2));
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        $main, category-id => $target.id);
+    my %field = fields($main.modals[0]);
+    is %field<Name>.text, 'Renamed Me', 'the editor opens on what is there';
+    %field<Name>.set-text('Renamed It');
+    submit(%field<Name>);
+    %f<store>.tick;
+    is $ws.categories.find-by-id($target.id).name, 'Renamed It',
+        'and Enter saves the edit';
+
+    # Ready to Assign: name and group are static text, because
+    # Gateway::Category.update refuses to change either.
+    my %s = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %s<main>, category-id => $rta.id);
+    my %sf = fields(%s<main>.modals[0]);
+    ok %sf<Name> ~~ Selkie::Widget::Text,
+        'a system envelope\'s name is read-only';
+    %sf{'Sort order'}.set-text('-3');
+    submit(%sf{'Sort order'});
+    %s<store>.tick;
+    is $ws.categories.find-by-id($rta.id).sort-order, -3,
+        'while its order is still editable, and Enter still saves it';
+};
+
+subtest 'the envelope editor carries the per-period target' => {
+    plan 9;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    ok %field<Target>.defined, 'a new envelope is offered a Target field';
+    is %field<Target>.text, '', 'empty, because a new envelope has no target';
+
+    %field<Name>.set-text('Car Insurance');
+    %field<Target>.set-text('50');
+    submit(%field<Target>);
+    %f<store>.tick;
+    my $saved = envelope('Car Insurance');
+    is $saved.target-pence, 5000, 'and Enter in it writes the target';
+
+    # Reopening prefills symbol-less, like the assign field: the value
+    # is there to be overtyped.
+    my %r = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %r<main>, category-id => $saved.id);
+    my %rf = fields(%r<main>.modals[0]);
+    is %rf<Target>.text, '50.00', 'reopening prefills it without a symbol';
+
+    # Blanking the field is how a target is taken off again — it must
+    # be an ordinary save, not a refusal.
+    %rf<Target>.set-text('');
+    submit(%rf<Target>);
+    %r<store>.tick;
+    is $ws.categories.find-by-id($saved.id).target-pence, 0,
+        'clearing it back to blank saves 0';
+    nok $ws.categories.find-by-id($saved.id).has-target,
+        'which is "no target", not "a target of nothing"';
+
+    # A negative is refused on the dialog's own error line, so the
+    # typo is still on screen to correct.
+    my %n = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %n<main>, category-id => $saved.id);
+    my $neg-modal = %n<main>.modals[0];
+    my %nf = fields($neg-modal);
+    %nf<Target>.set-text('-20');
+    submit(%nf<Target>);
+    %n<store>.tick;
+    is $ws.categories.find-by-id($saved.id).target-pence, 0,
+        'a negative target is not written';
+    ok status($neg-modal).contains('cannot be negative'),
+        'and the dialog says why, still open';
+
+    # Ready to Assign has no target to want, so it is offered no field.
+    my %s = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %s<main>, category-id => $rta.id);
+    nok fields(%s<main>.modals[0])<Target>.defined,
+        'a system envelope is offered no Target field at all';
+};
+
+subtest 'the envelope editor carries the overspending rule' => {
+    plan 9;
+    # The one control on this dialog that changes what the ENGINE does
+    # with the row (Service::Budget, rule 3), so the editor has to be
+    # able to set it, show it and leave it alone — and must not offer it
+    # where the gateway would refuse it.
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor($main);
+    my $modal = $main.modals[0];
+
+    ok carry-check($modal).defined, 'a new envelope is offered the toggle';
+    is carry-check($modal).label, 'Carry overspending',
+        'labelled as the rule rather than as the column';
+    nok carry-check($modal).checked,
+        'and it opens off — the forcing rule is the default';
+
+    fields($modal)<Name>.set-text('Reimbursables');
+    carry-check($modal).toggle;
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    my $saved = envelope('Reimbursables');
+    ok $saved.defined && $saved.carry-overspend,
+        'ticking it and saving puts the envelope on the carrying rule';
+
+    # Reopening shows the row's own state, so the next save is an edit
+    # rather than a silent reset.
+    my %r = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %r<main>, category-id => $saved.id);
+    my $reopened = %r<main>.modals[0];
+    ok carry-check($reopened).checked, 'reopening shows it ticked';
+
+    # A save that is not about the flag leaves it on — the whole-row
+    # trap, from the other side: `update` writes every column, and this
+    # dialog renders the checkbox, so what it renders is what it must
+    # write back.
+    fields($reopened)<Name>.set-text('Reimbursables (work)');
+    submit(fields($reopened)<Name>);
+    %r<store>.tick;
+    my $renamed = $ws.categories.find-by-id($saved.id);
+    is $renamed.name, 'Reimbursables (work)', 'the rename landed';
+    ok $renamed.carry-overspend, 'and the flag survived it';
+
+    my %o = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %o<main>, category-id => $saved.id);
+    my $off = %o<main>.modals[0];
+    carry-check($off).toggle;
+    press-key($off, 'ctrl+s');
+    %o<store>.tick;
+    nok $ws.categories.find-by-id($saved.id).carry-overspend,
+        'unticking it puts the envelope back on the forcing rule';
+
+    # A payment envelope carries by kind and Ready to Assign has no
+    # available to carry, so the gateway refuses the flag on both — and
+    # a dialog that offered it would be promising something the engine
+    # then refuses.
+    my %s = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %s<main>, category-id => $rta.id);
+    nok carry-check(%s<main>.modals[0]).defined,
+        'a system envelope is offered no toggle at all';
+};
+
+subtest 'the Kind picker, and the rows only one kind reads' => {
+    plan 14;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor($main);
+    my $modal = $main.modals[0];
+
+    is-deeply kind-select($modal).items,
+        ('Refill each period', 'Set aside each period', 'Goal by period'),
+        'three kinds, named as plans rather than as column values';
+    is kind-select($modal).selected, 0,
+        'a new envelope preselects Refill — the default every file means';
+
+    # Refill reads an amount and nothing else, so it renders nothing
+    # else: a field that takes a keystroke and has it discarded on save
+    # is the bug the swap container exists to prevent.
+    is-deeply goal-captions($modal), (),
+        'refill asks for no goal rows at all';
+    is goal-box($modal).sizing.value, 0,
+        'and the block claims no height either';
+
+    kind-select($modal).select-index(1);
+    is-deeply goal-captions($modal), (),
+        'nor does a set-aside, which is also just an amount';
+
+    kind-select($modal).select-index(2);
+    is-deeply goal-captions($modal), ('Goal period', 'Repeat'),
+        'a goal brings up its two rows, in that order';
+    is goal-box($modal).sizing.value, 4, 'two rows, four rows of height';
+    is goal-fields($modal){'Goal period'}.placeholder,
+        'YYYY-MM-DD · when the bill is paid',
+        'the goal date says what shape it takes and which period to pick';
+    is goal-fields($modal)<Repeat>.placeholder, 'blank for once · e.g. 3 periods',
+        'and the repeat says that blank is a one-off';
+
+    # What was typed survives a round trip, which is the whole reason
+    # the values live outside the widgets.
+    goal-fields($modal){'Goal period'}.set-text('2026-11-07');
+    goal-fields($modal)<Repeat>.set-text('3');
+    kind-select($modal).select-index(0);
+    is-deeply goal-captions($modal), (),
+        'going back to refill takes the rows off the dialog';
+    is inputs($modal).grep({ .text eq '2026-11-07' }).elems, 0,
+        'and they are gone from the tree entirely, not merely hidden';
+    kind-select($modal).select-index(2);
+    is goal-fields($modal){'Goal period'}.text, '2026-11-07',
+        'coming back gives the date the user typed, not a blank field';
+    is goal-fields($modal)<Repeat>.text, '3', 'and the repeat with it';
+
+    # A system row has no target of any kind, so it is offered no
+    # picker either — the same rule that takes its Target field away.
+    my %s = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %s<main>, category-id => $rta.id);
+    is selects(%s<main>.modals[0]).elems, 0,
+        'a system envelope is offered no picker at all';
+};
+
+subtest 'the whole form fits the terminal this app is built for' => {
+    plan 6;
+    # The numbers are re-stated rather than imported: a constant shared
+    # between the code and its test proves only that the two agree.
+    # 80x24 is the terminal (see Login's DIALOG-ROWS), and the envelope
+    # editor asks for 0.6 of its width and 0.9 of its height. A form
+    # whose last field is under the frame is a form nobody fills in, and
+    # the goal fields are the ones a user is least likely to guess at.
+    my constant TERM-ROWS = 24;
+    my constant TERM-COLS = 80;
+
+    my %f = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(%f<main>);
+    my $modal = %f<main>.modals[0];
+    my ($interior-rows, $interior-cols)
+        = $modal.content-extent(TERM-ROWS, TERM-COLS);
+    is $interior-rows, 17, 'seventeen interior rows on a 24-row terminal';
+
+    my sub claimed($m --> Int) {
+        $m.content.children.map({
+            $_.sizing.mode === SizeFixed ?? $_.sizing.value.Int !! 0
+        }).sum.Int;
+    }
+
+    # Carry overspending is the cheap one: a Checkbox carries its own
+    # label, so the flag that changes what the engine does with the row
+    # costs a single line where every other field costs two.
+    is claimed($modal), 11,
+        'Name, Group, Sort order, Carry overspending, Kind and Target '
+        ~ 'claim eleven of them';
+
+    kind-select($modal).select-index(2);
+    is claimed($modal), 15, 'and a goal\'s two extra rows make fifteen';
+    ok claimed($modal) + 2 <= $interior-rows,
+        'leaving the flex error line at least two for a wrapped refusal';
+
+    # The rows come and go inside their own container; nothing else in
+    # the dialog moves, so the modal never resizes under the user.
+    my Int $children = $modal.content.children.elems;
+    kind-select($modal).select-index(0);
+    is $modal.content.children.elems, $children,
+        'the dialog keeps its shape whichever kind is picked';
+    is claimed($modal), 11, 'with only the goal block\'s height changing';
+};
+
+subtest 'each kind reaches the file through the front door' => {
+    plan 12;
+    # The by-period save is the one with a moving part: only
+    # Service::Workspace.set-target may stamp a plan start, so a goal
+    # created here has to arrive with one — on its FIRST save, not on
+    # the next one.
+    my %f = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(%f<main>);
+    my $modal = %f<main>.modals[0];
+    my %field = fields($modal);
+    %field<Name>.set-text('Self Assessment');
+    %field<Target>.set-text('5000');
+    kind-select($modal).select-index(2);
+    goal-fields($modal){'Goal period'}.set-text('2027-01-31');
+    goal-fields($modal)<Repeat>.set-text('12');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $goal = envelope('Self Assessment');
+    ok $goal.defined, 'the envelope was created';
+    is $goal.target-pence, 500000, 'with the goal amount';
+    is $goal.target-kind, 'by_period', 'and the kind that was picked';
+    is $goal.target-period, '2027-01-31',
+        'the date stored exactly as typed, to be read as its period';
+    is $goal.target-repeat, 12, 'and the repeat';
+    is $goal.target-start, $ws.current-period,
+        'stamped with the period it was created in, on the first save';
+
+    # A set-aside: an amount, and every goal field normalised away
+    # because the kind does not read them.
+    my %s = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(%s<main>);
+    my $aside = %s<main>.modals[0];
+    fields($aside)<Name>.set-text('Christmas');
+    fields($aside)<Target>.set-text('100');
+    kind-select($aside).select-index(2);
+    goal-fields($aside){'Goal period'}.set-text('2026-12-25');
+    kind-select($aside).select-index(1);
+    press-key($aside, 'ctrl+s');
+    %s<store>.tick;
+
+    my $xmas = envelope('Christmas');
+    is $xmas.target-kind, 'set_aside', 'the set-aside kind was saved';
+    is $xmas.target-pence, 10000, 'with its per-period amount';
+    nok $xmas.target-period.defined,
+        'and the goal date it does not read was normalised away';
+
+    # Reopening a goal prefills every part of it, so the next save is
+    # an edit and not a re-typing.
+    my %r = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %r<main>, category-id => $goal.id);
+    my $reopened = %r<main>.modals[0];
+    is kind-select($reopened).selected, 2, 'the picker opens on the row\'s kind';
+    is goal-fields($reopened){'Goal period'}.text, '2027-01-31',
+        'with its goal date';
+    is goal-fields($reopened)<Repeat>.text, '12', 'and its repeat';
+};
+
+subtest 'a save that is not about the target leaves the target alone' => {
+    plan 6;
+    # THE trap. Gateway::Category.update writes the WHOLE row, target
+    # tuple included, and this dialog builds a fresh Model::Category out
+    # of its own fields — so an editor that carried only what it renders
+    # would wipe a plan every time somebody fixed a typo in a name.
+    #
+    # The stamp is planted through the gateway rather than the front
+    # door, so it is demonstrably older than this save: if the editor
+    # went anywhere near set-target on a rename, the ramp would restart
+    # from today and this assertion would catch it.
+    my $vat = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'VAT', group-id => $bills.id, sort-order => 7));
+    $ws.categories.set-target($vat.id, kind => 'by_period', pence => 300000,
+                              period => '2026-11-07', start => '2026-01-01',
+                              repeat => 3);
+
+    my %f = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        %f<main>, category-id => $vat.id);
+    my $modal = %f<main>.modals[0];
+    fields($modal)<Name>.set-text('VAT (quarterly)');
+    submit(fields($modal)<Name>);
+    %f<store>.tick;
+
+    my $saved = $ws.categories.find-by-id($vat.id);
+    is $saved.name, 'VAT (quarterly)', 'the rename landed';
+    is $saved.target-pence, 300000, 'and the amount is still there';
+    is $saved.target-kind, 'by_period', 'with its kind';
+    is $saved.target-period, '2026-11-07', 'its goal period';
+    is $saved.target-repeat, 3, 'its repeat';
+    is $saved.target-start, '2026-01-01',
+        'and the plan start it was stamped with — not re-stamped to today';
+};
+
+subtest 'the goal fields are validated on the dialog, not by the engine' => {
+    plan 7;
+    my $doomed = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Half A Plan', group-id => $bills.id, sort-order => 8));
+
+    my sub attempt(Str :$goal = '', Str :$repeat = '', Str :$amount = '500') {
+        my %f = fixture();
+        App::Moneymoor::Screen::Main::Modals::open-category-editor(
+            %f<main>, category-id => $doomed.id);
+        my $modal = %f<main>.modals[0];
+        fields($modal)<Target>.set-text($amount);
+        kind-select($modal).select-index(2);
+        goal-fields($modal){'Goal period'}.set-text($goal);
+        goal-fields($modal)<Repeat>.set-text($repeat);
+        press-key($modal, 'ctrl+s');
+        %f<store>.tick;
+        $modal;
+    }
+
+    ok status(attempt()).contains('A goal needs a date'),
+        'a goal with no date says so on the dialog\'s own error line';
+    nok $ws.categories.find-by-id($doomed.id).has-target,
+        'and nothing was written';
+
+    ok status(attempt(goal => '2026-02-30')).contains('A goal needs a date'),
+        'a date that is not a real day is refused the same way';
+    ok status(attempt(goal => '2026-11-07', repeat => 'often'))
+        .contains('whole number of periods'),
+        'and a repeat that is not a count has its own message';
+    ok status(attempt(goal => '2026-11-07', repeat => '-1'))
+        .contains('whole number of periods'),
+        'including a negative one';
+    nok $ws.categories.find-by-id($doomed.id).has-target,
+        'none of which wrote anything';
+
+    # Blank clears the target, and "no target" has exactly one shape —
+    # so the goal fields are not even consulted, whatever the picker
+    # says.
+    my $modal = attempt(amount => '', goal => 'nonsense');
+    is status($modal), '',
+        'a blank amount clears the target without a word about the goal';
+};
+
+subtest 'the group editor saves on Enter too' => {
+    plan 4;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-group-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    ok $modal.frame-bottom-title.contains('enter/^s save'),
+        'the group editor advertises it';
+    %field<Name>.set-text('Savings Goals');
+    %field{'Sort order'}.set-text('8');
+    submit(%field{'Sort order'});
+    %f<store>.tick;
+    my $group = $ws.categories.find-group-by-name('Savings Goals');
+    ok $group.defined && $group.sort-order == 8, 'and Enter writes the group';
+
+    my %g = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-group-editor(%g<main>);
+    my $blank = %g<main>.modals[0];
+    my %bf = fields($blank);
+    my Int $before = $ws.categories.find-groups(:include-hidden).elems;
+    submit(%bf<Name>);
+    %g<store>.tick;
+    is $ws.categories.find-groups(:include-hidden).elems, $before,
+        'an unnamed group is refused through Enter as well';
+    ok status($blank).contains('needs a name'), 'with the same message';
+};
+
+subtest 'ctrl+d from an editor opens the delete confirm' => {
+    plan 3;
+    # The editors' own delete key, which lands on the same confirm the
+    # grid's `d` does. The app closes the editor first — with no App
+    # here that is a no-op, so what this pins is that the confirm opens
+    # and that it is the confirm, not a second editor.
+    my $doomed = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Delete From Editor', group-id => $bills.id));
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-category-editor(
+        $main, category-id => $doomed.id);
+    press-key($main.modals[0], 'ctrl+d');
+    is $main.modals.elems, 2, 'the confirm opened over the editor';
+
+    my @texts;
+    my @queue = $main.modals[1].content;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @texts.push($w.text) if $w.can('text');
+        @texts.append($w.spans.map(*.text)) if $w.can('spans');
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    my Str $copy = @texts.join(' ');
+    ok $copy.contains('Delete From Editor'), 'and it names the envelope';
+    ok $copy.contains('money assigned to it in any period'),
+        'and states the rule the engine actually enforces';
+};

@@ -1,0 +1,179 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Gateway::Account;
+use App::Moneymoor::Gateway::Assignment;
+use App::Moneymoor::Gateway::Category;
+
+plan 9;
+
+my $db-path = $*TMPDIR.add("moneymoor-gw-assignment-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $accounts   = App::Moneymoor::Gateway::Account.new(:$db);
+my $categories = App::Moneymoor::Gateway::Category.new(:$db);
+my $gw         = App::Moneymoor::Gateway::Assignment.new(:$db);
+
+my $groceries = $categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', sort-order => 1));
+my $dining = $categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Dining Out', sort-order => 2));
+my $rta = $categories.rta-category;
+my $visa = $accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Visa', type => 'credit'));
+my $visa-pay = $accounts.payment-category-for($visa.id);
+
+subtest 'set is an upsert' => {
+    plan 5;
+    my $first = $gw.set('2026-03-01', $groceries.id, 40000);
+    is $first.amount, 40000, 'the first set inserts';
+    is $first.period, '2026-03-01', 'period preserved';
+
+    my $second = $gw.set('2026-03-01', $groceries.id, 45000);
+    is $second.amount, 45000, 'the second set updates';
+    is $second.id, $first.id, 'the same row, not a second one';
+    is $gw.find-by-period('2026-03-01').elems, 1, 'one row for the pair';
+};
+
+subtest 'get and amount-for' => {
+    plan 3;
+    is $gw.get('2026-03-01', $groceries.id).amount, 45000, 'get reads it back';
+    nok $gw.get('2026-03-01', $dining.id).defined,
+        'an unassigned pair is a type object';
+    is $gw.amount-for('2026-03-01', $dining.id), 0,
+        'and amount-for calls that zero';
+};
+
+subtest 'negative and zero amounts are legal' => {
+    plan 2;
+    is $gw.set('2026-04-01', $dining.id, -5000).amount, -5000,
+        'a negative assignment is stored as written';
+    is $gw.set('2026-04-01', $dining.id, 0).amount, 0,
+        'so is zero';
+};
+
+subtest 'payment envelopes can be assigned to, Ready to Assign cannot' => {
+    plan 3;
+    is $gw.set('2026-03-01', $visa-pay.id, 12000).amount, 12000,
+        'funding a card payment envelope directly is how you pay off debt';
+
+    my $r = $gw.set('2026-03-01', $rta.id, 1000);
+    ok $r ~~ Failure, 'assigning to Ready to Assign is refused';
+    like $r.exception.message, /'pool assignments come from'/,
+        'with an explanation';
+    $r.so;
+};
+
+subtest 'validation: the key must be well formed' => {
+    plan 6;
+    my @malformed = <2026-3-01 2026-13-01 20260301 2026-02-30 nope>;
+    for @malformed -> $period {
+        my $r = $gw.set($period, $groceries.id, 1000);
+        ok $r ~~ Failure, "set refuses the malformed period '$period'";
+        $r.so;
+    }
+
+    my $r = $gw.set('2026-3-01', $groceries.id, 1000);
+    like $r.exception.message, /'YYYY-MM-DD'/,
+        'and the message names the shape it wanted';
+    $r.so;
+};
+
+subtest 'validation: the key must be a period START' => {
+    plan 9;
+    # The blast radius is the reason this is checked at all. A key that
+    # is well formed but is not a start opens a bucket the derivation
+    # sums alongside the real periods: the money is neither lost nor
+    # visible, and the budget stops adding up in a way no screen
+    # explains. Refusing at the gateway is the only place it can be
+    # caught cheaply.
+    for <set adjust> -> $verb {
+        my $r = $verb eq 'set'
+            ?? $gw.set('2026-03-15', $groceries.id, 1000)
+            !! $gw.adjust('2026-03-15', $groceries.id, 1000);
+        ok $r ~~ Failure,
+            "$verb refuses a real date that is not a period start";
+        like $r.exception.message, /'budget period'/,
+            "and $verb says a period start is what it wanted";
+        $r.so;
+    }
+
+    my $moved = $gw.move-money('2026-03-15', $groceries.id, $dining.id, 100);
+    ok $moved ~~ Failure, 'move-money refuses it as well';
+    $moved.so;
+
+    # The unmigrated shape specifically: a budget file that somehow
+    # dodged the period migration must not be able to write more of
+    # the old keys through the new gateway.
+    for <set adjust> -> $verb {
+        my $r = $verb eq 'set'
+            ?? $gw.set('2026-03', $groceries.id, 1000)
+            !! $gw.adjust('2026-03', $groceries.id, 1000);
+        ok $r ~~ Failure, "$verb refuses the pre-period key '2026-03'";
+        $r.so;
+    }
+
+    my $old-move = $gw.move-money('2026-03', $groceries.id, $dining.id, 100);
+    ok $old-move ~~ Failure, 'and so does move-money';
+    $old-move.so;
+
+    is $gw.find-by-period('2026-03-15').elems, 0,
+        'nothing was written by any of them';
+};
+
+subtest 'adjust is relative' => {
+    plan 3;
+    $gw.set('2026-05-01', $groceries.id, 10000);
+    is $gw.adjust('2026-05-01', $groceries.id, 2500).amount, 12500,
+        'adjust adds to what is already there';
+    is $gw.adjust('2026-05-01', $groceries.id, -12500).amount, 0,
+        'and subtracts';
+    is $gw.adjust('2026-06-01', $dining.id, 3000).amount, 3000,
+        'adjusting a pair with no row starts from zero';
+};
+
+subtest 'move-money is atomic and relative' => {
+    plan 6;
+    $gw.set('2026-07-01', $groceries.id, 40000);
+    $gw.set('2026-07-01', $dining.id, 5000);
+
+    ok $gw.move-money('2026-07-01', $groceries.id, $dining.id, 7500),
+        'move-money succeeds';
+    is $gw.amount-for('2026-07-01', $groceries.id), 32500, 'the source lost it';
+    is $gw.amount-for('2026-07-01', $dining.id), 12500, 'the destination gained it';
+
+    my $self-move = $gw.move-money('2026-07-01', $dining.id, $dining.id, 100);
+    ok $self-move ~~ Failure, 'moving money to itself is refused';
+    $self-move.so;
+
+    my $zero = $gw.move-money('2026-07-01', $groceries.id, $dining.id, 0);
+    ok $zero ~~ Failure, 'moving zero is refused';
+    $zero.so;
+
+    my $unknown = $gw.move-money('2026-07-01', $groceries.id, 99999, 100);
+    ok $unknown ~~ Failure, 'moving to an unknown category is refused';
+    $unknown.so;
+};
+
+subtest 'find-all, find-by-category, delete' => {
+    plan 4;
+    my @all = $gw.find-all;
+    my @keys = @all.map(*.period);
+    is-deeply @keys.Array, @keys.sort.Array, 'find-all is ordered by period';
+
+    my @for-groceries = $gw.find-by-category($groceries.id);
+    ok @for-groceries.grep({ .category-id != $groceries.id }).elems == 0,
+        'find-by-category is scoped';
+
+    ok $gw.delete('2026-07-01', $dining.id), 'delete succeeds';
+    nok $gw.get('2026-07-01', $dining.id).defined, 'and the row is gone';
+};

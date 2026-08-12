@@ -1,0 +1,374 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Test::Store;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::View::RegisterRow;
+
+# The accounts tab's half of the store, against a real SQLCipher file.
+#
+# The thing being proved here is the change token. `budget/digest` is a
+# digest of the derivation and `budget/catalogue` of the envelope
+# catalogue; neither can see a memo, a payee or a cleared state, so a
+# register keyed on those two would sit there showing yesterday's
+# words. `ws/rev` is the third token, and the memo test below is the
+# one that would fail without it.
+#
+# Every date is derived from PINNED-PERIOD. Nothing here reads the clock.
+
+plan 10;
+
+my constant PINNED-PERIOD = '2026-03-01';
+my constant DAY = '2026-03-05';
+
+my $db-path = $*TMPDIR.add("moneymoor-accounts-store-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash', sort-order => 1));
+my $savings = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Savings', type => 'cash', sort-order => 2));
+my $house = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'House', type => 'tracking', sort-order => 3));
+
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+my $rta = $ws.categories.rta-category;
+
+# £2,000 of pay, so the register has something in it and the
+# derivation has a reason to range over the pinned period.
+my $pay = $ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => PINNED-PERIOD,
+        amount => 200000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 200000)],
+);
+my $shop = $ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => DAY, amount => -4210,
+        memo => 'weekly shop'),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $groceries.id, amount => -4210)],
+);
+
+sub fixture(--> Hash) {
+    my @toasts;
+    my $view;
+    my $handlers = App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        toast     => -> Str $m { @toasts.push($m) },
+        on-view   => -> $v { $view = $v },
+    );
+    my $store = mock-store;
+    $handlers.register($store);
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PINNED-PERIOD);
+    { :$store, :$handlers, :@toasts, view => -> { $view } };
+}
+
+sub mutate($store, &action) {
+    dispatch-and-tick($store, 'ws/mutate-requested', :&action);
+}
+
+sub rev($store --> Int) { (state-at($store, 'ws', 'rev') // 0).Int }
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the initial load publishes all three change tokens' => {
+    plan 4;
+    my %f = fixture();
+    ok rev(%f<store>) > 0, 'ws/rev is past its seeded zero';
+    ok state-at(%f<store>, 'budget', 'digest').chars, 'the derivation digest';
+    ok state-at(%f<store>, 'budget', 'catalogue').chars, 'the catalogue token';
+    is state-at(%f<store>, 'accounts', 'selected-account-id'), 0,
+        'and the register starts on All Accounts';
+};
+
+subtest 'a memo-only edit moves ws/rev and nothing else' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+    my Int $before-rev = rev($store);
+    my Str $before-digest = state-at($store, 'budget', 'digest');
+    my Str $before-catalogue = state-at($store, 'budget', 'catalogue');
+
+    # Same account, same date, same amount, same splits (omitted, so
+    # kept) — only the words change. This is the edit that repainted
+    # nothing before ws/rev existed.
+    mutate($store, -> {
+        $ws.transactions.update(App::Moneymoor::Model::Transaction.new(
+            id => $shop.id, account-id => $shop.account-id,
+            date => $shop.date, payee-id => $shop.payee-id,
+            memo => 'weekly shop — and a birthday card',
+            amount => $shop.amount, cleared => $shop.cleared));
+    });
+
+    is state-at($store, 'budget', 'digest'), $before-digest,
+        'the derivation is byte-identical, as it should be';
+    is state-at($store, 'budget', 'catalogue'), $before-catalogue,
+        'and so is the envelope catalogue';
+    is rev($store), $before-rev + 1,
+        'but ws/rev moved, so the register repaints';
+    is $ws.transactions.find-by-id($shop.id).memo,
+        'weekly shop — and a birthday card', 'and the memo really changed';
+};
+
+subtest 'the cleared cycle round-trips through the mutation effect' => {
+    plan 8;
+    my %f = fixture();
+    my $store = %f<store>;
+    my Int $id = $shop.id;
+
+    for <cleared reconciled uncleared> -> $expected {
+        my Int $before = rev($store);
+        my Str $now = $ws.transactions.find-by-id($id).cleared;
+        my Str $next = next-cleared-state($now);
+        mutate($store, -> { $ws.transactions.set-cleared($id, $next) });
+        is $ws.transactions.find-by-id($id).cleared, $expected,
+            "c takes it to $expected";
+        is rev($store), $before + 1, "and the register hears about it";
+    }
+
+    # The engine is the one that decides what a legal state is, and its
+    # refusal has to reach the user rather than the log.
+    my Int $before = rev($store);
+    mutate($store, -> { $ws.transactions.set-cleared($id, 'sort-of') });
+    is rev($store), $before,
+        'a refused state does not bump the token — nothing changed';
+    ok %f<toasts>.tail.contains('sort-of'),
+        'and the engine\'s own message is what the user is shown';
+};
+
+subtest 'creating a credit account creates its payment envelope' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+    my Str $before = state-at($store, 'budget', 'catalogue');
+
+    mutate($store, -> {
+        $ws.accounts.create(App::Moneymoor::Model::Account.new(
+            name => 'Visa', type => 'credit', sort-order => 4));
+    });
+
+    my $visa = $ws.accounts.find-by-name('Visa');
+    ok $visa.defined, 'the account exists';
+    my $payment = $ws.accounts.payment-category-for($visa.id);
+    ok $payment.defined && $payment.is-payment,
+        'and the engine made its payment envelope in the same breath';
+
+    my Str $after = state-at($store, 'budget', 'catalogue');
+    isnt $after, $before,
+        'the catalogue token moved, so the budget grid repaints too';
+    ok $after.contains('Visa'), 'and the new envelope is in it';
+
+    # Leave the fixture as the other subtests expect it.
+    $ws.accounts.delete($visa.id);
+};
+
+subtest 'a transfer shows up in both registers, once each' => {
+    plan 6;
+    my %f = fixture();
+    my $store = %f<store>;
+    my Int $before = rev($store);
+
+    mutate($store, -> {
+        $ws.transactions.create-transfer(
+            from-account-id => $current.id,
+            to-account-id   => $savings.id,
+            date            => DAY,
+            amount          => 50000,
+            memo            => 'sweep',
+        );
+    });
+    is rev($store), $before + 1, 'the write landed';
+
+    my %accounts = $ws.accounts.find-all(:include-closed)
+        .map({ .id => $_ }).Hash;
+    my %peers = $ws.transactions.find-all.map({ .id => .account-id }).Hash;
+
+    sub rows-for($id) {
+        register-rows(
+            transactions => $ws.transactions.find-by-account($id),
+            accounts => %accounts, peer-accounts => %peers,
+            running-balance => True, icons => icons('unicode'),
+        );
+    }
+
+    my @out = rows-for($current.id).grep(*.<transfer>);
+    my @in  = rows-for($savings.id).grep(*.<transfer>);
+    is @out.elems, 1, 'one leg in the account it left';
+    is @in.elems,  1, 'and one in the account it arrived at';
+
+    ok @out[0]<outflow>.contains('500.00'), 'out of Current';
+    ok @in[0]<inflow>.contains('500.00'), 'into Savings';
+    is @out[0]<payee>, icons('unicode').transfer ~ ' Savings',
+        'and each leg names the other end, which needs the peer index';
+};
+
+subtest 'a transfer across the budget boundary needs its envelope' => {
+    plan 3;
+    my %f = fixture();
+    my $store = %f<store>;
+    my Int $before = rev($store);
+
+    # House is a tracking account, so this is money leaving the budget
+    # and the engine refuses it without a split on the on-budget leg.
+    mutate($store, -> {
+        $ws.transactions.create-transfer(
+            from-account-id => $current.id,
+            to-account-id   => $house.id,
+            date            => DAY,
+            amount          => 10000,
+        );
+    });
+    is rev($store), $before,
+        'refused, so no token moves and nothing repaints';
+    ok %f<toasts>.tail.contains('categorized'),
+        'and the engine says why';
+
+    mutate($store, -> {
+        $ws.transactions.create-transfer(
+            from-account-id => $current.id,
+            to-account-id   => $house.id,
+            date            => DAY,
+            amount          => 10000,
+            splits => [App::Moneymoor::Model::Split.new(
+                category-id => $groceries.id, amount => -10000)],
+        );
+    });
+    is rev($store), $before + 1, 'with the envelope named, it goes through';
+};
+
+subtest 'the sidebar\'s two pieces of state' => {
+    plan 5;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    dispatch-and-tick($store, 'accounts/select-account',
+                      account-id => $savings.id);
+    is state-at($store, 'accounts', 'selected-account-id'), $savings.id,
+        'the sidebar picks a ledger';
+
+    # There is no "nothing selected": the cursor is always somewhere,
+    # and All Accounts is where a missing id lands.
+    dispatch-and-tick($store, 'accounts/select-account');
+    is state-at($store, 'accounts', 'selected-account-id'), 0,
+        'and an undefined id is All Accounts, not an empty register';
+
+    nok state-at($store, 'accounts', 'closed-expanded'),
+        'the closed bucket starts folded';
+    dispatch-and-tick($store, 'accounts/toggle-closed');
+    ok state-at($store, 'accounts', 'closed-expanded'), 'c unfolds it';
+    dispatch-and-tick($store, 'accounts/toggle-closed');
+    nok state-at($store, 'accounts', 'closed-expanded'), 'and folds it again';
+};
+
+subtest 'closing an account keeps its money in the net worth' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    mutate($store, -> { $ws.accounts.close($savings.id) });
+    ok $ws.accounts.find-by-id($savings.id).closed, 'it is closed';
+
+    my @accounts = $ws.accounts.find-all(:include-closed);
+    my @rows = sidebar-rows(:@accounts, view => %f<view>(),
+                            icons => icons('unicode'));
+    nok @rows.grep({ $_<kind> eq 'account' && $_<id> == $savings.id }).elems,
+        'and it has left the list';
+    ok @rows.grep({ $_<kind> eq 'closed-toggle' }).elems,
+        'for the CLOSED bucket';
+
+    # The derivation still holds its balance — closing is a display
+    # decision, not an accounting one — but net worth is about what the
+    # user still has, and the fold is where a closed account's money
+    # lives now.
+    my @open = @accounts.grep({ !.closed });
+    is net-worth(accounts => @accounts, view => %f<view>()),
+       net-worth(accounts => @open, view => %f<view>()),
+        'net worth counts the open accounts, and only those';
+
+    mutate($store, -> { $ws.accounts.reopen($savings.id) });
+};
+
+subtest 'reconcile mode is written, refused and cleared' => {
+    plan 7;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => $current.id, statement => 195790);
+    my $mode = state-at($store, 'accounts', 'reconcile');
+    is $mode<account-id>, $current.id, 'the ledger being reconciled';
+    is $mode<statement>, 195790, 'and the figure to reconcile it against';
+
+    # The mode has to come back off. `db` deep-merges, so clearing it
+    # with anything but db-replace would leave the old map in place and
+    # the mode could be entered but never left.
+    dispatch-and-tick($store, 'accounts/reconcile-exit');
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        'and exiting really removes it, rather than merging Nil into it';
+
+    # All Accounts has no cleared balance to compare a statement with,
+    # so the diff would be a difference between one statement and every
+    # ledger the user owns.
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => 0, statement => 100);
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        'All Accounts is refused at the handler';
+
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => $current.id);
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        'and so is a statement that never parsed';
+
+    # Nothing about the mode is a fact, so nothing about it recomputes.
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => $current.id, statement => 1);
+    my Int $before = rev($store);
+    dispatch-and-tick($store, 'accounts/reconcile-exit');
+    is rev($store), $before, 'entering and leaving derives nothing';
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => $current.id, statement => 1);
+    is rev($store), $before, 'in either direction';
+};
+
+subtest 'the reports tab\'s one piece of state' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    nok state-at($store, 'reports', 'by-group'),
+        'spending starts per envelope, as §4.6 draws it';
+    my Int $before = rev($store);
+
+    dispatch-and-tick($store, 'reports/toggle-by-group');
+    ok state-at($store, 'reports', 'by-group'), 'b groups it';
+    dispatch-and-tick($store, 'reports/toggle-by-group');
+    nok state-at($store, 'reports', 'by-group'), 'and b ungroups it again';
+
+    is rev($store), $before,
+        'without a recompute — it adds the same derivation up '
+        ~ 'differently, it does not change a fact';
+};

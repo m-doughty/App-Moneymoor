@@ -1,0 +1,385 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Category;
+
+plan 14;
+
+my $db-path = $*TMPDIR.add("moneymoor-db-test-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $plain-path = $*TMPDIR.add("moneymoor-plain-test-{$*PID}.db").Str;
+LEAVE { unlink $plain-path if $plain-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+ok $db.is-connected, 'DB connected';
+
+subtest 'every expected table exists' => {
+    my @tables = <budget_meta accounts category_groups categories payees
+                  transactions splits assignments>;
+    plan @tables.elems;
+    for @tables -> $table {
+        my $row = $db.query-one(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            $table);
+        ok $row && $row<name> eq $table, "table $table exists";
+    }
+};
+
+subtest 'indices the derivation depends on' => {
+    my @indices = <idx_transactions_date idx_splits_transaction
+                   idx_splits_category idx_assignments_period_category
+                   idx_categories_kind>;
+    plan @indices.elems;
+    my @existing = $db.query-all(
+        "SELECT name FROM sqlite_master WHERE type='index'").map({ .<name> });
+    for @indices -> $idx {
+        ok @existing.first({ $_ eq $idx }).defined, "index $idx exists";
+    }
+};
+
+subtest 'system rows are seeded' => {
+    plan 5;
+    my $rta = $db.query-one("SELECT * FROM categories WHERE kind = 'rta'");
+    ok $rta && $rta<id>, 'the rta category exists';
+    is $rta<name>, 'Ready to Assign', 'named Ready to Assign';
+    nok $rta<group_id>.defined, 'and is ungrouped';
+
+    my $group = $db.query-one(
+        "SELECT * FROM category_groups WHERE name = 'Credit Card Payments'");
+    ok $group && $group<id>, 'the credit-card payment group exists';
+    is $group<system>, 1, 'and is marked system';
+};
+
+subtest 'CHECK constraints reject nonsense' => {
+    plan 3;
+    dies-ok {
+        $db.execute("INSERT INTO accounts (name, type) VALUES (?, ?)",
+            'Bogus', 'crypto');
+        True;
+    }, 'accounts.type CHECK rejects an unknown type';
+
+    dies-ok {
+        $db.execute("INSERT INTO categories (name, kind) VALUES (?, ?)",
+            'Bogus', 'magic');
+        True;
+    }, 'categories.kind CHECK rejects an unknown kind';
+
+    dies-ok {
+        $db.execute(
+            "INSERT INTO accounts (name, type) VALUES ('CheckSrc', 'cash')");
+        my $id = $db.last-insert-id;
+        $db.execute(
+            "INSERT INTO transactions (account_id, date, amount, cleared)
+             VALUES (?, '2026-03-01', -100, 'maybe')", $id);
+        True;
+    }, 'transactions.cleared CHECK rejects an unknown state';
+};
+
+subtest 'foreign keys are enforced on this connection' => {
+    plan 3;
+    dies-ok {
+        $db.execute(
+            "INSERT INTO transactions (account_id, date, amount)
+             VALUES (99999, '2026-03-01', -100)");
+        True;
+    }, 'a transaction cannot reference a missing account';
+
+    $db.execute("INSERT INTO accounts (name, type) VALUES ('FK Test', 'cash')");
+    my $account-id = $db.last-insert-id;
+    $db.execute(
+        "INSERT INTO transactions (account_id, date, amount)
+         VALUES (?, '2026-03-01', -100)", $account-id);
+    my $txn-id = $db.last-insert-id;
+    my $category = $db.query-one("SELECT id FROM categories WHERE kind='rta'");
+    $db.execute(
+        "INSERT INTO splits (transaction_id, category_id, amount)
+         VALUES (?, ?, -100)", $txn-id, $category<id>);
+
+    $db.execute("DELETE FROM transactions WHERE id = ?", $txn-id);
+    my $orphans = $db.query-one(
+        "SELECT count(*) AS n FROM splits WHERE transaction_id = ?", $txn-id);
+    is $orphans<n>, 0, 'deleting a transaction cascades to its splits';
+
+    dies-ok {
+        $db.execute(
+            "INSERT INTO splits (transaction_id, category_id, amount)
+             VALUES (?, 99999, -100)", $txn-id);
+        True;
+    }, 'a split cannot reference a missing category';
+};
+
+subtest 'assignments are one row per (period_start, category)' => {
+    plan 2;
+    my $category = $db.query-one("SELECT id FROM categories WHERE kind='rta'");
+    $db.execute(
+        "INSERT INTO assignments (period_start, category_id, amount)
+         VALUES ('2026-03-01', ?, 1000)", $category<id>);
+    dies-ok {
+        $db.execute(
+            "INSERT INTO assignments (period_start, category_id, amount)
+             VALUES ('2026-03-01', ?, 2000)", $category<id>);
+        True;
+    }, 'the unique index rejects a second row for the same pair';
+
+    $db.execute(
+        "INSERT INTO assignments (period_start, category_id, amount)
+         VALUES ('2026-04-01', ?, 2000)
+         ON CONFLICT(period_start, category_id)
+         DO UPDATE SET amount = excluded.amount",
+        $category<id>);
+    $db.execute(
+        "INSERT INTO assignments (period_start, category_id, amount)
+         VALUES ('2026-04-01', ?, 3000)
+         ON CONFLICT(period_start, category_id)
+         DO UPDATE SET amount = excluded.amount",
+        $category<id>);
+    my $row = $db.query-one(
+        "SELECT amount FROM assignments
+         WHERE period_start='2026-04-01' AND category_id=?",
+        $category<id>);
+    is $row<amount>, 3000, 'the upsert the gateway relies on works';
+};
+
+subtest 'budget_meta: get-meta, set-meta, and what absence means' => {
+    plan 7;
+    # Absence is an answer, not an error: for the period scheme it means
+    # "the calendar month", and for schema_rev it means revision 0.
+    # It has to stay distinguishable from a stored empty string.
+    nok $db.get-meta('never_written').defined,
+        'an unwritten key reads as the Str type object';
+
+    $db.set-meta('a_key', 'first');
+    is $db.get-meta('a_key'), 'first', 'set-meta writes';
+    $db.set-meta('a_key', 'second');
+    is $db.get-meta('a_key'), 'second', 'and overwrites rather than duplicating';
+
+    my $rows = $db.query-one(
+        "SELECT count(*) AS n FROM budget_meta WHERE key = 'a_key'");
+    is $rows<n>, 1, 'the upsert leaves exactly one row';
+
+    $db.set-meta('empty_key', '');
+    ok $db.get-meta('empty_key').defined,
+        'a stored empty string is defined';
+    is $db.get-meta('empty_key'), '', 'and reads back as itself';
+
+    # The revision this code writes, stamped on every file it opens.
+    is $db.get-meta('schema_rev'), '1',
+        'connect stamped the current schema revision';
+};
+
+subtest 'run-txn commits, rolls back, and nests' => {
+    plan 4;
+    $db.execute("DELETE FROM payees");
+
+    $db.run-txn: {
+        $db.execute("INSERT INTO payees (name) VALUES ('Committed')");
+    };
+    my $after-commit = $db.query-one(
+        "SELECT count(*) AS n FROM payees WHERE name = 'Committed'");
+    is $after-commit<n>, 1, 'a successful run-txn commits';
+
+    my $died = False;
+    try {
+        $db.run-txn: {
+            $db.execute("INSERT INTO payees (name) VALUES ('Rolled Back')");
+            die 'nope';
+        };
+        CATCH { default { $died = True } }
+    }
+    ok $died, 'an exception inside run-txn propagates to the caller';
+    my $after-rollback = $db.query-one(
+        "SELECT count(*) AS n FROM payees WHERE name = 'Rolled Back'");
+    is $after-rollback<n>, 0, 'and the write was rolled back';
+
+    $db.run-txn: {
+        $db.execute("INSERT INTO payees (name) VALUES ('Outer')");
+        $db.run-txn: {
+            $db.execute("INSERT INTO payees (name) VALUES ('Inner')");
+        };
+    };
+    my $nested = $db.query-one(
+        "SELECT count(*) AS n FROM payees WHERE name IN ('Outer','Inner')");
+    is $nested<n>, 2, 'a nested run-txn joins the outer transaction';
+};
+
+subtest 'ensure-column is the additive migration seam' => {
+    plan 3;
+    $db.execute('CREATE TABLE IF NOT EXISTS migration_probe (id INTEGER PRIMARY KEY)');
+
+    $db.ensure-column('migration_probe', 'note', "TEXT NOT NULL DEFAULT ''");
+    my @cols = $db.query-all('PRAGMA table_info(migration_probe)').map({ .<name> });
+    ok @cols.first({ $_ eq 'note' }).defined, 'the column was added';
+
+    $db.ensure-column('migration_probe', 'note', "TEXT NOT NULL DEFAULT ''");
+    my @again = $db.query-all('PRAGMA table_info(migration_probe)')
+        .map({ .<name> }).grep({ $_ eq 'note' });
+    is @again.elems, 1, 're-running is a no-op, not a duplicate column';
+
+    $db.execute("INSERT INTO migration_probe (id) VALUES (1)");
+    my $row = $db.query-one('SELECT note FROM migration_probe WHERE id = 1');
+    is $row<note>, '', 'the added column carries its default';
+
+    $db.execute('DROP TABLE migration_probe');
+};
+
+subtest 'a budget file older than the target columns still opens' => {
+    plan 8;
+    # The additive migrations, exercised the only way that proves them:
+    # against a file that genuinely lacks the columns. Every budget
+    # written by v0.2.0 and earlier is one of these, and "it opens" is
+    # not a claim a fresh-file test can make.
+    my constant TARGET-COLUMNS = <target_pence target_kind target_period
+                                  target_start target_repeat>;
+
+    my $legacy-path = $*TMPDIR.add("moneymoor-legacy-{$*PID}.db").Str;
+    LEAVE { unlink $legacy-path if $legacy-path.IO.e }
+
+    my $legacy = App::Moneymoor::DB.new(db-path => $legacy-path);
+    $legacy.connect('testpass');
+    $legacy.execute(
+        "INSERT INTO categories (group_id, name, kind, sort_order, hidden)
+         VALUES (NULL, 'Groceries', 'standard', 1, 0)");
+    # Wind the schema back to what it was before targets existed.
+    $legacy.execute("ALTER TABLE categories DROP COLUMN $_")
+        for TARGET-COLUMNS;
+    my @before = $legacy.query-all('PRAGMA table_info(categories)')
+        .map({ .<name> });
+    is @before.grep({ TARGET-COLUMNS.first($_).defined }).elems, 0,
+        'the columns really are gone';
+    $legacy.disconnect;
+
+    my $reopened = App::Moneymoor::DB.new(db-path => $legacy-path);
+    my $result = $reopened.connect('testpass');
+    ok $reopened.is-connected && !($result ~~ Failure),
+        'the file opens rather than failing on the missing columns';
+
+    my @after = $reopened.query-all('PRAGMA table_info(categories)')
+        .map({ .<name> });
+    is-deeply @after.grep({ TARGET-COLUMNS.first($_).defined }).sort.List,
+        TARGET-COLUMNS.sort.List,
+        'and the migrations put every one of them back';
+
+    # The defaults are also the correct values for every pre-existing
+    # row — a legacy envelope reads as the refill target of nothing it
+    # always was — which is what makes these one-line migrations with no
+    # backfill behind them.
+    my $row = $reopened.query-one(
+        "SELECT * FROM categories WHERE name = 'Groceries'");
+    is $row<target_pence>, 0, 'the row that predates them reads "no target"';
+    is $row<target_kind>, 'refill', 'of the kind it always meant';
+    is $row<target_repeat>, 0, 'with no repeat';
+    nok ($row<target_period>.defined || $row<target_start>.defined),
+        'and no dates, which only a by-period target has';
+
+    my $survivors = $reopened.query-one(
+        "SELECT count(*) AS n FROM categories WHERE name = 'Groceries'");
+    is $survivors<n>, 1, 'and nothing was lost adding them';
+    $reopened.disconnect;
+};
+
+subtest 'a budget file older than carry_overspend reads as the forcing rule'
+        => {
+    plan 5;
+    # The sixth additive column, exercised the same way and for a
+    # sharper reason than the target ones: its default is not merely a
+    # sensible value for a legacy row, it is the rule every period of
+    # that file was already derived under. A migration that arrived with
+    # any other default would silently re-derive somebody's past.
+    my $legacy-path = $*TMPDIR.add("moneymoor-legacy-carry-{$*PID}.db").Str;
+    LEAVE { unlink $legacy-path if $legacy-path.IO.e }
+
+    my $legacy = App::Moneymoor::DB.new(db-path => $legacy-path);
+    $legacy.connect('testpass');
+    $legacy.execute(
+        "INSERT INTO categories (group_id, name, kind, sort_order, hidden)
+         VALUES (NULL, 'Expenses', 'standard', 1, 0)");
+    $legacy.execute('ALTER TABLE categories DROP COLUMN carry_overspend');
+    my @before = $legacy.query-all('PRAGMA table_info(categories)')
+        .map({ .<name> });
+    nok @before.first({ $_ eq 'carry_overspend' }).defined,
+        'the column really is gone';
+    $legacy.disconnect;
+
+    my $reopened = App::Moneymoor::DB.new(db-path => $legacy-path);
+    my $result = $reopened.connect('testpass');
+    ok $reopened.is-connected && !($result ~~ Failure),
+        'the file opens rather than failing on the missing column';
+
+    my $row = $reopened.query-one(
+        "SELECT * FROM categories WHERE name = 'Expenses'");
+    is $row<carry_overspend>, 0,
+        'the row that predates it is on the forcing rule';
+
+    # Through the model, because that is what every read site sees: a
+    # Bool, defaulted, with no NULL for a caller to guard.
+    my $category = App::Moneymoor::Model::Category.new-from-row($row);
+    nok $category.carry-overspend, 'which the model reads as False';
+    nok $category.carries-negative,
+        'so it does not carry — the predicate the engine asks';
+    $reopened.disconnect;
+};
+
+subtest 'target_kind is constrained to the three kinds' => {
+    plan 5;
+    # The CHECK rides along on the added column, which is the one
+    # constraint an `ensure-column` migration is allowed to carry. The
+    # gateway refuses an unknown kind with a message; this is the
+    # backstop for hand-written SQL.
+    my @cols = $db.query-all('PRAGMA table_info(categories)').map({ .<name> });
+    ok @cols.first({ $_ eq 'target_kind' }).defined,
+        'a fresh file has the column';
+
+    for <refill set_aside by_period> -> $kind {
+        lives-ok {
+            $db.execute(
+                "INSERT INTO categories (name, kind, target_kind, target_pence)
+                 VALUES (?, 'standard', ?, 100)",
+                "Kind Probe $kind", $kind);
+            True;
+        }, "$kind is accepted";
+    }
+
+    dies-ok {
+        $db.execute(
+            "INSERT INTO categories (name, kind, target_kind, target_pence)
+             VALUES ('Bogus Kind', 'standard', 'sideways', 100)");
+        True;
+    }, 'categories.target_kind CHECK rejects anything else';
+
+    $db.execute("DELETE FROM categories WHERE name LIKE 'Kind Probe%'");
+};
+
+subtest 'reconnect, wrong passphrase, and plaintext detection' => {
+    plan 6;
+    my $db2 = App::Moneymoor::DB.new(:$db-path);
+    my $result = $db2.connect('testpass');
+    ok $db2.is-connected, 'reconnecting runs the migrations again without error';
+    ok $result.defined && !($result ~~ Failure), 'connect returns the DB';
+    my $accounts = $db2.query-one("SELECT count(*) AS n FROM accounts");
+    ok $accounts<n> >= 1, 'the existing data is still there';
+    $db2.disconnect;
+
+    my $wrong = App::Moneymoor::DB.new(:$db-path);
+    my $failed = $wrong.connect('not the passphrase');
+    ok $failed ~~ Failure, 'the wrong passphrase returns a Failure';
+    like $failed.exception.message, /:i 'passphrase'/,
+        'and the message says so';
+    $failed.so;
+
+    # A plain (unencrypted) SQLite file is positively identifiable, so
+    # it gets its own message rather than the hedged wrong-key one.
+    $plain-path.IO.spurt("SQLite format 3\0" ~ "\0" x 128);
+    my $plain = App::Moneymoor::DB.new(db-path => $plain-path);
+    my $plain-result = $plain.connect('testpass');
+    ok $plain-result ~~ Failure
+        && $plain-result.exception.message.contains('plain SQLite'),
+        'a plaintext SQLite file is reported as such';
+    $plain-result.so;
+};

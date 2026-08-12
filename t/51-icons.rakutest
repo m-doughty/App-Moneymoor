@@ -1,0 +1,112 @@
+use Test;
+use lib 'lib';
+
+use JSON::Fast;
+
+use App::Moneymoor::Config;
+use App::Moneymoor::Service::Icons;
+
+# Icon accessors we assert against, in source-verified order — matches
+# the slot table in lib/App/Moneymoor/Service/Icons.rakumod.
+my @ACCESSORS = <
+    cleared-uncleared cleared-cleared cleared-reconciled account-cash
+    account-credit account-tracking transfer warn group-collapsed
+    group-expanded gutter move inflow outflow budget
+>;
+
+plan 5;
+
+subtest "unicode tier matches the source glyph table" => {
+    plan @ACCESSORS.elems;
+    my $u = icons();
+    my %expected =
+        cleared-uncleared  => '○',
+        cleared-cleared    => '◐',
+        cleared-reconciled => '●',
+        account-cash       => '▪',
+        account-credit     => '▫',
+        account-tracking   => '◦',
+        transfer           => '⇄',
+        warn               => '‼',
+        group-collapsed    => '▸',
+        group-expanded     => '▾',
+        gutter             => '▍',
+        move               => '→',
+        inflow             => '↓',
+        outflow            => '↑',
+        budget             => '◆',
+    ;
+    for @ACCESSORS -> $name {
+        is $u."$name"(), %expected{$name}, "unicode $name matches source glyph";
+    }
+};
+
+subtest "nerd tier: every accessor is non-empty" => {
+    plan @ACCESSORS.elems;
+    my $n = icons('nerd');
+    for @ACCESSORS -> $name {
+        ok $n."$name"().chars > 0, "nerd $name is non-empty";
+    }
+};
+
+subtest "every accessor of both tiers is exactly one grapheme" => {
+    plan @ACCESSORS.elems * 2;
+    for ('unicode', 'nerd') -> $tier {
+        my $glyphs = icons($tier);
+        for @ACCESSORS -> $name {
+            is $glyphs."$name"().chars, 1, "$tier $name is one grapheme";
+        }
+    }
+};
+
+subtest "unknown tier falls back to unicode" => {
+    plan 2;
+    is icons('made-up'), icons(), "bogus tier name resolves to unicode";
+    is icons(''), icons(), "empty tier name resolves to unicode";
+};
+
+# The tier is only useful if it survives a restart, and the one thing
+# that can silently break it is a config file written before the key
+# existed — an upgrade must not leave the user staring at empty cells
+# where the glyphs used to be.
+subtest "Config round-trip" => {
+    plan 3;
+
+    my $scratch = $*TMPDIR.add("moneymoor-icons-config-{$*PID}").Str;
+    %*ENV<MONEYMOOR_HOME> = $scratch;
+
+    LEAVE {
+        if $scratch.IO.d {
+            for $scratch.IO.dir -> $entry {
+                if $entry.d {
+                    for $entry.dir -> $f { unlink $f }
+                    rmdir $entry;
+                } else {
+                    unlink $entry;
+                }
+            }
+            rmdir $scratch;
+        }
+        %*ENV<MONEYMOOR_HOME>:delete;
+    }
+
+    my $cfg = App::Moneymoor::Config.new;
+    is $cfg.icons, 'unicode', "default icons tier is 'unicode'";
+
+    $cfg.load;
+    $cfg.icons = 'nerd';
+    $cfg.save;
+
+    my $cfg2 = App::Moneymoor::Config.new.load;
+    is $cfg2.icons, 'nerd', "saved icons tier round-trips";
+
+    # A config file written without the `icons` key must still load as
+    # 'unicode' rather than as a type object that would blow up at the
+    # first `icons($cfg.icons)`.
+    spurt $cfg2.config-path,
+        to-json({ budget_name => 'budget', theme => 'gruvbox' },
+                :sorted-keys, :pretty);
+
+    my $cfg3 = App::Moneymoor::Config.new.load;
+    is $cfg3.icons, 'unicode', "config file missing 'icons' loads as 'unicode'";
+};

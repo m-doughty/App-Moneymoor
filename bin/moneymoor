@@ -1,0 +1,74 @@
+#!/usr/bin/env raku
+
+# `use MacOS::NativeLib` shells out to `brew config` per library,
+# adding ~1s per launch. Skip when the symlink is already in place.
+#
+# This has to run BEFORE anything pulls in App::Moneymoor::DB — the
+# engine deliberately doesn't depend on MacOS::NativeLib (it is a
+# macOS-only distribution and would tax every Linux consumer), so
+# loading the sqlcipher shim is the entry point's job. Hence the
+# BEGIN block: `use App::Moneymoor::UI` below is a compile-time load
+# and would otherwise win the race.
+BEGIN {
+    my $lib-dir = $*EXECUTABLE.parent.sibling("lib");
+    unless $lib-dir.add("libsqlcipher.dylib").e {
+        my $saved-err = $*ERR;
+        $*ERR = open $*SPEC.devnull, :w;
+        EVAL q[use MacOS::NativeLib <sqlcipher>];
+        $*ERR = $saved-err;
+    }
+}
+
+use App::Moneymoor::UI;
+use JSON::Fast;
+
+#| App::Moneymoor — envelope-budgeting TUI. With no flags, launches the
+#| TUI. C<--version> and C<--help> are the only non-interactive paths;
+#| everything else (budgets, accounts, transactions) happens inside it.
+sub MAIN(
+    Bool :$version,   #= Print version and exit
+    Bool :$help,      #= Print help and exit
+) {
+    if $version {
+        say "App::Moneymoor { moneymoor-version() }";
+        return;
+    }
+    if $help {
+        say q:to/HELP/;
+        Usage: moneymoor [--version] [--help]
+
+          --version   Print the App::Moneymoor version and exit.
+          --help      Print this help and exit.
+
+        With no flags, launches the TUI. The login screen lists the
+        encrypted budgets under ~/.moneymoor (or offers a create-new
+        flow if there are none); all subsequent interaction is
+        keyboard-driven inside the TUI.
+
+        Set MONEYMOOR_HOME to point the data home somewhere else.
+        HELP
+        return;
+    }
+    App::Moneymoor::UI.new.run;
+}
+
+#| Read the published version. The authoritative answer is
+#| C<App::Moneymoor::UI::dist-version> — C<$?DISTRIBUTION> from module
+#| scope, which works installed (zef, or an ariza bundle's C<inst#>
+#| site repo, where this script runs from the sources store and
+#| C<bin/../META6.json> does not exist) and from a checkout alike.
+#| The C<META6.json> probe stays as the fallback for the one context
+#| with no distribution at all, and "dev" closes the chain.
+sub moneymoor-version(--> Str) {
+    my $v = App::Moneymoor::UI::dist-version;
+    return $v unless $v eq 'dev';
+    my @candidates = $?FILE.IO.parent.parent.add('META6.json');
+    for @candidates -> $path {
+        next unless $path.e;
+        my $data = try { from-json(slurp $path) };
+        next unless $data;
+        my $v = $data<version>;
+        return $v if $v.defined && $v.chars > 0;
+    }
+    'dev';
+}

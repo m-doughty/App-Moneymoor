@@ -1,0 +1,256 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+
+plan 11;
+
+subtest 'a positive balance carries forward untouched' => {
+    plan 6;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 25000,
+             category => GROCERIES);
+
+    my $view = $f.compute(through-period => '2026-05-01');
+    is $view.category('2026-03-01', GROCERIES).available, 15000,
+        'March ends with 150.00 left';
+    is $view.category('2026-03-01', GROCERIES).carry-out, 15000,
+        'which is exactly what carries';
+    is $view.category('2026-04-01', GROCERIES).carry-in, 15000,
+        'April starts with it';
+    is $view.category('2026-04-01', GROCERIES).available, 15000,
+        'and still has it, having done nothing';
+    is $view.category('2026-05-01', GROCERIES).carry-in, 15000,
+        'and so does May';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds every month';
+};
+
+subtest 'cash overspending resets the envelope and charges Ready to Assign' => {
+    plan 9;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 20000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 30000,
+             category => GROCERIES);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $march = $view.category('2026-03-01', GROCERIES);
+    is $march.available, -10000, 'March is 100.00 in the hole';
+    is $march.cash-overspend, 10000, 'all of it cash overspending';
+    is $march.credit-overspend, 0, 'none of it credit overspending';
+    is $march.carry-out, 0, 'the hole does not carry into April';
+    ok $march.has-flag('overspent'), 'the row is flagged overspent';
+    ok $march.has-flag('cash-overspend'), 'and specifically cash-overspent';
+
+    is $view.rta('2026-03-01'), 80000,
+        "March's own Ready to Assign is not charged for it";
+    is $view.rta('2026-04-01'), 70000,
+        "April's Ready to Assign is — you spent money you did not have";
+    is $view.invariant-errors.join('; '), '', 'the invariant holds every month';
+};
+
+subtest 'cash overspending is charged once, then stays charged' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 5000,
+             category => DINING);
+
+    my $view = $f.compute(through-period => '2026-06-01');
+    is $view.rta('2026-03-01'), 100000, 'March is untouched';
+    is $view.rta('2026-04-01'), 95000, 'April carries the charge';
+    is $view.rta('2026-05-01'), 95000, 'May is charged once, not twice';
+    is $view.rta('2026-06-01'), 95000, 'and June the same';
+};
+
+subtest 'two overspent periods accumulate' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 5000,
+             category => DINING);
+    $f.spend(account => CURRENT, date => '2026-04-20', amount => 7000,
+             category => DINING);
+
+    my $view = $f.compute(through-period => '2026-05-01');
+    is $view.rta('2026-04-01'), 95000, "April is charged for March's hole";
+    is $view.category('2026-04-01', DINING).available, -7000,
+        'April digs its own';
+    is $view.rta('2026-05-01'), 88000, 'May is charged for both';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds every month';
+};
+
+subtest 'assigning into an overspent month fixes it before the boundary' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 5000,
+             category => DINING);
+    # Noticing the red row and covering it, still inside March:
+    $f.assign('2026-03-01', DINING, 5000);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    is $view.category('2026-03-01', DINING).available, 0, 'the hole is filled';
+    is $view.category('2026-03-01', DINING).cash-overspend, 0,
+        'so there is no overspending to charge';
+    is $view.rta('2026-04-01'), 95000,
+        'April pays for the assignment instead of the overspend';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a negative assignment hands money back' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.assign('2026-04-01', GROCERIES, -15000);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    is $view.category('2026-04-01', GROCERIES).carry-in, 40000,
+        'April starts with March money';
+    is $view.category('2026-04-01', GROCERIES).available, 25000,
+        'and the negative assignment takes some back';
+    is $view.rta('2026-04-01'), 75000,
+        'which Ready to Assign gets to keep';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+# --- rule 3's other answer: the envelope that carries -----------------
+#
+# `carry-overspend` puts a standard envelope on the payment envelope's
+# rule: the negative available becomes next period's carry-in and
+# NOTHING is charged to Ready to Assign. The four subtests below are the
+# whole of that claim — one boundary, several boundaries, the way out,
+# and the retroactivity that follows from `compute` being pure.
+
+subtest 'a carrying envelope keeps its negative across the boundary' => {
+    plan 9;
+    my $f = standard-facts();
+    $f.add-category(7, 'Expenses', sort-order => 3, carry-overspend => True);
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 30000,
+             category => 7);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $march = $view.category('2026-03-01', 7);
+    is $march.available, -30000, 'March is 300.00 in the hole';
+    is $march.cash-overspend, 0,
+        'and none of it is cash overspending — nothing was written off';
+    is $march.carry-out, -30000, 'so the whole hole carries';
+    ok $march.has-flag('overspent'), 'the row is still flagged overspent';
+    ok $march.has-flag('carried-negative'), 'and specifically as carrying it';
+    nok $march.has-flag('cash-overspend'),
+        'which is not the forcing rule\'s flag';
+
+    is $view.category('2026-04-01', 7).carry-in, -30000,
+        'April opens on it';
+    is $view.rta('2026-04-01'), 100000,
+        'and Ready to Assign is not charged a penny — that is the point';
+    is $view.invariant-errors.join('; '), '',
+        'the invariant holds: the hole never left the envelope';
+};
+
+subtest 'a carried negative accumulates across several boundaries' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.add-category(7, 'Expenses', sort-order => 3, carry-overspend => True);
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 5000,
+             category => 7);
+    $f.spend(account => CURRENT, date => '2026-04-20', amount => 7000,
+             category => 7);
+
+    my $view = $f.compute(through-period => '2026-06-01');
+    is $view.category('2026-04-01', 7).available, -12000,
+        'April carries March\'s hole and digs its own on top';
+    is $view.category('2026-05-01', 7).available, -12000,
+        'May holds the total, having spent nothing';
+    is $view.rta('2026-05-01'), 100000, 'Ready to Assign is untouched';
+    is $view.rta('2026-06-01'), 100000, 'in every later period too';
+    is $view.invariant-errors.join('; '), '',
+        'and the invariant holds in every one of them';
+};
+
+subtest 'assigning into a carried negative heals it' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.add-category(7, 'Expenses', sort-order => 3, carry-overspend => True);
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 5000,
+             category => 7);
+    # The reimbursement arrives as an ordinary assignment in April.
+    $f.assign('2026-04-01', 7, 5000);
+
+    my $view = $f.compute(through-period => '2026-05-01');
+    is $view.category('2026-04-01', 7).carry-in, -5000,
+        'April opens in the red';
+    is $view.category('2026-04-01', 7).available, 0,
+        'and the assignment brings it back to zero';
+    nok $view.category('2026-04-01', 7).has-flag('carried-negative'),
+        'so it is no longer carrying anything';
+    is $view.rta('2026-05-01'), 95000,
+        'Ready to Assign paid for the assignment, and never for the hole';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'the flag re-derives the past, Ready to Assign included' => {
+    plan 6;
+    # The retroactivity ruling, as a test. `compute` stores nothing, so
+    # the SAME facts under the two rules are two different budgets —
+    # including in periods that have already been and gone.
+    my $f = standard-facts();
+    $f.add-category(7, 'Expenses', sort-order => 3);
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 8000,
+             category => 7);
+
+    my $forcing = $f.compute(through-period => '2026-05-01');
+    is $forcing.category('2026-04-01', 7).carry-in, 0,
+        'off: the envelope resets at the boundary';
+    is $forcing.rta('2026-05-01'), 92000,
+        'and May\'s Ready to Assign is 80.00 lighter for it';
+
+    ok $f.set-carry-overspend(7, True), 'the flag goes on';
+    my $carrying = $f.compute(through-period => '2026-05-01');
+    is $carrying.category('2026-04-01', 7).carry-in, -8000,
+        'on: the same facts now carry the hole';
+    is $carrying.rta('2026-05-01'), 100000,
+        'and May\'s Ready to Assign — a period already derived — is '
+        ~ 'restored, which is the retroactivity ruling in one number';
+    is $carrying.invariant-errors.join('; '), '',
+        'both readings are internally consistent';
+};
+
+subtest 'a long chain stays consistent' => {
+    plan 3;
+    my $f = standard-facts();
+    for 3..8 -> $m {
+        my Str $stem   = sprintf('2026-%02d', $m);
+        my Str $period = "{ $stem }-01";
+        $f.inflow(account => CURRENT, date => $period, amount => 200000);
+        $f.assign($period, GROCERIES, 40000);
+        $f.assign($period, DINING, 15000);
+        $f.spend(account => CURRENT, date => "{ $stem }-15", amount => 38000,
+                 category => GROCERIES);
+        $f.spend(account => CURRENT, date => "{ $stem }-25", amount => 16000,
+                 category => DINING);
+    }
+
+    my $view = $f.compute(through-period => '2026-09-01');
+    # Groceries banks 2000 a period for six periods; Dining overspends
+    # 1000 a period in cash, which resets each time and charges the
+    # next period's Ready to Assign.
+    is $view.category('2026-08-01', GROCERIES).available, 12000,
+        'six periods of 20.00 left over';
+    # September has no facts at all, and Dining carried nothing out of
+    # August, so it has no row: a category with no money, no history
+    # and no carry says nothing about a period it was not part of.
+    nok $view.period('2026-09-01').has-category(DINING),
+        'while the overspent envelope always restarts at zero';
+    is $view.invariant-errors.join('; '), '',
+        'the invariant holds in every period';
+};

@@ -1,0 +1,301 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Test::Keys;
+use Selkie::Widget::Select;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::Config;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Util::Money;
+use App::Moneymoor::Util::Period;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The Settings dialog, opened and saved without a terminal — the same
+# stand-in-screen trick t/78 and t/87 use for the dialogs that write to
+# the database, except that this one writes to the plaintext config and
+# to the money locale.
+#
+# Two of its four pickers have a consequence beyond their own key. The
+# currency and the number format are pushed into Util::Money's module
+# state on save, and everything the app has already rendered is
+# re-rendered by the theme-live rebuild that follows. So the assertions
+# here are deliberately about the *effect*: after Ctrl+S, does
+# format-pence speak the locale the user just picked? A test that only
+# checked the config fields would pass with the set-money-locale call
+# deleted.
+
+plan 8;
+
+my $scratch = $*TMPDIR.add("moneymoor-settings-{$*PID}").Str;
+%*ENV<MONEYMOOR_HOME> = $scratch;
+
+LEAVE {
+    set-money-locale;             # never leak a locale into another file
+    if $scratch.IO.d {
+        unlink $_ for $scratch.IO.dir;
+        rmdir $scratch;
+    }
+    %*ENV<MONEYMOOR_HOME>:delete;
+}
+
+# --- The stand-in screen ---------------------------------------------
+
+#| Exactly what the dialog asks the workspace for: the budget's period
+#| scheme, which its period section reports in words.
+my class FakeWorkspace {
+    has $.scheme = App::Moneymoor::Util::Period.default-scheme;
+}
+
+my class FakeMain {
+    has $.app;                     # Nil — the toast is guarded
+    has $.config is required;
+    has $.theme is required;
+    has $.workspace is required;
+    has @.modals;
+    has Int $.rebuilds is rw = 0;
+
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { body($emitted) };
+    }
+
+    #| The real one re-resolves the palette and rebuilds the content
+    #| area, which is what re-renders every money string. Counting the
+    #| calls is enough: t/65 pins that Main has the method.
+    method apply-theme-live() { $!rebuilds++ }
+}
+
+#|( The dialog's controls, keyed by the caption above them. The content
+    is a flat VBox — caption, control, caption, control — rather than
+    the label/field VBox pairs the text dialogs use, so pairing is by
+    position: every Select is named by the last Text seen before it. )
+sub controls($modal --> Hash) {
+    my %out;
+    my Str $caption = '';
+    for $modal.content.children -> $child {
+        if $child ~~ Selkie::Widget::Text {
+            $caption = $child.text;
+        } elsif $child ~~ Selkie::Widget::Select {
+            %out{$caption} = $child;
+        }
+    }
+    %out;
+}
+
+sub fixture($scheme = App::Moneymoor::Util::Period.default-scheme --> Hash) {
+    # Each subtest saves to the same scratch config, so start every one
+    # from a file-less home: a preselect assertion that only passed
+    # because the previous subtest had written that value is worse than
+    # no assertion.
+    unlink "$scratch/config.json" if "$scratch/config.json".IO.e;
+    my $cfg = App::Moneymoor::Config.new.load;
+    my $main = FakeMain.new(
+        config    => $cfg,
+        theme     => App::Moneymoor::Themes::load('gruvbox'),
+        workspace => FakeWorkspace.new(:$scheme),
+    );
+    { :$cfg, :$main };
+}
+
+# --- Tests ------------------------------------------------------------
+
+subtest 'the dialog offers exactly the settings the config holds' => {
+    plan 6;
+    set-money-locale;
+    my %f = fixture;
+    App::Moneymoor::Screen::Main::Modals::open-settings(%f<main>);
+    my $modal = %f<main>.modals[0];
+    my %c = controls($modal);
+
+    is-deeply %c.keys.sort.List, ('Currency', 'Icons', 'Numbers', 'Theme'),
+        'four pickers, captioned';
+    is-deeply %c<Currency>.items, ('£', '$', '€'),
+        'the currency picker lists the symbols Util::Money accepts, in its order';
+    is-deeply %c<Numbers>.items, ('1,234.56', '1.234,56'),
+        'the number picker lists worked examples, not bare marks';
+
+    # The Pod claims Settings has no text field, which is why it is the
+    # one dialog without an Enter-save. Keep that true.
+    my @inputs = $modal.content.children.grep(Selkie::Widget::TextInput);
+    is @inputs.elems, 0, 'and no text field, so Enter stays a picker key';
+
+    is %c<Currency>.selected-value, '£',
+        'the currency opens on the configured symbol';
+    is %c<Numbers>.selected-value, '1,234.56',
+        'and the numbers on the example for the configured mark';
+};
+
+subtest 'the pickers open on a non-default saved locale' => {
+    plan 3;
+    set-money-locale;
+    my %f = fixture;
+    %f<cfg>.currency     = '€';
+    %f<cfg>.decimal-mark = ',';
+
+    App::Moneymoor::Screen::Main::Modals::open-settings(%f<main>);
+    my %c = controls(%f<main>.modals[0]);
+
+    is %c<Currency>.selected-value, '€', 'the saved symbol is preselected';
+    is %c<Numbers>.selected-value, '1.234,56',
+        'and the example for the saved mark, not the first item';
+    is %c<Numbers>.selected, 1,
+        'by index — which is the join between example and mark';
+};
+
+subtest 'ctrl+s saves the money settings and applies them live' => {
+    plan 8;
+    set-money-locale;
+    my %f = fixture;
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-settings($main);
+    my $modal = $main.modals[0];
+    my %c = controls($modal);
+
+    %c<Currency>.select-index(2);              # €
+    %c<Numbers>.select-index(1);               # 1.234,56
+    press-key($modal, 'ctrl+s');
+
+    is %f<cfg>.currency, '€', 'the config took the symbol';
+    is %f<cfg>.decimal-mark, ',',
+        'and the mark — not the example string the picker was showing';
+    is $main.rebuilds, 1, 'the content area was rebuilt once';
+
+    is format-pence(123456), '€1.234,56',
+        'and the locale is live: formatting speaks it immediately';
+    is parse-pence('1.234,56'), 123456, 'so does parsing';
+
+    my $cfg2 = App::Moneymoor::Config.new.load;
+    is $cfg2.currency, '€', 'the symbol reached the file';
+    is $cfg2.decimal-mark, ',', 'and so did the mark';
+    is $cfg2.theme, %f<cfg>.theme,
+        'and the settings that were not touched survived the write';
+};
+
+subtest 'the other two settings still go through untouched' => {
+    plan 4;
+    set-money-locale;
+    my %f = fixture;
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-settings($main);
+    my $modal = $main.modals[0];
+    my %c = controls($modal);
+
+    %c<Icons>.select-index(1);                 # nerd
+    my $theme = %c<Theme>.selected-value;
+    press-key($modal, 'ctrl+s');
+
+    is %f<cfg>.icons, 'nerd', 'the glyph tier saved';
+    is %f<cfg>.theme, $theme, 'the palette saved';
+    is %f<cfg>.currency, '£',
+        'an untouched currency picker saves the value it opened on';
+    is format-pence(100), '£1.00',
+        'and the locale is unchanged rather than reset to something else';
+};
+
+subtest 'a save can move the locale back' => {
+    plan 3;
+    my %f = fixture;
+    %f<cfg>.currency     = '€';
+    %f<cfg>.decimal-mark = ',';
+    set-money-locale(symbol => '€', decimal-mark => ',');
+
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-settings($main);
+    my %c = controls($main.modals[0]);
+    %c<Currency>.select-index(0);              # £
+    %c<Numbers>.select-index(0);               # 1,234.56
+    press-key($main.modals[0], 'ctrl+s');
+
+    is %f<cfg>.currency, '£', 'back to sterling';
+    is %f<cfg>.decimal-mark, '.', 'and to the point';
+    is format-pence(123456), '£1,234.56', 'live, in the same pass';
+};
+
+subtest 'the startup hand-off cannot throw on any config that loads' => {
+    plan 4;
+    LEAVE set-money-locale;
+
+    # `UI.run` does exactly this, before the first frame:
+    #
+    #     set-money-locale(symbol       => $!config.currency,
+    #                      decimal-mark => $!config.decimal-mark);
+    #
+    # and `set-money-locale` throws on a value it does not know. The
+    # only thing standing between a hand-edited config and an app that
+    # will not start is Config validating on load, so pin the pairing
+    # rather than each half separately.
+    for '{ "currency": "CAD", "decimal_mark": "!" }',
+        '{ "currency": null, "decimal_mark": [] }',
+        '{ "theme": "nord" }',
+        '{ "currency": "€", "decimal_mark": "," }'
+    -> Str $json {
+        spurt "$scratch/config.json", $json;
+        my $cfg = App::Moneymoor::Config.new.load;
+        lives-ok {
+            set-money-locale(symbol       => $cfg.currency,
+                             decimal-mark => $cfg.decimal-mark);
+        }, "a config of $json starts the app";
+    }
+};
+
+subtest 'the period section is a line and a key, not a fifth picker' => {
+    plan 8;
+    # The period is a property of the budget FILE, and changing it
+    # rewrites every assignment row — so it does not ride along on the
+    # same Ctrl+S as a colour scheme. What Settings owns is the report
+    # and the key that opens the dialog.
+    set-money-locale;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-settings($main);
+    my $modal = $main.modals[0];
+
+    my %c = controls($modal);
+    is-deeply %c.keys.sort.List, ('Currency', 'Icons', 'Numbers', 'Theme'),
+        'still four pickers, and the period is not one of them';
+    is $modal.content.children.grep(Selkie::Widget::TextInput).elems, 0,
+        'still no text field, so Enter stays a picker key';
+
+    my @lines = $modal.content.children
+        .grep(Selkie::Widget::Text).map(*.text);
+    ok @lines.grep({ $_ eq 'Period' }).elems == 1, 'a Period caption';
+    ok @lines.grep({ $_ eq 'Calendar month' }).elems == 1,
+        'with the scheme under it, described in words';
+    ok @lines.grep({ $_ eq 'ctrl+p change' }).elems == 1,
+        'and the key that changes it';
+
+    # It reports the budget's scheme, not a constant.
+    my %p = fixture(App::Moneymoor::Util::Period.monthly(anchor-day => 14));
+    App::Moneymoor::Screen::Main::Modals::open-settings(%p<main>);
+    ok %p<main>.modals[0].content.children.grep(Selkie::Widget::Text)
+        .map(*.text).grep({ $_ eq 'Monthly from the 14th' }).elems == 1,
+        'a payday budget says so';
+
+    # Ctrl+P chains: Settings closes (a no-op with no App here) and the
+    # picker opens over it.
+    press-key($modal, 'ctrl+p');
+    is $main.modals.elems, 2, 'ctrl+p opens a second dialog';
+    is $main.modals[1].frame-title, 'Budget period',
+        'and it is the period picker';
+};
+
+subtest 'number-example derives both halves of the rule' => {
+    plan 3;
+    # The Select's items are built by mapping this over
+    # money-decimal-marks, so index alignment — which is what the
+    # submit relies on to turn a selection back into a mark — is only
+    # true while this stays a pure function of the mark.
+    is App::Moneymoor::Screen::Main::Modals::number-example('.'), '1,234.56',
+        'a point decimal groups with the comma';
+    is App::Moneymoor::Screen::Main::Modals::number-example(','), '1.234,56',
+        'a comma decimal groups with the point';
+    is-deeply money-decimal-marks().map({
+            App::Moneymoor::Screen::Main::Modals::number-example($_)
+        }).List,
+        ('1,234.56', '1.234,56'),
+        'and the derived list is what the picker shows, in that order';
+};

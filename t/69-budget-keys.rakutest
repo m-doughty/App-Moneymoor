@@ -1,0 +1,229 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Screen::Budget;
+use App::Moneymoor::Screen::Main;
+use App::Moneymoor::Screen::Main::Keybinds;
+use App::Moneymoor::Screen::Main::Modals;
+use App::Moneymoor::View::HintBar;
+
+# Two things nothing else can catch.
+#
+# 1. The budget tab's keys are registered inside closures that only run
+#    when the user presses them, and they call sibling-module subs by
+#    fully-qualified name plus accessors on Screen::Main by string.
+#    Both resolve at *runtime*: a renamed accessor or a missing `use`
+#    compiles cleanly and takes the app down on a keypress. t/65 guards
+#    the three Main sub-modules that way; Screen::Budget needs the same
+#    treatment, and cannot simply be added to t/65's list because its
+#    `$self-ref` is a Budget, not a Main.
+#
+# 2. The hint footer is a hand-maintained table. Every key it advertises
+#    has to be a key that exists, or the footer is lying to the user in
+#    the one place they look to find out what the keys are.
+#
+# Source-level, because building Screen::Budget needs a notcurses App
+# and there is no terminal in a test run.
+
+plan 7;
+
+my constant BUDGET-SRC   = 'lib/App/Moneymoor/Screen/Budget.rakumod';
+my constant KEYBINDS-SRC = 'lib/App/Moneymoor/Screen/Main/Keybinds.rakumod';
+
+# Lines that are neither Pod nor comment — the ones that actually run.
+sub code-lines(Str $path --> List) {
+    my @out;
+    my Bool $in-pod = False;
+    for $path.IO.lines -> $line {
+        $in-pod = True  if $line.starts-with('=begin pod');
+        if $in-pod {
+            $in-pod = False if $line.starts-with('=end pod');
+            next;
+        }
+        next if $line.trim.starts-with('#');
+        @out.push($line);
+    }
+    @out.List;
+}
+
+sub keys-bound-in(Str $path --> SetHash) {
+    my $set = SetHash.new;
+    for code-lines($path) -> $line {
+        for $line.match(/ 'on-key:' \s* \' (<-[']>+) \' /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    $set;
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'every $main.method Screen::Budget calls exists on Main' => {
+    my $set = SetHash.new;
+    for code-lines(BUDGET-SRC) -> $line {
+        for $line.match(/ '$main.' ( <[a..z\-]>+ ) /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    plan $set.elems;
+    for $set.keys.sort -> $name {
+        ok App::Moneymoor::Screen::Main.^find_method($name).defined,
+            "Screen::Main has method '$name'";
+    }
+};
+
+subtest 'every modal Screen::Budget opens is a real routine' => {
+    # `Pkg::sub(...)` resolves only if the caller had the matching
+    # `use` at compile time, and the lookup happens inside the keybind
+    # closure — so a missing `use` is invisible until a keypress.
+    my $rx = / 'App::Moneymoor::' (<[\w:]>+) '::' ( <[a..z]> <[a..z\-]>+ ) '(' /;
+    my %resolved;
+    for code-lines(BUDGET-SRC) -> $line {
+        for $line.match($rx, :g) -> $m {
+            %resolved{ "App::Moneymoor::{$m[0].Str}::{$m[1].Str}" } = True;
+        }
+    }
+    plan %resolved.elems;
+    for %resolved.keys.sort -> $fqn {
+        my @parts = $fqn.split('::');
+        my $sub-name = @parts.pop;
+        my $stash = ::(@parts.join('::')).WHO;
+        ok ($stash{ '&' ~ $sub-name }:exists), "$fqn is reachable";
+    }
+};
+
+subtest 'the whole of §4.3\'s key table is bound' => {
+    plan 13;
+    my $pane   = keys-bound-in(BUDGET-SRC);
+    my $global = keys-bound-in(KEYBINDS-SRC);
+
+    # `d` is the register's delete key too — one letter, one meaning,
+    # whichever grid has focus. `f` is the odd one out: it is the only
+    # budget key that is about the month rather than the selected row.
+    for <a m f x n g e h u i d> -> $key {
+        ok $pane{$key}, "'$key' is bound on the envelope table";
+    }
+    # Month navigation is global state — the banner and the reports
+    # chart read it too — so it is bound on the screen root rather than
+    # duplicated onto two tabs' panes.
+    ok $global{'['} && $global{']'}, '[ and ] are bound on the screen root';
+
+    # Enter goes through Table's on-activate rather than a keybind:
+    # Table checks its keybinds before its own navigation, so binding
+    # 'enter' would take it away from the widget permanently.
+    nok $pane{'enter'}, 'Enter is deliberately NOT a keybind';
+};
+
+subtest 'Enter is wired, through the supply instead' => {
+    plan 2;
+    my $src = BUDGET-SRC.IO.slurp;
+    ok $src.contains('on-activate.tap'), 'the activate supply is tapped';
+    ok $src.contains('budget/toggle-group'),
+        'and a header row folds its group from there';
+};
+
+subtest 'the budget hint bar advertises only keys that exist' => {
+    my $pane   = keys-bound-in(BUDGET-SRC);
+    my $global = keys-bound-in(KEYBINDS-SRC);
+
+    # The hint table writes a key the way a human reads it; this is the
+    # translation to the way it is bound.
+    my sub bindings-for(Str $hint --> List) {
+        given $hint {
+            when 'n/g' { ('n', 'g')   }
+            when '[ ]' { ('[', ']')   }
+            default    { ($hint.lc,)  }
+        }
+    }
+
+    my @hints = hint-groups('budget');
+    plan @hints.elems;
+    for @hints -> $group {
+        my @needed = bindings-for($group.key);
+        my @missing = @needed.grep({ !$pane{$_} && !$global{$_} });
+        is @missing.join(', '), '',
+            "the footer's '{$group.key}' ({$group.value}) is a real bind";
+    }
+};
+
+subtest 'the assign field\'s sign rule' => {
+    plan 23;
+    my &parse = &App::Moneymoor::Screen::Main::Modals::parse-assign-input;
+
+    # No sign: set the envelope to this figure.
+    is-deeply parse('400'), %( mode => 'set', amount => 40000 ),
+        'a bare figure is an absolute set';
+    is-deeply parse('£1,234.56'), %( mode => 'set', amount => 123456 ),
+        'symbols and separators are the user\'s business, not the field\'s';
+    is-deeply parse('  0  '), %( mode => 'set', amount => 0 ),
+        'zero is a legitimate thing to assign, and whitespace is trimmed';
+
+    # Leading sign: adjust by this much.
+    is-deeply parse('+5'), %( mode => 'adjust', amount => 500 ),
+        '+5 adds a fiver';
+    is-deeply parse('-2.50'), %( mode => 'adjust', amount => -250 ),
+        '-2.50 takes half of one back';
+    is-deeply parse('+£12.34'), %( mode => 'adjust', amount => 1234 ),
+        'a symbol after the sign is still an adjustment';
+
+    # The escape hatch: negative assignments are legal (pulling money
+    # back out of a category that had none this month), and '-5' is
+    # already spoken for, so accountant parentheses do it.
+    is-deeply parse('(5.00)'), %( mode => 'set', amount => -500 ),
+        'parentheses set a negative, which the sign rule cannot express';
+
+    # `=` funds TO a figure — a statement about available, not about
+    # assigned, which is why it is its own mode and not a set.
+    is-deeply parse('=450'), %( mode => 'fund-to', amount => 45000 ),
+        '=450 is "make it £450", not "assign £450"';
+    is-deeply parse('= 450'), %( mode => 'fund-to', amount => 45000 ),
+        'whitespace after the = is the user\'s business';
+    is-deeply parse('  =£1,234.56  '), %( mode => 'fund-to', amount => 123456 ),
+        'and a symbol and separators after it are too';
+    is-deeply parse('=0'), %( mode => 'fund-to', amount => 0 ),
+        'funding an envelope back down to nothing is a legitimate ask';
+
+    # Bare `=` carries no amount: this function is pure and has no
+    # envelope to read a target off. The dialog resolves it.
+    is-deeply parse('='), %( mode => 'fund-target' ),
+        'a bare = defers to the envelope\'s target';
+    is-deeply parse('  =  '), %( mode => 'fund-target' ),
+        'and is still bare with spaces around it';
+
+    # "Fund to minus five pounds" is not a thing anyone means; taking
+    # money out is '-5', which the sign rule already reads.
+    for '=-5', '=(5)', '=abc', '=1.234' -> $bad {
+        my $result = parse($bad);
+        ok $result ~~ Failure, "'$bad' is refused rather than guessed at";
+        $result.so;
+    }
+    my $neg = parse('=-5');
+    like $neg.exception.message, /:i 'negative'/,
+        'and the negative one says which of its two problems it has';
+    $neg.so;
+
+    for 'twelve', '', '   ', '+', '1.234' -> $bad {
+        my $result = parse($bad);
+        ok $result ~~ Failure, "'$bad' is refused rather than guessed at";
+        $result.so;
+    }
+};
+
+subtest 'the editor\'s Target field' => {
+    plan 8;
+    my &parse = &App::Moneymoor::Screen::Main::Modals::parse-target;
+
+    is parse('400'), 40000, 'a bare figure is pence';
+    is parse('£1,234.56'), 123456, 'symbols and separators are accepted';
+    # Blank clears the target, so an empty box must not be an error —
+    # it is the only way to take a target off again.
+    is parse(''), 0, 'blank is no target';
+    is parse('   '), 0, 'and so is whitespace';
+    is parse('0'), 0, 'an explicit zero is the same thing';
+
+    for '-1', '(5)', 'soon' -> $bad {
+        my $result = parse($bad);
+        ok $result ~~ Failure, "'$bad' is refused";
+        $result.so;
+    }
+};

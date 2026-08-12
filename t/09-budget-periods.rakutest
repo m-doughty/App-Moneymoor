@@ -1,0 +1,138 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Service::Budget;
+use App::Moneymoor::Util::Period;
+
+plan 7;
+
+my $monthly = App::Moneymoor::Util::Period.default-scheme;
+
+subtest 'valid-date' => {
+    plan 12;
+    ok valid-date('2026-03-14'), 'an ordinary date';
+    ok valid-date('2026-01-01'), 'the first of January';
+    ok valid-date('2026-12-31'), 'the last of December';
+    ok valid-date('2024-02-29'), 'a leap day in a leap year';
+    ok valid-date('2000-02-29'), 'a leap day in a 400-year leap year';
+    nok valid-date('2026-02-29'), 'no leap day in a common year';
+    nok valid-date('2100-02-29'), 'no leap day in a century that is not';
+    nok valid-date('2026-02-30'), 'February never has 30 days';
+    nok valid-date('2026-04-31'), 'April never has 31';
+    nok valid-date('2026-13-01'), 'there is no thirteenth month';
+    nok valid-date('2026-03-00'), 'there is no zeroth day';
+    nok valid-date('2026-3-14'),  'the shape is strict';
+};
+
+subtest 'valid-period is format validity, and nothing more' => {
+    plan 8;
+    ok valid-period('2026-03-01'), 'a calendar-month period start';
+    ok valid-period('2026-08-14'), 'a pay-day period start';
+    nok valid-period('2026-03'),   'the unmigrated month shape is not a key';
+    nok valid-period('2026-02-30'), 'and neither is a date that never happened';
+    nok valid-period('2026-3-01'),  'nor an unpadded one';
+    nok valid-period('nope'),       'nor a word';
+    nok valid-period(Str),          'nor an undefined key';
+
+    # The distinction the name is carrying: 2026-03-15 is a perfectly
+    # well-formed period key, and is not a period start under the
+    # calendar month. Only a scheme can tell you which — valid-period
+    # deliberately does not try.
+    ok valid-period('2026-03-15')
+        && $monthly.period-of('2026-03-15') ne '2026-03-15',
+        'a well-formed key that is not a start still passes the format check';
+};
+
+subtest 'period-range walks the sequence' => {
+    plan 5;
+    is period-range($monthly, '2026-03-01', '2026-03-01').Array, ['2026-03-01'],
+        'a single period';
+    is period-range($monthly, '2026-11-01', '2027-02-01').Array,
+        ['2026-11-01', '2026-12-01', '2027-01-01', '2027-02-01'],
+        'across a year boundary';
+    is period-range($monthly, '2026-05-01', '2026-03-01').elems, 0,
+        'a backwards range is empty, not infinite';
+    is period-range($monthly, '2026-01-01', '2026-12-01').elems, 12,
+        'a whole year';
+    is period-range($monthly, '2026-01-01', '2026-12-01')[*-1], '2026-12-01',
+        'ending where it was asked to';
+};
+
+subtest 'period-range refuses endpoints that are not starts' => {
+    plan 7;
+    my $bad-shape = period-range($monthly, '2026-1-01', '2026-12-01');
+    ok $bad-shape ~~ Failure, 'a malformed start fails';
+    like $bad-shape.exception.message, /'YYYY-MM-DD'/,
+        'and says what shape it wanted';
+    $bad-shape.so;
+
+    my $bad-end = period-range($monthly, '2026-01-01', '2026-99-01');
+    ok $bad-end ~~ Failure, 'so does a malformed end';
+    $bad-end.so;
+
+    # The stronger half: well-formed, real dates, and not starts.
+    my $not-start = period-range($monthly, '2026-03-15', '2026-05-01');
+    ok $not-start ~~ Failure,
+        'a well-formed date that is not a period start fails too';
+    like $not-start.exception.message, /'budget period'/,
+        'and the message says a start is what was wanted';
+    $not-start.so;
+
+    my $not-start-end = period-range($monthly, '2026-03-01', '2026-05-20');
+    ok $not-start-end ~~ Failure, 'at either end';
+    $not-start-end.so;
+
+    my $undef = period-range($monthly, Str, '2026-05-01');
+    ok $undef ~~ Failure, 'an undefined endpoint fails rather than crashing';
+    $undef.so;
+};
+
+subtest 'period-range is scheme-generic' => {
+    plan 4;
+    # P2 always passes the calendar month, but the helper steps with
+    # whatever scheme it is given — this is the case no month can fake.
+    my $fortnightly = App::Moneymoor::Util::Period.weekly(
+        weeks => 2, anchor => '2026-01-07');
+    is period-range($fortnightly, '2026-01-07', '2026-03-04').Array,
+        ['2026-01-07', '2026-01-21', '2026-02-04', '2026-02-18', '2026-03-04'],
+        'every fourteen days, crossing month boundaries mid-period';
+
+    my $anchored = App::Moneymoor::Util::Period.monthly(anchor-day => 31);
+    is period-range($anchored, '2026-01-31', '2026-04-30').Array,
+        ['2026-01-31', '2026-02-28', '2026-03-31', '2026-04-30'],
+        'a clamping monthly scheme recovers after a short month';
+
+    # The first of the month is not a start under either of those.
+    my $wrong-scheme = period-range($fortnightly, '2026-01-01', '2026-02-01');
+    ok $wrong-scheme ~~ Failure,
+        'a calendar-month key is refused by a fortnightly scheme';
+    $wrong-scheme.so;
+
+    ok period-range($monthly, '2026-01-01', '2026-02-01').elems == 2,
+        'and the same key is fine under the scheme it belongs to';
+};
+
+subtest 'an absurd range is truncated rather than materialised' => {
+    plan 3;
+    my @periods = period-range($monthly, '2026-01-01', '9999-12-01');
+    is @periods.elems, 1200,
+        'period-range stops at the MAX-PERIODS ceiling';
+    is @periods[0], '2026-01-01', 'starting where it was asked to';
+    is @periods[*-1], '2125-12-01',
+        'and a hundred years of monthly periods is where 1200 lands';
+};
+
+subtest 'the cap is a count of periods, not of months' => {
+    plan 2;
+    # The same ceiling under a weekly scheme is a much shorter span of
+    # calendar time — which is the point: the cap defends the engine
+    # against materialising a million buckets, and a bucket is a
+    # period, whatever length that happens to be.
+    my $weekly = App::Moneymoor::Util::Period.weekly(
+        weeks => 1, anchor => '2026-01-01');
+    my @periods = period-range($weekly, '2026-01-01',
+        $weekly.period-of('9999-12-31'));
+    is @periods.elems, 1200, 'still 1200 of them';
+    is @periods[*-1], Date.new('2026-01-01').later(days => 1199 * 7).Str,
+        'covering 1199 weeks rather than 1199 months';
+};

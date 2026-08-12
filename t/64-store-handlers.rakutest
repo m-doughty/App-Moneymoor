@@ -1,0 +1,403 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Test::Store;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+
+# The store is where the UI's glue lives, and the glue is the part the
+# engine's own suite cannot cover: the engine proves the derivation is
+# right, these prove the app talks to it correctly. Specifically:
+#
+#   * the state shape §5 of the UI spec names actually gets seeded;
+#   * navigation writes the paths the subscriptions read;
+#   * `ws/mutate` toasts and DOES NOT bump the digest on a Failure —
+#     a write that didn't happen must not make every subscription in
+#     the app repaint to say nothing changed;
+#   * the overspent badge counts envelopes, in the viewed period, and
+#     never the Ready-to-Assign pseudo-category.
+#
+# A real SQLCipher file in $*TMPDIR, not a fixture: the mutation path
+# is exactly the seam where a gateway's Failure contract matters, and a
+# hand-built Facts object cannot fail the way a gateway does.
+#
+# Every period here is derived from PINNED-PERIOD, never from
+# Date.today — except where the workspace's own clock is the thing
+# under test, and there the assertion is relational ("the store's
+# period is the workspace's period") rather than a literal.
+
+plan 9;
+
+# A period far enough in the past that no amount of real-world time
+# passing can make it "the current period" and change what the
+# derivation ranges over. The workspace's default scheme is
+# monthly/1, so a period start is the first of a month.
+my constant PINNED-PERIOD = '2026-03-01';
+my constant NEXT-PERIOD   = '2026-04-01';
+my constant PREV-PERIOD   = '2026-02-01';
+
+# Two dates inside PINNED-PERIOD, for the facts the badge counts.
+my constant SPEND-DATE-A = '2026-03-10';
+my constant SPEND-DATE-B = '2026-03-11';
+
+my $db-path = $*TMPDIR.add("moneymoor-store-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', sort-order => 1));
+my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Dining Out', sort-order => 2));
+my $rta = $ws.categories.rta-category;
+
+# £1,000 of inflow in the pinned period, so there is something to assign
+# and the derivation has a reason to range over that period at all.
+$ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => PINNED-PERIOD,
+        amount => 100000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 100000)],
+);
+
+# --- Harness -------------------------------------------------------------
+
+# A fresh store + handlers per subtest: the handlers cache nothing, but
+# a shared store would let one subtest's period leak into the next and
+# make failures read as unrelated.
+sub fixture(--> Hash) {
+    my @toasts;
+    my @views;
+    my $handlers = App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        toast     => -> Str $m { @toasts.push($m) },
+        on-view   => -> $v { @views.push($v) },
+    );
+    my $store = mock-store;
+    $handlers.register($store);
+    dispatch-and-tick($store, 'app/init', theme => 'nord', icons => 'nerd');
+    # Park on the pinned period before anything else runs, so no
+    # assertion below depends on what today happens to be.
+    dispatch-and-tick($store, 'app/period-set', period => PINNED-PERIOD);
+    { :$store, :$handlers, :@toasts, :@views };
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest "app/init seeds every path the spec names" => {
+    plan 12;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    is state-at($store, 'app', 'tab'), 'budget', "app/tab defaults to budget";
+    is state-at($store, 'app', 'theme'), 'nord', "app/theme mirrors config";
+    is state-at($store, 'app', 'icons'), 'nerd', "app/icons mirrors config";
+
+    # Relational, not literal: the seeded period IS whatever the
+    # workspace calls today, and asserting the string would rot.
+    my $fresh = mock-store;
+    App::Moneymoor::StoreHandlers.new(workspace => $ws).register($fresh);
+    dispatch-and-tick($fresh, 'app/init');
+    is state-at($fresh, 'app', 'period'), $ws.current-period,
+        "app/period starts on the workspace's current period";
+
+    ok state-at($store, 'budget', 'digest').chars > 0,
+        "budget/digest is populated by the bootstrap recompute";
+    is state-at($store, 'budget', 'overspent-count'), 0,
+        "budget/overspent-count starts at zero";
+    nok state-at($store, 'budget', 'selected-category-id').defined,
+        "no category is selected yet";
+    is-deeply state-at($store, 'budget', 'collapsed-groups'), %(),
+        "no groups are collapsed";
+    is state-at($store, 'budget', 'show-hidden'), False,
+        "hidden envelopes start hidden";
+    is state-at($store, 'budget', 'inspector'), True,
+        "the inspector rail starts open";
+    is state-at($store, 'accounts', 'selected-account-id'), 0,
+        "the sidebar starts on All Accounts";
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        "reconcile mode is off";
+};
+
+subtest "the bootstrap hands the view to the cache sink exactly once" => {
+    plan 3;
+    my %f = fixture();
+    # app/init recomputes once; the period-set in the fixture recomputes
+    # a second time. Both go through on-view, and neither goes through
+    # it twice — a double-fire would rebuild four lookup hashes for
+    # nothing on every keystroke once the tabs are real.
+    is %f<views>.elems, 2,
+        "one view per recompute: bootstrap + the period jump";
+    ok %f<views>[0].defined, "and the sink got a real BudgetView";
+    is %f<views>[*-1].canonical-digest,
+        state-at(%f<store>, 'budget', 'digest'),
+        "the digest in the store is the digest of the view in the cache";
+};
+
+subtest "app/tab-selected writes the tab, and clamps nonsense" => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    for <accounts reports budget> -> $name {
+        dispatch-and-tick($store, 'app/tab-selected', :$name);
+        is state-at($store, 'app', 'tab'), $name, "switched to $name";
+    }
+
+    # An unknown tab would leave the shell with no content builder and
+    # a blank pane, which is a worse failure than ignoring the event.
+    dispatch-and-tick($store, 'app/tab-selected', name => 'wardrobe');
+    is state-at($store, 'app', 'tab'), 'budget',
+        "an unknown tab name clamps to budget rather than blanking the shell";
+};
+
+subtest "period navigation steps the period and recomputes" => {
+    plan 6;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    is state-at($store, 'app', 'period'), PINNED-PERIOD,
+        "parked on the pinned period";
+    my $views-before = %f<views>.elems;
+
+    dispatch-and-tick($store, 'app/period-next');
+    is state-at($store, 'app', 'period'), NEXT-PERIOD, "] steps forward";
+
+    dispatch-and-tick($store, 'app/period-prev');
+    dispatch-and-tick($store, 'app/period-prev');
+    is state-at($store, 'app', 'period'), PREV-PERIOD, "[ steps back";
+
+    is %f<views>.elems - $views-before, 3,
+        "every step recomputes — the through-period moved even though "
+            ~ "no fact did";
+
+    # Year boundaries are the one place a naive +1 breaks.
+    dispatch-and-tick($store, 'app/period-set', period => '2026-12-01');
+    dispatch-and-tick($store, 'app/period-next');
+    is state-at($store, 'app', 'period'), '2027-01-01',
+        "December rolls to January";
+    dispatch-and-tick($store, 'app/period-prev');
+    is state-at($store, 'app', 'period'), '2026-12-01',
+        "and January rolls back";
+};
+
+subtest "app/period-set refuses anything that is not a period start" => {
+    plan 5;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    # Malformed, out-of-range, and empty: none of them is a date at all.
+    for 'not-a-period', '2026-13-01', '' -> $bad {
+        dispatch-and-tick($store, 'app/period-set', period => $bad);
+        is state-at($store, 'app', 'period'), PINNED-PERIOD,
+            "'{$bad}' left the period alone rather than corrupting it";
+    }
+
+    # A perfectly good date that is not a period START under monthly/1.
+    # `valid-period` is a format check and would wave this through; the
+    # handler asks the workspace's scheme, which will not.
+    dispatch-and-tick($store, 'app/period-set', period => '2026-03-15');
+    is state-at($store, 'app', 'period'), PINNED-PERIOD,
+        "a mid-period date is refused — it is not a start under monthly/1";
+
+    # The shape the store held before the re-key. A budget file that
+    # somehow escaped the migration must not be able to write one of
+    # these into the store, where every downstream `.category($p, …)`
+    # would silently find nothing.
+    dispatch-and-tick($store, 'app/period-set', period => '2026-03');
+    is state-at($store, 'app', 'period'), PINNED-PERIOD,
+        "an unmigrated 'YYYY-MM' month key is refused too";
+};
+
+subtest "ws/mutate: a Failure toasts and does NOT bump the digest" => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+    my $before = state-at($store, 'budget', 'digest');
+    my $views-before = %f<views>.elems;
+
+    # Assigning to Ready to Assign is the canonical refusal: it is the
+    # pool assignments come *from*, so the gateway fails rather than
+    # letting the user invent money.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.set-assigned(PINNED-PERIOD, $rta.id, 25000);
+    });
+
+    is %f<toasts>.elems, 1, "the failure was toasted";
+    ok %f<toasts>[0].contains('Ready to Assign'),
+        "with the gateway's own message, not a generic one";
+    is state-at($store, 'budget', 'digest'), $before,
+        "the digest did not move — nothing was written";
+    is %f<views>.elems, $views-before,
+        "and the cache was not rebuilt for a write that never happened";
+};
+
+subtest "ws/mutate: a success recomputes and bumps the digest" => {
+    plan 5;
+    my %f = fixture();
+    my $store = %f<store>;
+    my $before = state-at($store, 'budget', 'digest');
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.set-assigned(PINNED-PERIOD, $groceries.id, 40000);
+    });
+
+    is %f<toasts>.elems, 0, "nothing was toasted";
+    isnt state-at($store, 'budget', 'digest'), $before,
+        "the digest moved";
+    is %f<views>[*-1].category(PINNED-PERIOD, $groceries.id).assigned, 40000,
+        "and the cached view carries the new assignment";
+
+    # An identical re-write must produce an identical digest: the token
+    # is a content hash, not a counter, or every no-op save would
+    # repaint the whole screen.
+    my $after = state-at($store, 'budget', 'digest');
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.set-assigned(PINNED-PERIOD, $groceries.id, 40000);
+    });
+    is state-at($store, 'budget', 'digest'), $after,
+        "re-writing the same value leaves the digest byte-identical";
+
+    # Clean up so the badge subtest starts from a known board.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.set-assigned(PINNED-PERIOD, $groceries.id, 0);
+    });
+    is state-at($store, 'budget', 'digest'), $before,
+        "and undoing it returns the digest to where it started";
+};
+
+subtest "the overspent badge counts envelopes in the viewed period" => {
+    plan 6;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    is state-at($store, 'budget', 'overspent-count'), 0,
+        "nothing is overspent to begin with";
+
+    # £50 spent out of Groceries with nothing assigned to it: available
+    # goes negative, which is what the badge counts.
+    my $txn = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => SPEND-DATE-A,
+            amount => -5000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -5000)],
+    );
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    is state-at($store, 'budget', 'overspent-count'), 1,
+        "one overspent envelope";
+
+    # A second one, to prove it counts rather than flags.
+    my $txn2 = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => SPEND-DATE-B,
+            amount => -2500),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $dining.id, amount => -2500)],
+    );
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    is state-at($store, 'budget', 'overspent-count'), 2,
+        "two overspent envelopes";
+
+    # Cash overspending resets at the period boundary — it is charged
+    # to the following period's Ready to Assign, not carried in the
+    # envelope — so the next period is clean. The badge is per viewed
+    # period, which is the whole reason it is recomputed on navigation.
+    dispatch-and-tick($store, 'app/period-next');
+    is state-at($store, 'budget', 'overspent-count'), 0,
+        "the badge follows the viewed period, and the next one is clean";
+
+    dispatch-and-tick($store, 'app/period-prev');
+    is state-at($store, 'budget', 'overspent-count'), 2,
+        "and comes back on the way back";
+
+    # Funding one of them clears half the badge.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.set-assigned(PINNED-PERIOD, $groceries.id, 5000);
+    });
+    is state-at($store, 'budget', 'overspent-count'), 1,
+        "assigning enough to cover an envelope drops it off the badge";
+
+    $ws.transactions.delete($txn.id);
+    $ws.transactions.delete($txn2.id);
+    $ws.set-assigned(PINNED-PERIOD, $groceries.id, 0);
+};
+
+subtest "the carry-overspend flag moves the catalogue token, and stays overspent"
+        => {
+    plan 6;
+    # Two claims about one flag, and they pull in opposite directions.
+    #
+    # The token first. `carry-overspend` IS visible to the derivation —
+    # it is what rule 3 keys on — so flipping it on an envelope that has
+    # overspent moves the digest by itself. On one that has not, it
+    # changes no derived number at all and only the editor's checkbox
+    # would come back stale, which is exactly what the catalogue token
+    # is for.
+    my $forcing = App::Moneymoor::Model::Category.new(
+        id => 42, name => 'Reimbursables', sort-order => 3);
+    my $carrying = App::Moneymoor::Model::Category.new(
+        id => 42, name => 'Reimbursables', sort-order => 3,
+        carry-overspend => True);
+    isnt catalogue-token(($carrying,), ()), catalogue-token(($forcing,), ()),
+        'the token can tell the two rules apart';
+    is catalogue-token(($carrying,), ()), catalogue-token(($carrying,), ()),
+        'and is a content hash, so an unchanged catalogue is byte-identical';
+
+    my %f = fixture();
+    my $store = %f<store>;
+    my $expenses = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Reimbursables', sort-order => 3));
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    my Str $before = state-at($store, 'budget', 'catalogue');
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.categories.update(App::Moneymoor::Model::Category.new(
+            id => $expenses.id, name => $expenses.name,
+            group-id => $expenses.group-id, sort-order => 3,
+            carry-overspend => True));
+    });
+    is %f<toasts>.elems, 0, 'saving the flag is not a refusal';
+    isnt state-at($store, 'budget', 'catalogue'), $before,
+        'and the catalogue token moved, so the grid and the editor repaint';
+
+    # The badge second, and it is unchanged on purpose: `overspent`
+    # means "available is negative", which is exactly as true of a
+    # carried negative as of a forced one. The difference between the
+    # two rules is where the hole goes next period, not whether it is
+    # one — so a carried envelope keeps its badge, and keeps it in the
+    # period it carries into, where the forcing rule would have shown a
+    # clean board.
+    my $txn = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => SPEND-DATE-A,
+            amount => -5000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $expenses.id, amount => -5000)],
+    );
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    is state-at($store, 'budget', 'overspent-count'), 1,
+        'a carried negative counts as overspent, like any other red row';
+
+    dispatch-and-tick($store, 'app/period-next');
+    is state-at($store, 'budget', 'overspent-count'), 1,
+        'and it is still there next period, because that is what carrying is';
+
+    $ws.transactions.delete($txn.id);
+    $ws.categories.delete($expenses.id);
+};

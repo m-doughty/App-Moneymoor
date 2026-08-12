@@ -1,0 +1,283 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::App;
+use Selkie::Sizing;
+use Selkie::Widget::Text;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::HintBar;
+use App::Moneymoor::Screen::Main;
+use App::Moneymoor::Screen::Main::Keybinds;
+use App::Moneymoor::Screen::Main::Modals;
+use App::Moneymoor::Screen::Main::Subscriptions;
+
+# Screen::Main cannot be *built* in a test: Selkie::App's constructor
+# calls notcurses_init, and there is no terminal in a test run. What
+# can be checked without one is everything the shell decides before it
+# paints — the tab table, the pure resolvers the subscriptions use, and
+# the module boundary between Main and its three sibling modules.
+#
+# That boundary is the part worth guarding hardest. The siblings reach
+# into Main through `$main.foo` accessors resolved at *runtime*, inside
+# keybind and subscription closures, so a renamed accessor compiles
+# fine and only explodes when a user presses the key. Same for the
+# `our sub` FQN calls between the siblings: `Pkg::Name::sub(...)` needs
+# the caller to have `use Pkg::Name`, and forgetting it is invisible
+# until the closure fires.
+#
+# `t/84-tab-focus.rakutest` does build the shell, by subclassing it and
+# replacing the two seams that reach the app (`store` and
+# `focus-content`). That covers the content-swap path; it still cannot
+# cover anything that needs a real `Selkie::App` — a toast, a modal, a
+# resize.
+#
+# The banner's period caption used to be built here, by a `month-label`
+# living in Subscriptions. It is now `App::Moneymoor::Util::Period`'s
+# `label`, which is an engine-tier concern with its own literal
+# expectations in `t/18-period.rakutest` — including the empty-string
+# contract that keeps it safe inside a store selector — so this file no
+# longer duplicates them.
+
+plan 8;
+
+my @sub-modules = <Modals Keybinds Subscriptions>.map({
+    "lib/App/Moneymoor/Screen/Main/{$_}.rakumod"
+});
+
+sub collect-callsites(@files, @match-prefixes --> SetHash) {
+    my $set = SetHash.new;
+    for @files -> $f {
+        for $f.IO.lines -> $line {
+            for @match-prefixes -> $prefix {
+                # `<prefix>.<name>` where <name> is kebab-case ASCII —
+                # which is the whole of our naming convention.
+                my $rx = / $prefix '.' ( <[a..z\-]>+ ) /;
+                for $line.match($rx, :g) -> $m {
+                    $set{ $m[0].Str } = True;
+                }
+            }
+        }
+    }
+    $set;
+}
+
+subtest 'every $main.method the siblings call exists on Main' => {
+    my $calls = collect-callsites(@sub-modules, ('$main',));
+    plan $calls.elems;
+    for $calls.keys.sort -> $name {
+        ok App::Moneymoor::Screen::Main.^find_method($name).defined,
+            "App::Moneymoor::Screen::Main has method '$name'";
+    }
+};
+
+subtest 'every $self-ref.method the siblings call exists on Main' => {
+    my $calls = collect-callsites(@sub-modules, ('$self-ref',));
+    plan $calls.elems || 1;
+    if $calls.elems == 0 {
+        pass 'no $self-ref call sites (nothing to verify)';
+    } else {
+        for $calls.keys.sort -> $name {
+            ok App::Moneymoor::Screen::Main.^find_method($name).defined,
+                "App::Moneymoor::Screen::Main has method '$name'";
+        }
+    }
+};
+
+subtest 'cross-module FQN sub-calls resolve at runtime' => {
+    # `Pkg::Path::sub-name(` in the sub-modules resolves only if the
+    # caller had the corresponding `use` at compile time. Silent
+    # without this test — and the failure mode is a keypress that
+    # kills the app.
+    my $rx = / 'App::Moneymoor::' (<[\w:]>+) '::' ( <[a..z]> <[a..z\-]>+ ) '(' /;
+    my %resolved;
+    for @sub-modules -> $f {
+        for $f.IO.lines -> $line {
+            # Pod and `#` comments name symbols without calling them.
+            next if $line.trim.starts-with('#');
+            for $line.match($rx, :g) -> $m {
+                my $name = $m[1].Str;
+                next if $name eq 'new' | 'WHO' | 'WHAT' | 'gist';
+                %resolved{ "App::Moneymoor::{$m[0].Str}::$name" } = True;
+            }
+        }
+    }
+    plan %resolved.elems || 1;
+    if %resolved.elems == 0 {
+        pass 'no FQN sub-calls in the sub-modules (nothing to verify)';
+    } else {
+        for %resolved.keys.sort -> $fqn {
+            my @parts = $fqn.split('::');
+            my $sub-name = @parts.pop;
+            my $pkg-name = @parts.join('::');
+            my $stash = ::($pkg-name).WHO;
+            ok ($stash{ '&' ~ $sub-name }:exists),
+                "$fqn is reachable as a routine";
+        }
+    }
+};
+
+subtest 'Main also exposes what its own delegates need' => {
+    plan 7;
+    # The keybinds reach these through the delegate methods on Main
+    # rather than through `$main.`, so the scan above doesn't see them.
+    # `open-period-picker` is reached from further away still — the
+    # entry point calls it once, straight after a budget is created.
+    for <with-modal open-settings open-diagnostics open-period-picker
+         apply-theme-live set-view set-hint-context> -> $name {
+        ok App::Moneymoor::Screen::Main.^find_method($name).defined,
+            "Main has method '$name'";
+    }
+};
+
+subtest 'the tab table is the three tabs the spec names' => {
+    plan 8;
+    # Constructed, not built: no notcurses is involved until `build`,
+    # and the tab table is a compile-time constant.
+    my $main = App::Moneymoor::Screen::Main.new(
+        app       => Selkie::App,
+        db        => App::Moneymoor::DB,
+        workspace => App::Moneymoor::Service::Workspace,
+        theme     => App::Moneymoor::Themes::load('gruvbox'),
+    );
+
+    is-deeply $main.tab-names, ('budget', 'accounts', 'reports'),
+        "three tabs, in spec order";
+    is $main.tab-label('budget'),   'Budget',   "budget label";
+    is $main.tab-label('accounts'), 'Accounts', "accounts label";
+    is $main.tab-label('reports'),  'Reports',  "reports label";
+    is $main.tab-label('wardrobe'), '',
+        "an unknown tab has no label rather than throwing";
+    is $main.tab-label(Str), '',
+        "and neither does a missing one";
+
+    # Only the budget tab carries a badge: it is the only count that
+    # means "something needs your attention" rather than "here is how
+    # much data there is".
+    is-deeply $main.badged-tab-names, ('budget',),
+        "only the budget tab is badged";
+
+    # The caches start empty, and an unknown id must answer with
+    # nothing rather than autovivifying an entry.
+    nok $main.category(42).defined,
+        "an id with no model behind it resolves to nothing";
+};
+
+subtest 'hint-for-focus resolves focus to a HintBar context' => {
+    plan 7;
+
+    # A stand-in for Main: `hint-for-focus` only reads `.pane-contexts`,
+    # which is exactly the contract that keeps it testable without a
+    # terminal.
+    my class PaneHost {
+        has @.pane-contexts;
+    }
+
+    my $sidebar  = Selkie::Widget::Text.new(text => '', sizing => Sizing.flex);
+    my $register = Selkie::Widget::Text.new(text => '', sizing => Sizing.flex);
+    my $stranger = Selkie::Widget::Text.new(text => '', sizing => Sizing.flex);
+
+    my $host = PaneHost.new(pane-contexts => [
+        $sidebar  => 'sidebar',
+        $register => 'register',
+    ]);
+
+    is hint-for-focus($host, $sidebar), 'sidebar',
+        "the sidebar pane gets the sidebar hints";
+    is hint-for-focus($host, $register), 'register',
+        "the register pane gets the register hints";
+    is hint-for-focus($host, $stranger), 'generic',
+        "a widget outside the map falls back to the app-wide keys";
+    is hint-for-focus($host, Nil), 'generic',
+        "and so does no focus at all";
+
+    # Identity, not equality: two panes with the same content are not
+    # the same pane, and the map is rebuilt with the widgets on every
+    # tab change.
+    my $twin = Selkie::Widget::Text.new(text => '', sizing => Sizing.flex);
+    is hint-for-focus($host, $twin), 'generic',
+        "an identical-but-different widget is not a match";
+
+    my $empty = PaneHost.new(pane-contexts => []);
+    is hint-for-focus($empty, $sidebar), 'generic',
+        "a tab with no registered panes yields generic";
+
+    # Whatever the shell can produce has to be a context the table
+    # actually knows, or the footer silently falls back and the user
+    # sees the wrong keys.
+    ok (<generic budget register sidebar reports>.all
+            ∈ hint-contexts().Set),
+        "every context the shell routes to exists in the hint table";
+};
+
+subtest 'the app-wide and login hints advertise only keys that exist' => {
+    # The four per-pane contexts are scanned by t/69, t/75 and t/83,
+    # each next to the tab that owns the keys. These two have no tab:
+    # `generic` is what the footer shows when focus is somewhere it has
+    # no opinion about, and `login` is painted once into a screen that
+    # never subscribes to anything. Nothing else would notice either
+    # going stale.
+    my constant KEYBINDS-SRC = 'lib/App/Moneymoor/Screen/Main/Keybinds.rakumod';
+    my constant LOGIN-SRC    = 'lib/App/Moneymoor/Screen/Login.rakumod';
+
+    # Keys Selkie itself binds, app-wide, before Moneymoor binds
+    # anything (Selkie::App.!register-default-keybinds). Advertising one
+    # is honest; it just isn't bound in this distribution.
+    my constant FRAMEWORK = <tab shift+tab esc ctrl+q>;
+
+    sub keys-bound-in(Str $path --> SetHash) {
+        my $set = SetHash.new;
+        my Bool $in-pod = False;
+        for $path.IO.lines -> $line {
+            $in-pod = True if $line.starts-with('=begin pod');
+            if $in-pod {
+                $in-pod = False if $line.starts-with('=end pod');
+                next;
+            }
+            next if $line.trim.starts-with('#');
+            for $line.match(/ 'on-key:' \s* \' (<-[']>+) \' /, :g) -> $m {
+                $set{ $m[0].Str } = True;
+            }
+        }
+        $set;
+    }
+
+    my $global = keys-bound-in(KEYBINDS-SRC);
+    my $login  = keys-bound-in(LOGIN-SRC);
+
+    my @cases =
+        ('generic', $global),
+        ('login',   $login ∪ $global),
+    ;
+    plan @cases.map({ hint-groups(.[0]).elems }).sum;
+
+    for @cases -> ($context, $bound) {
+        for hint-groups($context) -> $group {
+            my Str $spec = $group.key.lc;
+            # 'Enter' on the login screen is a TextInput submit supply,
+            # not a keybind — Selkie's TextInput emits on-submit and
+            # never lets Enter reach a bind.
+            my Bool $ok = $spec ∈ FRAMEWORK
+                       || $bound{$spec}
+                       || ($context eq 'login' && $spec eq 'enter'
+                           && LOGIN-SRC.IO.slurp.contains('on-submit.tap'));
+            ok $ok,
+                "the $context footer's '{$group.key}' ({$group.value}) "
+                    ~ "is something the app really does";
+        }
+    }
+};
+
+subtest 'the hint contexts the shell uses are distinct and populated' => {
+    plan 8;
+    for <budget register sidebar reports> -> $ctx {
+        ok hint-groups($ctx).elems > 0, "$ctx has hints";
+        isnt hint-groups($ctx).map(*.key).join(','),
+             hint-groups('generic').map(*.key).join(','),
+            "$ctx is not just the generic set under another name";
+    }
+};

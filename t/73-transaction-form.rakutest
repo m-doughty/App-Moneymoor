@@ -1,0 +1,149 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The transaction editor's semantics, extracted from its widgets.
+#
+# Everything in this file is a rule the engine already has and the form
+# has to restate: which fields a tracking account may show, what a
+# transfer leg will not let you move, when Save is allowed to fire, and
+# which way the money goes. A restated rule that nobody tests goes
+# stale, so each one is a pure function called by fully-qualified name
+# — the same treatment the assign field's sign rule gets in t/69.
+
+plan 7;
+
+my &signed      = &App::Moneymoor::Screen::Main::Modals::signed-amount;
+my &remainder   = &App::Moneymoor::Screen::Main::Modals::split-remainder;
+my &suggest     = &App::Moneymoor::Screen::Main::Modals::payee-suggest-tail;
+my &caps        = &App::Moneymoor::Screen::Main::Modals::editor-capabilities;
+my &magnitude   = &App::Moneymoor::Screen::Main::Modals::parse-magnitude;
+my constant OUT = App::Moneymoor::Screen::Main::Modals::OUTFLOW-LABEL;
+my constant IN  = App::Moneymoor::Screen::Main::Modals::INFLOW-LABEL;
+
+sub account(Str $type) {
+    App::Moneymoor::Model::Account.new(id => 1, name => 'A', :$type);
+}
+
+sub txn(Int :$peer, Str :$cleared = 'uncleared') {
+    App::Moneymoor::Model::Transaction.new(
+        id => 1, account-id => 1, date => '2026-03-01', amount => -100,
+        :$cleared, transfer-peer-id => $peer);
+}
+
+# --- Tests --------------------------------------------------------------
+
+subtest 'the direction is applied in exactly one place' => {
+    plan 4;
+    is signed(1250, OUT), -1250, 'an outflow is negative in the account';
+    is signed(1250, IN),   1250, 'an inflow is positive';
+    is signed(0, OUT), 0, 'and nothing has no direction to speak of';
+    # A form that has lost its direction is far likelier to be a
+    # purchase than a windfall, and guessing wrong the safe way means
+    # the user sees a figure they have to correct rather than one that
+    # quietly inflates the budget.
+    is signed(500, Str), -500, 'a missing direction reads as outflow';
+};
+
+subtest 'the remainder is what Save waits for' => {
+    plan 6;
+    is remainder(1250, (500, 250)), 500, 'part-allocated';
+    is remainder(1250, (1000, 250)), 0, 'exactly allocated';
+    is remainder(1250, (2000,)), -750, 'over-allocated is negative, not zero';
+    is remainder(1250, ()), 1250, 'nothing allocated is the whole amount';
+    is remainder(0, ()), 0, 'and nothing to allocate is already done';
+
+    # The gate itself: the editor refuses to emit while this is
+    # non-zero, which is what "Save is disabled" means in a dialog with
+    # no Save button.
+    my @entries = ({ amount => 400 }, { amount => 850 });
+    ok remainder(1250, @entries.map(*<amount>)) == 0,
+        'and a split set that adds up opens the gate';
+};
+
+subtest 'split lines take the transaction\'s direction' => {
+    plan 3;
+    # Typed as magnitudes, signed once on save — so a £12.50 line of a
+    # £30 shop is -1250 in an outflow.
+    is signed(1250, OUT), -1250, 'a line of an outflow is an outflow';
+    is signed(1250, IN), 1250, 'and a line of an inflow is an inflow';
+    # Accountant parentheses are how a line runs the other way: a
+    # refund inside a purchase. parse-pence reads '(2.50)' as -250, and
+    # the direction then flips it to +250.
+    is signed(-250, OUT), 250,
+        'a negative line inside an outflow runs the other way';
+};
+
+subtest 'the amount field is a magnitude, not a signed figure' => {
+    plan 6;
+    is magnitude('42.10'), 4210, 'a plain figure';
+    is magnitude(' £1,234.56 '), 123456, 'symbols and separators are fine';
+
+    for '', '  ', 'twelve' -> $bad {
+        my $result = magnitude($bad);
+        ok $result ~~ Failure, "'$bad' is refused rather than guessed at";
+        $result.so;
+    }
+
+    # The direction is the RadioGroup's job. A field where -5 in an
+    # Outflow form means an inflow is a form that lies about what it is
+    # about to do.
+    my $negative = magnitude('-5');
+    ok $negative ~~ Failure, 'and so is a negative';
+    $negative.so;
+};
+
+subtest 'a payee suggestion is the tail of the first match' => {
+    plan 6;
+    my @names = ('Sainsbury', 'Tesco', 'Tesco Express');
+    is suggest(@names, 'tes'), 'co', 'case-insensitive prefix';
+    is suggest(@names, 'Tesco'), ' Express',
+        'and it keeps going once the shorter one is complete';
+    is suggest(@names, 'TESCO'), ' Express', 'still case-insensitively';
+    is suggest(@names, 'Tesco Express'), '',
+        'an exact match has no tail to accept';
+    is suggest(@names, 'zzz'), '', 'no match suggests nothing';
+    is suggest(@names, ''), '',
+        'and an empty field suggests nothing rather than the first payee';
+};
+
+subtest 'what the editor may offer, per account and transaction' => {
+    plan 10;
+    my %new-cash = caps(account('cash'), Nil);
+    ok %new-cash<categorised>,
+        'a new transaction on a budget account must say where the money went';
+    nok %new-cash<endpoints-locked>, 'and may choose its account';
+    nok %new-cash<warn-first>, 'with nothing to warn about';
+
+    my %tracking = caps(account('tracking'), Nil);
+    nok %tracking<categorised>,
+        'a tracking account is never categorised — the engine refuses it';
+    ok %tracking<tracking>, 'and the picker can say which reason applies';
+
+    my %edit = caps(account('cash'), txn());
+    ok %edit<endpoints-locked>,
+        'an existing transaction cannot change account from this form';
+
+    my %transfer = caps(account('cash'), txn(peer => 9));
+    ok %transfer<transfer>, 'a transfer leg is recognised';
+    nok %transfer<categorised>,
+        'and one that stays inside the budget carries no envelope';
+
+    # The engine only permits splits on a transfer whose legs sit on
+    # opposite sides of the budget, so a leg that has them is one.
+    my %crossing = caps(account('cash'), txn(peer => 9), has-splits => True);
+    ok %crossing<categorised>,
+        'a boundary-crossing leg keeps its category, because it must';
+
+    ok caps(account('cash'), txn(cleared => 'reconciled'))<warn-first>,
+        'and a reconciled transaction is asked about first';
+};
+
+subtest 'the two labels the form and the register share' => {
+    plan 2;
+    is OUT, 'Outflow', 'the register\'s Outflow column names the direction';
+    is IN, 'Inflow', 'and its Inflow column the other';
+};

@@ -1,0 +1,227 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Screen::Accounts;
+use App::Moneymoor::Screen::Budget;
+use App::Moneymoor::Screen::Main;
+use App::Moneymoor::Screen::Main::Keybinds;
+use App::Moneymoor::Screen::Main::Modals;
+use App::Moneymoor::View::HintBar;
+
+# t/69's treatment, for the accounts tab.
+#
+# Two things nothing else can catch.
+#
+# 1. The tab's keys are registered inside closures that only run when
+#    the user presses them, and they call sibling-module subs by
+#    fully-qualified name plus accessors on Screen::Main and on the tab
+#    controller by string. All of it resolves at *runtime*: a renamed
+#    accessor or a missing `use` compiles cleanly and takes the app
+#    down on a keypress.
+#
+# 2. The hint footer is a hand-maintained table. Every key it
+#    advertises has to be a key that exists, or the footer is lying to
+#    the user in the one place they look to find out what the keys are.
+#
+# Source-level, because building the tab needs a notcurses App and
+# there is no terminal in a test run.
+
+plan 8;
+
+my constant ACCOUNTS-SRC = 'lib/App/Moneymoor/Screen/Accounts.rakumod';
+my constant KEYBINDS-SRC = 'lib/App/Moneymoor/Screen/Main/Keybinds.rakumod';
+my constant MODALS-SRC   = 'lib/App/Moneymoor/Screen/Main/Modals.rakumod';
+
+# Lines that are neither Pod nor comment — the ones that actually run.
+sub code-lines(Str $path --> List) {
+    my @out;
+    my Bool $in-pod = False;
+    for $path.IO.lines -> $line {
+        $in-pod = True  if $line.starts-with('=begin pod');
+        if $in-pod {
+            $in-pod = False if $line.starts-with('=end pod');
+            next;
+        }
+        next if $line.trim.starts-with('#');
+        @out.push($line);
+    }
+    @out.List;
+}
+
+sub keys-bound-in(Str $path --> SetHash) {
+    my $set = SetHash.new;
+    for code-lines($path) -> $line {
+        for $line.match(/ 'on-key:' \s* \' (<-[']>+) \' /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    $set;
+}
+
+# Which widget a bind was hung on, so the two panes' tables can be told
+# apart in one file: `$!table.on-key: 'n'` and `$!sidebar.on-key: 'n'`
+# are different keys on different panes.
+sub keys-bound-on(Str $path, Str $widget --> SetHash) {
+    my $set = SetHash.new;
+    my $rx = / '$!' $widget '.on-key:' \s* \' (<-[']>+) \' /;
+    for code-lines($path) -> $line {
+        for $line.match($rx, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    $set;
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'every $main.method Screen::Accounts calls exists on Main' => {
+    my $set = SetHash.new;
+    for code-lines(ACCOUNTS-SRC) -> $line {
+        for $line.match(/ '$main.' ( <[a..z\-]>+ ) /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    plan $set.elems;
+    for $set.keys.sort -> $name {
+        ok App::Moneymoor::Screen::Main.^find_method($name).defined,
+            "Screen::Main has method '$name'";
+    }
+};
+
+subtest 'every $tab.method the dialogs call exists on a tab' => {
+    # Screen::Main::Modals reaches both tab controllers through a local
+    # named $tab. Every one of those calls happens inside a keybind or
+    # submit closure, so a rename is invisible until a keypress.
+    my $set = SetHash.new;
+    for code-lines(MODALS-SRC) -> $line {
+        for $line.match(/ '$tab.' ( <[a..z\-]>+ ) /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    plan $set.elems;
+    for $set.keys.sort -> $name {
+        ok (App::Moneymoor::Screen::Accounts.^find_method($name).defined
+            || App::Moneymoor::Screen::Budget.^find_method($name).defined),
+            "a tab controller has method '$name'";
+    }
+};
+
+subtest 'every modal Screen::Accounts opens is a real routine' => {
+    # `Pkg::sub(...)` resolves only if the caller had the matching
+    # `use` at compile time, and the lookup happens inside the keybind
+    # closure — so a missing `use` is invisible until a keypress.
+    my $rx = / 'App::Moneymoor::' (<[\w:]>+) '::' ( <[a..z]> <[a..z\-]>+ ) '(' /;
+    my %resolved;
+    for code-lines(ACCOUNTS-SRC) -> $line {
+        for $line.match($rx, :g) -> $m {
+            %resolved{ "App::Moneymoor::{$m[0].Str}::{$m[1].Str}" } = True;
+        }
+    }
+    plan %resolved.elems;
+    for %resolved.keys.sort -> $fqn {
+        my @parts = $fqn.split('::');
+        my $sub-name = @parts.pop;
+        my $stash = ::(@parts.join('::')).WHO;
+        ok ($stash{ '&' ~ $sub-name }:exists), "$fqn is reachable";
+    }
+};
+
+subtest 'the whole of §4.4\'s two key tables is bound' => {
+    plan 11;
+    my $register = keys-bound-on(ACCOUNTS-SRC, 'table');
+    my $sidebar  = keys-bound-on(ACCOUNTS-SRC, 'sidebar');
+
+    for <n e d c t> -> $key {
+        ok $register{$key}, "'$key' is bound on the register";
+    }
+    for <n e c> -> $key {
+        ok $sidebar{$key}, "'$key' is bound on the sidebar";
+    }
+
+
+    ok $register{'ctrl+r'}, 'ctrl+r is bound, as the footer promises';
+
+    # §4.5's Esc is the one key the register consumes outright: it must
+    # not fall through while a reconciliation is running.
+    ok $register{'esc'}, 'and so is Esc, for reconcile mode';
+
+    # Enter goes through on-activate on both panes: Table and ListView
+    # both check their keybinds before their own navigation, so binding
+    # 'enter' would take it away from the widget for good.
+    nok $register{'enter'} || $sidebar{'enter'},
+        'Enter is deliberately NOT a keybind on either pane';
+};
+
+subtest 'Enter is wired, through the supplies instead' => {
+    plan 4;
+    my $src = ACCOUNTS-SRC.IO.slurp;
+    is $src.comb('on-activate.tap').elems, 2,
+        'both panes tap their activate supply';
+    ok $src.contains('accounts/toggle-closed'),
+        'the sidebar\'s Enter folds the closed bucket';
+    ok $src.contains('open-transaction-editor'),
+        'and the register\'s opens the editor';
+    ok $src.contains('accounts/select-account'),
+        'while moving the cursor writes the selection to the store';
+};
+
+subtest 'the register hint bar advertises only keys that exist' => {
+    my $register = keys-bound-on(ACCOUNTS-SRC, 'table');
+    my $global   = keys-bound-in(KEYBINDS-SRC);
+
+    my @hints = hint-groups('register');
+    plan @hints.elems;
+    for @hints -> $group {
+        my Str $key = $group.key.lc;
+        ok $register{$key} || $global{$key},
+            "the footer's '{$group.key}' ({$group.value}) is a real bind";
+    }
+};
+
+subtest 'the sidebar hint bar advertises only keys that exist' => {
+    my $sidebar = keys-bound-on(ACCOUNTS-SRC, 'sidebar');
+    my $global  = keys-bound-in(KEYBINDS-SRC);
+    my $src     = ACCOUNTS-SRC.IO.slurp;
+
+    my @hints = hint-groups('sidebar');
+    plan @hints.elems;
+    for @hints -> $group {
+        my Str $key = $group.key.lc;
+        if $key eq 'enter' {
+            # Not a keybind by design — see the subtest above.
+            ok $src.contains('on-activate.tap'),
+                "the footer's 'Enter' ({$group.value}) is the activate supply";
+        } else {
+            ok $sidebar{$key} || $global{$key},
+                "the footer's '{$group.key}' ({$group.value}) is a real bind";
+        }
+    }
+};
+
+subtest 'the reconcile hint bar advertises only keys that exist' => {
+    # §4.5's context overrides `register` while the mode is running, so
+    # every key it names has to be a key the register really answers —
+    # and Enter deliberately is not one of them, because Table checks
+    # its keybinds before its own navigation.
+    my $register = keys-bound-on(ACCOUNTS-SRC, 'table');
+    my $global   = keys-bound-in(KEYBINDS-SRC);
+    my $src      = ACCOUNTS-SRC.IO.slurp;
+
+    my @hints = hint-groups('reconcile');
+    plan @hints.elems + 1;
+    for @hints -> $group {
+        my Str $key = $group.key.lc;
+        if $key eq 'enter' {
+            ok $src.contains('finish-reconcile'),
+                "the footer's 'Enter' ({$group.value}) is the activate supply";
+        } else {
+            ok $register{$key} || $global{$key},
+                "the footer's '{$group.key}' ({$group.value}) is a real bind";
+        }
+    }
+
+    # And the mode has to be reachable from the context that precedes
+    # it: ctrl+r is advertised by `register` and opens the dialog.
+    ok $src.contains('open-reconcile'),
+        'ctrl+r opens the dialog that starts the mode';
+};

@@ -1,0 +1,347 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Payee;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Budget;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Util::Money;
+use App::Moneymoor::View::BudgetRow;
+use App::Moneymoor::View::RegisterRow;
+
+# The register's and the sidebar's row models, without a terminal and
+# without a database: models and lookup hashes in, row hashes out.
+#
+# Everything awkward about a register lives in here — the running
+# balance's dependence on order, the hop from a transfer leg to the
+# account at the other end, the three shapes of the category cell, and
+# the column set that changes with the width — so this is where those
+# are pinned.
+#
+# Dates are literal constants. Nothing in this file reads the clock.
+
+plan 13;
+
+my constant DAY1 = '2026-03-01';
+my constant DAY2 = '2026-03-04';
+my constant DAY3 = '2026-03-09';
+
+my $icons = icons('unicode');
+my $theme = App::Moneymoor::Themes::load('gruvbox');
+
+# --- Fixtures ---------------------------------------------------------
+
+sub account(Int $id, Str $name, Str $type = 'cash', Bool :$closed = False,
+            Int :$order = 0) {
+    App::Moneymoor::Model::Account.new(
+        :$id, :$name, :$type, :$closed, sort-order => $order);
+}
+
+sub txn(Int $id, Int $account-id, Str $date, Int $amount,
+        Int :$payee-id, Str :$cleared = 'uncleared', Int :$peer) {
+    App::Moneymoor::Model::Transaction.new(
+        :$id, :$account-id, :$date, :$amount, :$payee-id, :$cleared,
+        transfer-peer-id => $peer);
+}
+
+sub split(Int $category-id, Int $amount) {
+    App::Moneymoor::Model::Split.new(:$category-id, :$amount);
+}
+
+my $current  = account(1, 'Current',  'cash',     order => 1);
+my $visa     = account(2, 'Visa',     'credit',   order => 2);
+my $savings  = account(3, 'Savings',  'cash',     order => 3);
+my $house    = account(4, 'House',    'tracking', order => 4);
+my $old      = account(5, 'Old ISA',  'cash',     order => 5, closed => True);
+
+my %accounts = (1 => $current, 2 => $visa, 3 => $savings, 4 => $house,
+                5 => $old);
+
+my %payees = (
+    1 => App::Moneymoor::Model::Payee.new(id => 1, name => 'Tesco'),
+    2 => App::Moneymoor::Model::Payee.new(id => 2, name => 'Work'),
+);
+
+my %categories = (
+    7 => App::Moneymoor::Model::Category.new(id => 7, name => 'Groceries'),
+    8 => App::Moneymoor::Model::Category.new(id => 8, name => 'Fuel'),
+    9 => App::Moneymoor::Model::Category.new(
+             id => 9, name => 'Ready to Assign', kind => 'rta'),
+);
+
+#| A stand-in BudgetView: the register only ever asks it for one thing.
+my class FakeView {
+    has %.balances;      # account id => [cleared, uncleared]
+    method account-balance(Int $id) {
+        # `.list`, because a hash element is itemised: without it the
+        # whole pair lands in @pair[0].
+        my @pair = (%!balances{$id} // (0, 0)).list;
+        App::Moneymoor::Service::Budget::AccountBalance.new(
+            account-id => $id, cleared => @pair[0], uncleared => @pair[1]);
+    }
+}
+
+my $view = FakeView.new(balances => {
+    1 => (90000, 10000),      # Current: £900 cleared, £1,000 working
+    2 => (-25000, 0),         # Visa:    -£250
+    3 => (500000, 0),         # Savings: £5,000
+    4 => (17500000, 0),       # House:   £175,000
+    5 => (1234, 0),           # Old ISA (closed) — must not count
+});
+
+# --- Tests -------------------------------------------------------------
+
+subtest 'the running balance is a scan in the order it was given' => {
+    plan 5;
+    # Two on the same date: the gateway orders by (date, id), and the
+    # scan has to preserve whatever order it was handed rather than
+    # re-sorting by date and scrambling the pair.
+    my @txns = (
+        txn(1, 1, DAY1, 200000),
+        txn(4, 1, DAY2, -1500),
+        txn(5, 1, DAY2, -2500),
+        txn(9, 1, DAY3, -10000),
+    );
+    my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
+                             running-balance => True, :$icons);
+
+    is @rows[0]<balance>, money-cell(200000, BALANCE-COLS), 'the opening pay';
+    is @rows[1]<balance>, money-cell(198500, BALANCE-COLS), 'less the first';
+    is @rows[2]<balance>, money-cell(196000, BALANCE-COLS),
+        'and the second on the same day, in id order';
+    is @rows[3]<balance>, money-cell(186000, BALANCE-COLS), 'and the last';
+
+    # All Accounts interleaves ledgers by date, so the cumulative sum
+    # would be a balance of nothing. The column is simply not filled.
+    my @flat = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
+                             :$icons);
+    is-deeply @flat.map(*<balance>).List, ('', '', '', ''),
+        'and it is empty when the caller did not ask for it';
+};
+
+subtest 'a transfer leg names the account at the other end' => {
+    plan 4;
+    # Leg 11 lives on Current and points at leg 12, which lives on
+    # Savings — a hop the row builder cannot make without the index.
+    my @txns = (txn(11, 1, DAY1, -50000, peer => 12),);
+    my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
+                             peer-accounts => { 12 => 3 }, :$icons);
+    is @rows[0]<payee>, $icons.transfer ~ ' Savings',
+        'the payee cell is the peer account, not a payee';
+    ok @rows[0]<transfer>, 'and the row knows it is one';
+
+    my @orphan = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
+                               :$icons);
+    is @orphan[0]<payee>, $icons.transfer ~ ' Transfer',
+        'an unindexed peer still reads as a transfer rather than as blank';
+
+    my @plain = register-rows(
+        transactions => (txn(12, 1, DAY1, -1200, payee-id => 1),),
+        :%payees, :%categories, :%accounts, :$icons);
+    is @plain[0]<payee>, 'Tesco', 'an ordinary row names its payee';
+};
+
+subtest 'the category cell has three shapes' => {
+    plan 5;
+    my @txns = (
+        txn(1, 1, DAY1, -1000),      # no splits at all
+        txn(2, 1, DAY1, -2000),      # one, an envelope
+        txn(3, 1, DAY1, 200000),     # one, Ready to Assign
+        txn(4, 1, DAY1, -3000),      # three
+    );
+    my %splits = (
+        2 => [split(7, -2000),],
+        3 => [split(9, 200000),],
+        4 => [split(7, -1000), split(8, -1000), split(7, -1000)],
+    );
+    my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
+                             :%splits, :$icons);
+
+    is @rows[0]<category>, UNCATEGORISED-CELL,
+        'no splits is an em dash, not an empty cell';
+    is @rows[1]<category>, 'Groceries', 'one split is its category';
+    is @rows[2]<category>, RTA-LABEL,
+        'and the rta row is spelled out as an inflow';
+    is @rows[3]<category>, '(3 splits)', 'more than one is a count';
+
+    my @unknown = register-rows(
+        transactions => (txn(5, 1, DAY1, -100),),
+        :%payees, categories => %(), :%accounts,
+        splits => { 5 => [split(99, -100),] }, :$icons);
+    is @unknown[0]<category>, '(unknown category)',
+        'a split pointing nowhere says so rather than rendering blank';
+};
+
+subtest 'outflow and inflow are two columns, never both' => {
+    plan 6;
+    my @rows = register-rows(
+        transactions => (txn(1, 1, DAY1, -4210),
+                         txn(2, 1, DAY1, 125000),
+                         txn(3, 1, DAY1, 0)),
+        :%payees, :%categories, :%accounts, :$icons);
+
+    is @rows[0]<outflow>, money-cell(4210, OUTFLOW-COLS),
+        'money out is the absolute figure';
+    is @rows[0]<inflow>, '', 'and the other cell is empty';
+    is @rows[1]<inflow>, money-cell(125000, INFLOW-COLS), 'money in';
+    is @rows[1]<outflow>, '', 'and the other cell is empty';
+
+    # §4.4: outflow when amount < 0, inflow when > 0. Zero is neither,
+    # and a £0.00 in one column would read as a rounding error.
+    is @rows[2]<outflow>, '', 'a zero transaction fills neither column';
+    is @rows[2]<inflow>, '', 'in either direction';
+};
+
+subtest 'reconciled outranks direction, and the palette agrees' => {
+    plan 6;
+    my @rows = register-rows(
+        transactions => (txn(1, 1, DAY1, -100),
+                         txn(2, 1, DAY1, 100),
+                         txn(3, 1, DAY1, -100, cleared => 'reconciled'),
+                         txn(4, 1, DAY1, 100, cleared => 'reconciled')),
+        :%payees, :%categories, :%accounts, :$icons);
+
+    is @rows[0]<severity>, 'outflow', 'money out';
+    is @rows[1]<severity>, 'inflow',  'money in';
+    is @rows[2]<severity>, 'reconciled',
+        'a locked row is finished business whichever way it went';
+    is @rows[3]<severity>, 'reconciled', 'in both directions';
+
+    is register-style('reconciled', :$theme).fg, $theme.fg-dim,
+        'reconciled renders dim';
+    is register-style('inflow', :$theme).fg, $theme.fg-green,
+        'and an inflow green, as §2 asks';
+};
+
+subtest 'the cleared column is the icon, and c walks it in a circle' => {
+    plan 6;
+    my @rows = register-rows(
+        transactions => (txn(1, 1, DAY1, -100),
+                         txn(2, 1, DAY1, -100, cleared => 'cleared'),
+                         txn(3, 1, DAY1, -100, cleared => 'reconciled')),
+        :%payees, :%categories, :%accounts, :$icons);
+    is @rows[0]<cleared>, ' ' ~ $icons.cleared-uncleared, 'uncleared';
+    is @rows[1]<cleared>, ' ' ~ $icons.cleared-cleared,   'cleared';
+    is @rows[2]<cleared>, ' ' ~ $icons.cleared-reconciled, 'reconciled';
+
+    is next-cleared-state('uncleared'), 'cleared', 'c clears';
+    is next-cleared-state('cleared'), 'reconciled', 'c again reconciles';
+    is next-cleared-state('reconciled'), 'uncleared',
+        'and once more comes back round';
+};
+
+subtest 'the All-Accounts view swaps the balance for the account' => {
+    plan 4;
+    my @txns = (txn(1, 1, DAY1, -100), txn(2, 3, DAY2, -200));
+    my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
+                             :$icons);
+    is @rows[0]<account>, 'Current', 'each row names its own ledger';
+    is @rows[1]<account>, 'Savings', 'including the second';
+
+    my @names = register-columns(all-accounts => True, width => 200)
+        .map(*<name>);
+    ok @names.first('account').defined, 'the column is there';
+    nok @names.first('balance').defined,
+        'and the running balance is not, because it would be meaningless';
+};
+
+subtest 'the balance column comes and goes with the width' => {
+    plan 6;
+    my @wide   = register-columns(width => BALANCE-MIN-COLS).map(*<name>);
+    my @narrow = register-columns(width => BALANCE-MIN-COLS - 1).map(*<name>);
+
+    is-deeply @wide.List,
+        ('date', 'payee', 'category', 'cleared', 'outflow', 'inflow',
+         'balance'),
+        'at the threshold the balance fits';
+    is-deeply @narrow.List,
+        ('date', 'payee', 'category', 'cleared', 'outflow', 'inflow'),
+        'one column narrower and it is dropped rather than truncated';
+
+    my @cols = register-columns(width => 200);
+    is @cols[0]<width>, DATE-COLS,
+        'the date column is the ISO date plus a gutter';
+    is @cols[3]<width>, CLEARED-COLS, 'the cleared column is the glyph plus one';
+    is-deeply @cols.grep({ $_<width> == 0 }).map(*<name>).List,
+        ('payee', 'category'), 'and only the two text columns are flex';
+    is @cols[6]<label>, money-header('Balance', BALANCE-COLS),
+        'money headers sit over their own digits';
+};
+
+subtest 'net worth is every open account, tracking included' => {
+    plan 3;
+    my @accounts = ($current, $visa, $savings, $house, $old);
+    # 1000 + (-250) + 5000 + 175000, and NOT the closed ISA's £12.34.
+    is net-worth(:@accounts, :$view), 100000 - 25000 + 500000 + 17500000,
+        'cash plus credit plus tracking, open only';
+    is net-worth(accounts => (), :$view), 0, 'and nothing is zero';
+    is working-balance(Nil, 1), 0,
+        'a view that has not been computed yet answers zero, not undefined';
+};
+
+subtest 'the sidebar has sections, and the captions are not selections' => {
+    plan 8;
+    my @accounts = ($current, $visa, $savings, $house, $old);
+    my @rows = sidebar-rows(:@accounts, :$view, :$icons);
+
+    is-deeply @rows.map(*<kind>).List,
+        ('all', 'header', 'account', 'account', 'account',
+         'header', 'account', 'closed-toggle'),
+        'All Accounts, BUDGET and its three, TRACKING and its one, the fold';
+    is @rows[0]<label>, 'All Accounts', 'the pseudo-ledger first';
+    # The net worth is arithmetically this row's, but the name is 12 of
+    # the 22 cells a sidebar line has and any real figure would push it
+    # into an ellipsis. It goes in the pane's bottom title.
+    nok @rows[0]<label>.contains('£'), 'without a figure crowding it';
+    ok @rows[1]<label> eq 'BUDGET', 'the on-budget caption';
+    ok @rows[5]<label> eq 'TRACKING', 'and the off-budget one';
+    ok @rows[2]<label>.starts-with($icons.account-cash ~ ' Current'),
+        'an account row is its type glyph and its name';
+    ok @rows[3]<label>.starts-with($icons.account-credit ~ ' Visa'),
+        'and a card gets the card glyph';
+    ok @rows[7]<label>.contains('CLOSED (1)'),
+        'the closed bucket counts what is in it';
+};
+
+subtest 'the closed bucket only lists its accounts when unfolded' => {
+    plan 5;
+    my @accounts = ($current, $old);
+    my @shut = sidebar-rows(:@accounts, :$view, :$icons);
+    is @shut.elems, 4, 'All Accounts, BUDGET, Current, the fold';
+    ok @shut[*-1]<label>.starts-with($icons.group-collapsed),
+        'and the fold shows a closed chevron';
+
+    my @open = sidebar-rows(:@accounts, :$view, show-closed => True,
+                            :$icons);
+    is @open.elems, 5, 'unfolded, the closed account joins the list';
+    is @open[*-1]<id>, 5, 'as a real, selectable row';
+    is @open[*-1]<severity>, 'reconciled',
+        'rendered dim, because it is history rather than a live ledger';
+};
+
+subtest 'a sidebar line fits its width, name first to give way' => {
+    plan 5;
+    is sidebar-label('Current', '£10.00', 22), 'Current         £10.00',
+        'the balance is flush right';
+    is sidebar-label('Current', '£10.00', 22).chars, 22, 'exactly the width';
+
+    my Str $long = sidebar-label('A Very Long Account Name Indeed',
+                                 '£1,000.00', 22);
+    is $long.chars, 22, 'a name too long still fits the line';
+    ok $long.ends-with('£1,000.00'),
+        'because the name gives way, never the figure';
+    ok $long.contains('…'), 'and says that it did';
+};
+
+subtest 'the register\'s frame title carries both balances' => {
+    plan 2;
+    is register-title('Current', $view.account-balance(1)),
+        'Current · cleared £900.00 · working £1,000.00',
+        'the two figures a reconciliation needs';
+    is register-title('Current', Nil), 'Current',
+        'and just the name before the first derivation lands';
+};

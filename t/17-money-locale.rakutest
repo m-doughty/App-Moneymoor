@@ -1,0 +1,242 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Util::Money;
+
+# The display locale: a currency symbol and a decimal mark, held as
+# module state in Util::Money and set once at startup from the config.
+#
+# Two things make this worth its own file rather than a few extra
+# assertions in t/01. The first is that the decimal mark is not only a
+# formatting choice — it decides how a typed figure is READ, and the
+# thousands separator is always the other character, so a locale change
+# rewires the parser as well as the renderer. The second is that the
+# failure mode of getting that wrong is silent and expensive: '1,50'
+# read as 150 instead of 1.50 is a 100x error in a budget. So the
+# strict-grouping rule is pinned here from both sides.
+#
+# Every subtest that moves the registers puts them back in a LEAVE.
+# t/01 asserts the default locale and would fail — correctly — if this
+# file leaked one.
+
+plan 11;
+
+LEAVE set-money-locale;
+
+#| The message from a Failure, defusing it on the way out: an
+#| undefused Failure re-throws when it is next sunk, which in a test
+#| file means a crash attributed to whatever ran next.
+sub failure-message($result --> Str) {
+    return "not a Failure: $result" unless $result ~~ Failure;
+    my Str $msg = $result.exception.message;
+    $result.so;
+    $msg;
+}
+
+#| Did parsing refuse this? Defuses either way.
+sub refused($result --> Bool) {
+    my Bool $is = $result ~~ Failure;
+    $result.so if $is;
+    $is;
+}
+
+subtest 'the registers start where the rest of the app assumes' => {
+    plan 4;
+    is pence-symbol(), '£', 'the default symbol is sterling';
+    is money-decimal-mark(), '.', 'the default decimal mark is a point';
+    is-deeply money-symbols(), ('£', '$', '€'),
+        'the accepted symbols, in picker order';
+    is-deeply money-decimal-marks(), ('.', ','),
+        'the accepted decimal marks, in picker order';
+};
+
+subtest 'set-money-locale moves both registers, and resets to default' => {
+    plan 6;
+    LEAVE set-money-locale;
+
+    set-money-locale(symbol => '€', decimal-mark => ',');
+    is pence-symbol(), '€', 'the symbol register took';
+    is money-decimal-mark(), ',', 'the decimal register took';
+
+    # Each argument defaults independently, so a caller can move one.
+    set-money-locale(symbol => '$');
+    is pence-symbol(), '$', 'the symbol moved';
+    is money-decimal-mark(), '.',
+        'and the omitted mark went back to its default rather than sticking';
+
+    set-money-locale;
+    is pence-symbol(), '£', 'a bare call restores the default symbol';
+    is money-decimal-mark(), '.', 'and the default mark';
+};
+
+subtest 'formatting under a $ / . locale' => {
+    plan 6;
+    LEAVE set-money-locale;
+    set-money-locale(symbol => '$', decimal-mark => '.');
+
+    is format-pence(1234),      '$12.34',        'symbol only, everything else as before';
+    is format-pence(123456789), '$1,234,567.89', 'grouping is still the comma';
+    is format-pence(-1234),     '-$12.34',       'the sign stays outside the symbol';
+    is format-pence(2500, :plus),  '+$25.00',    ':plus is unaffected';
+    is format-pence(2500, :!symbol), '25.00',    ':!symbol drops the new symbol too';
+    is format-pence(0),         '$0.00',         'zero';
+};
+
+subtest 'formatting under a € / , locale swaps both separators' => {
+    plan 8;
+    LEAVE set-money-locale;
+    set-money-locale(symbol => '€', decimal-mark => ',');
+
+    is format-pence(1234),      '€12,34',        'the decimal mark is the comma';
+    is format-pence(123456),    '€1.234,56',     'and thousands group with the point';
+    is format-pence(123456789), '€1.234.567,89', 'every group, not just the first';
+    is format-pence(-1234),     '-€12,34',       'negatives sign outside the symbol';
+    is format-pence(-1),        '-€0,01',        'a negative penny still pads';
+    is format-pence(123456, :!separators), '€1234,56',
+        ':!separators drops the grouping but keeps the decimal mark';
+    is format-pence(123456, :!symbol), '1.234,56',
+        ':!symbol is a symbol switch, not a locale switch';
+    is format-pence(123456, :plus), '+€1.234,56', ':plus in the new locale';
+};
+
+subtest 'parsing under a . decimal mark' => {
+    plan 8;
+    LEAVE set-money-locale;
+    set-money-locale;
+
+    is parse-pence('1,000'),     100000, 'the comma is a group separator';
+    is parse-pence('1,234.56'),  123456, 'group and decimal together';
+    is parse-pence('1.5'),       150,    'one decimal digit is tenths';
+    is parse-pence('1.50'),      150,    'two decimal digits are pence';
+    is parse-pence('1_000'),     100000, 'underscores are locale-independent';
+
+    # The wrong-locale typo. Reading this as 1000 would be a 100x
+    # error, and reading it as 10.00 would be inventing a rule the
+    # locale does not have.
+    ok refused(parse-pence('10,00')),
+        "'10,00' is refused rather than read as either 1000 or 10.00";
+    ok refused(parse-pence('1,50')),
+        "'1,50' is refused: a group is exactly three digits";
+    ok refused(parse-pence('12,34,')), 'a trailing separator is still a typo';
+};
+
+subtest 'parsing under a , decimal mark' => {
+    plan 9;
+    LEAVE set-money-locale;
+    set-money-locale(symbol => '€', decimal-mark => ',');
+
+    is parse-pence('100,00'),    10000,  'the comma is now the decimal mark';
+    is parse-pence('1,5'),       150,    'one decimal digit is tenths';
+    is parse-pence('1.000'),     100000, 'the point is now the group separator';
+    is parse-pence('1.234,56'),  123456, 'group and decimal together';
+    is parse-pence('1.234.567,89'), 123456789, 'every group';
+    is parse-pence('1_234,56'),  123456, 'underscores are locale-independent';
+    is parse-pence('(2,50)'),    -250,   'accounting parentheses are unaffected';
+    is parse-pence('-1.234,56'), -123456, 'a leading minus is unaffected';
+
+    ok refused(parse-pence('12.34')),
+        "'12.34' — the other locale's number — is refused, not read as 1234";
+};
+
+subtest 'three digits after the mark points at the group separator' => {
+    plan 6;
+    LEAVE set-money-locale;
+
+    set-money-locale(symbol => '€', decimal-mark => ',');
+    my Str $msg = failure-message(parse-pence('1,000'));
+    ok $msg.contains('1,000'), 'the message quotes what was typed';
+    ok $msg.contains("'.'"),
+        'and names the separator thousands are actually grouped with';
+    ok $msg.contains('1.000'),
+        'and spells out the string the user probably meant';
+
+    set-money-locale;
+    my Str $back = failure-message(parse-pence('1.000'));
+    ok $back.contains("','"), 'the hint mirrors under the default locale';
+    ok $back.contains('1,000'), 'with the mirrored suggestion';
+
+    # Not a hint case: four digits is not a mistyped group, so the
+    # generic refusal stands rather than a misleading suggestion.
+    ok failure-message(parse-pence('1.0000')).contains('did you mean').not,
+        'four digits gets no grouping hint — it is not a mistyped group';
+};
+
+subtest 'every symbol is accepted on input, whatever is being displayed' => {
+    plan 8;
+    LEAVE set-money-locale;
+
+    set-money-locale(symbol => '€', decimal-mark => ',');
+    is parse-pence('€12,34'), 1234, 'the displayed symbol';
+    is parse-pence('£12,34'), 1234, 'a pasted sterling figure';
+    is parse-pence('$12,34'), 1234, 'a pasted dollar figure';
+    is parse-pence('-£1.234,56'), -123456, 'symbol after the sign';
+
+    set-money-locale(symbol => '$');
+    is parse-pence('$12.34'), 1234, 'the displayed symbol';
+    is parse-pence('£12.34'), 1234, 'sterling still parses';
+    is parse-pence('€12.34'), 1234, 'euro still parses';
+    is parse-pence('(£4.20)'), -420, 'inside accounting parentheses';
+};
+
+subtest 'round trips hold in either locale' => {
+    plan 4;
+    LEAVE set-money-locale;
+
+    my @pence = (0, 1, -1, 99, -99, 100, -100, 1234, -1234, 100000,
+                 -100000, 123456789, -123456789, 999999999999);
+
+    for (('$', '.'), ('€', ',')) -> ($symbol, $decimal-mark) {
+        set-money-locale(:$symbol, :$decimal-mark);
+
+        my @broken = @pence.grep(-> $p { parse-pence(format-pence($p)) != $p });
+        is-deeply @broken, [],
+            "parse(format(p)) == p for every sample under $symbol / $decimal-mark";
+
+        my @stable = @pence.map(-> $p {
+            my $once  = format-pence($p);
+            $once eq format-pence(parse-pence($once));
+        });
+        ok @stable.all.so,
+            "format(parse(s)) is idempotent under $symbol / $decimal-mark";
+    }
+};
+
+subtest 'a locale change re-reads a string it had already accepted' => {
+    plan 3;
+    LEAVE set-money-locale;
+
+    # The same six characters, three meanings. This is the whole reason
+    # parsing is locale-aware rather than permissive: '1.234' cannot be
+    # both 1.23 and 1234 pounds, so the setting has to decide.
+    set-money-locale;
+    is parse-pence('1,234.56'), 123456, 'read as pounds and pence under . ';
+
+    set-money-locale(decimal-mark => ',');
+    ok refused(parse-pence('1,234.56')),
+        'and refused outright under , — the groups are in the wrong places';
+    is parse-pence('1.234,56'), 123456,
+        'while its mirror image reads back to the same pence';
+};
+
+subtest 'set-money-locale refuses anything outside the whitelists' => {
+    plan 7;
+    LEAVE set-money-locale;
+
+    set-money-locale(symbol => '€', decimal-mark => ',');
+
+    dies-ok { set-money-locale(symbol => 'CAD') },
+        'an unknown currency symbol throws';
+    dies-ok { set-money-locale(symbol => '¥') },
+        'a plausible but unsupported symbol throws too';
+    dies-ok { set-money-locale(decimal-mark => ';') },
+        'an unknown decimal mark throws';
+    dies-ok { set-money-locale(decimal-mark => '') },
+        'an empty decimal mark throws';
+    dies-ok { set-money-locale(symbol => Str) },
+        'a type object is refused by the signature';
+
+    # A refused call must not leave the registers half-moved: the
+    # symbol is validated before either is written.
+    is pence-symbol(), '€', 'the symbol register survived the refusals';
+    is money-decimal-mark(), ',', 'and so did the decimal register';
+};

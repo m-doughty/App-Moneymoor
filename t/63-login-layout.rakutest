@@ -1,0 +1,422 @@
+use Test;
+use lib 'lib';
+
+use Selkie::Align;
+use Selkie::Test::Keys;
+use Selkie::Test::Supply;
+use Selkie::BorderStyle;
+use Selkie::Sizing;
+use Selkie::Widget::Border;
+use Selkie::Widget::RichText;
+use Selkie::Widget::Text;
+use Selkie::Layout::HBox;
+use Selkie::Layout::VBox;
+
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::HintBar;
+use App::Moneymoor::Screen::Login;
+
+# The login dialog is the one screen in Moneymoor with a hard height
+# budget: it is a fixed-size box centred in the terminal, so it cannot
+# scroll, cannot grow, and cannot be reached by a resize handler. Every
+# row it spends is spent at build time, and the create-a-budget form
+# spends all of them — that branch has no slack at all.
+#
+# That makes the arithmetic the thing worth testing. These are pure
+# tree assertions: Login is plain Raku until `init-plane`, so the whole
+# layout can be interrogated headlessly, and the numbers below are the
+# same ones the comment on `DIALOG-ROWS` documents. If a field, a gap
+# or a line of warning copy is added without growing the dialog, one of
+# these fails instead of the hint line silently vanishing off the
+# bottom edge on a user's screen.
+#
+# What is NOT covered here: how it actually looks. That needs a live
+# notcurses (`Selkie::Test::Snapshot`), which no test in this suite
+# takes a dependency on.
+
+plan 12;
+
+# --- The numbers under test ---------------------------------------------
+#
+# Deliberately re-stated rather than exported from Login: a constant
+# shared between the code and its test proves only that the two agree
+# with each other. These are the values the design calls for.
+my constant DIALOG-ROWS   = 24;
+my constant DIALOG-COLS   = 64;
+my constant INTERIOR-ROWS = DIALOG-ROWS - 4;   # frame + one cell padding
+my constant INTERIOR-COLS = DIALOG-COLS - 4;
+my constant WORDMARK-ROWS = 2;
+my constant FORM-ROWS     = 11;
+
+my constant LOGIN-SRC = 'lib/App/Moneymoor/Screen/Login.rakumod';
+
+sub existing-login($theme) {
+    App::Moneymoor::Screen::Login.new(
+        available-budgets => ('household', 'business'), :$theme,
+    );
+}
+
+sub new-login($theme) {
+    App::Moneymoor::Screen::Login.new(
+        available-budgets => (), force-new-db => True, :$theme,
+    );
+}
+
+# The Border of a built login screen: root → centring HBox → fixed-width
+# column → Border.
+sub dialog-border($root --> Selkie::Widget::Border) {
+    $root.children[1].children[1].children[0];
+}
+
+# Every widget under $node, $node included, in tree order.
+sub descendants($node --> List) {
+    my @out;
+    sub visit($w) {
+        return without $w;
+        @out.push($w);
+        visit($w.content) if $w.^can('content');
+        visit($_) for $w.^can('children') ?? $w.children !! ();
+    }
+    visit($node);
+    @out.List;
+}
+
+# Rows a subtree occupies, if it is made only of fixed-height children:
+# the sum of the fixed heights plus the gaps its VBoxes reserve between
+# them. Returns Nil for anything flexible, so a caller asking for the
+# height of the create-a-budget form gets an answer or an honest
+# failure, never a silently wrong number.
+sub fixed-rows($w) {
+    return Nil unless $w.sizing.mode === SizeFixed;
+    $w.sizing.value.Int;
+}
+
+# Gap rows a VBox reserves: one fewer than its children, times the gap.
+sub gap-rows(Selkie::Layout::VBox $v --> Int) {
+    ((($v.children.elems - 1) max 0) * $v.gap).Int;
+}
+
+subtest "the dialog is 64 x 24, rounded, padded, and untitled" => {
+    plan 9;
+    my $theme = App::Moneymoor::Themes::load('catppuccin');
+    my $root  = existing-login($theme).build;
+
+    is $root.children.elems, 3,
+        "root is strut / dialog row / strut";
+    ok $root.children[1] ~~ Selkie::Layout::HBox,
+        "the middle child is the centring HBox";
+    is $root.children[1].sizing.value, DIALOG-ROWS,
+        "the dialog row is {DIALOG-ROWS} rows tall";
+    is $root.children[1].children[1].sizing.value, DIALOG-COLS,
+        "the dialog column is {DIALOG-COLS} columns wide";
+
+    my $border = dialog-border($root);
+    ok $border ~~ Selkie::Widget::Border, "the column holds a Border";
+    is $border.border-style, BorderRounded, "the frame is rounded";
+    is-deeply
+        ($border.padding-top, $border.padding-right,
+         $border.padding-bottom, $border.padding-left),
+        (1, 1, 1, 1),
+        "one cell of padding on every edge";
+
+    # The wordmark inside the dialog is the app's name; a frame title
+    # would be the same word twice, so the top edge stays unbroken.
+    is $border.title, '', "no frame title — the wordmark carries the name";
+    is $border.bottom-title, '', "no bottom title either";
+};
+
+subtest "the wordmark is two centred accent rows that fit the interior" => {
+    plan 5;
+    my $theme = App::Moneymoor::Themes::load('catppuccin');
+    my $root  = existing-login($theme).build;
+
+    my $wordmark = dialog-border($root).content.children[0];
+    is $wordmark.children.elems, WORDMARK-ROWS,
+        "the wordmark is {WORDMARK-ROWS} rows";
+    is fixed-rows($wordmark), WORDMARK-ROWS,
+        "and claims exactly that many rows from the budget";
+
+    # Both rows have to be the same width or a centred pair shears by
+    # half the difference and stops reading as one mark.
+    is $wordmark.children.map(*.text.chars).unique.elems, 1,
+        "both rows are exactly as wide as each other";
+
+    subtest "each row" => {
+        plan $wordmark.children.elems * 4;
+        for $wordmark.children.kv -> $i, $row {
+            ok $row ~~ Selkie::Widget::Text, "row $i is a Text";
+            is $row.align, TextCenter, "row $i is centred";
+            is $row.style.fg, $theme.accent, "row $i is painted in accent";
+            # Room to spare at both ends, or a centred wordmark reads as
+            # a full-width band rather than a mark.
+            ok $row.text.chars <= INTERIOR-COLS - 4,
+                "row $i ({$row.text.chars} cols) clears the "
+                    ~ "{INTERIOR-COLS}-column interior";
+        }
+    };
+
+    # Half-block letterforms only: no letters, digits or punctuation
+    # sneaking back in as a "wordmark". MONEYMOOR needs an E and a Y
+    # that Mindmoor's alphabet never had, and the constraint here is
+    # what keeps them in the same visual language as the rest.
+    ok $wordmark.children.map(*.text).join.comb.all
+            ~~ any(' ', '█', '▀', '▄', '▌', '▐'),
+        "drawn purely from block glyphs and spaces";
+};
+
+subtest "the create-a-budget form spends the row budget exactly" => {
+    plan 6;
+    my $theme = App::Moneymoor::Themes::load('catppuccin');
+    my $root  = new-login($theme).build;
+
+    my $content = dialog-border($root).content;
+    is $content.children.elems, 4,
+        "content is wordmark / budget / form / footer";
+    is $content.gap, 1, "one row of gap between those blocks";
+
+    my ($wordmark, $picker, $form, $footer) = $content.children;
+    my $fixed = ($wordmark, $picker, $footer).map(&fixed-rows).sum;
+    my $available = INTERIOR-ROWS - $fixed - gap-rows($content);
+    is $available, FORM-ROWS,
+        "the flexible form is left {FORM-ROWS} of the {INTERIOR-ROWS} "
+            ~ "interior rows";
+
+    is $form.gap, 1, "the form separates the warning from the fields";
+    is $form.children.map(&fixed-rows).sum + gap-rows($form), $available,
+        "and the create-a-budget branch fills them precisely — "
+            ~ "one more row anywhere pushes the hint line out of the frame";
+
+    # The open-a-budget branch is the short one; it must not be the
+    # branch that overflows either.
+    my @short-blocks = dialog-border(existing-login($theme).build)
+                           .content.children;
+    my $short = @short-blocks[2];
+    ok $short.children.map(&fixed-rows).sum + gap-rows($short) <= $available,
+        "the open-a-budget branch fits inside the same allocation";
+};
+
+subtest "the blank spacer rows are gone" => {
+    plan 4;
+    my $theme = App::Moneymoor::Themes::load('catppuccin');
+
+    for 'open a budget' => existing-login($theme),
+        'create a budget' => new-login($theme)
+    -> $case {
+        my $border = dialog-border($case.value.build);
+        my @texts  = descendants($border).grep(Selkie::Widget::Text);
+        my @blank  = @texts.grep(*.text eq '');
+
+        # Exactly one: the status line, which is empty until something
+        # goes wrong. Every other blank Text would be a hand-rolled
+        # spacer, and spacing is the VBox's job.
+        is @blank.elems, 1,
+            "{$case.key}: one empty Text — the status line — and no spacers";
+        ok @texts.elems > @blank.elems,
+            "{$case.key}: the dialog does have labelled rows";
+    }
+};
+
+subtest "field captions sit flush with the fields they name" => {
+    plan 2;
+    my $theme = App::Moneymoor::Themes::load('catppuccin');
+
+    for 'open a budget' => existing-login($theme),
+        'create a budget' => new-login($theme)
+    -> $case {
+        my @texts = descendants(dialog-border($case.value.build))
+                        .grep(Selkie::Widget::Text)
+                        .grep(*.text.chars > 0);
+        # The Border's padding is the inset; a leading space in the
+        # caption would offset it from its own TextInput, which paints
+        # at column 0.
+        ok @texts.grep(*.text.starts-with(' ')).elems == 0,
+            "{$case.key}: no caption carries a leading space";
+    }
+};
+
+subtest "the warning wraps inside its allotted rows" => {
+    plan 5;
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+    my $root  = new-login($theme).build;
+
+    my $warning = dialog-border($root).content.children[2].children[0];
+    ok $warning ~~ Selkie::Widget::RichText, "the warning is a RichText";
+    my $rows = fixed-rows($warning);
+    is $rows, 3, "it claims 3 rows";
+
+    # The budget has no room for a fourth line, and RichText responds
+    # to overflow by dropping lines for a '…' marker — so a re-worded
+    # warning that ran long would quietly lose its last sentence.
+    # Re-wrap the real spans at the real width and count.
+    my @lines = Selkie::Widget::RichText.wrap-spans(
+        $warning.spans, INTERIOR-COLS,
+    );
+    ok @lines.elems <= $rows,
+        "the copy wraps to {@lines.elems} lines at {INTERIOR-COLS} "
+            ~ "columns, within the $rows it has";
+
+    # The two sentences that have to survive any re-wording: sqlcipher
+    # has no recovery path, and the user must be told before they pick
+    # a passphrase rather than after they forget it.
+    my $copy = $warning.spans.map(*.text).join;
+    ok $copy.contains('sqlcipher') && $copy.contains('no reset'),
+        "it still says what sqlcipher does and that there is no reset";
+
+    is $warning.spans[0].style.fg, $theme.fg-amber,
+        "painted in the palette's amber, not a baked-in colour";
+};
+
+subtest "the hint line is the shared HintBar, not a hand-rolled string" => {
+    plan 4;
+    my $theme = App::Moneymoor::Themes::load('nord');
+    my $root  = new-login($theme).build;
+
+    my $footer = dialog-border($root).content.children[3];
+    my $hint   = $footer.children[1];
+    ok $hint ~~ Selkie::Widget::RichText, "the footer's second row is RichText";
+
+    my @expected = hint-spans('login', INTERIOR-COLS, :$theme);
+    is $hint.spans.map(*.text).join, @expected.map(*.text).join,
+        "carries exactly what hint-spans('login') renders at "
+            ~ "{INTERIOR-COLS} columns";
+    ok $hint.spans.elems > 1,
+        "as styled spans, not one flat string";
+
+    # The keys are the part the eye is meant to find first.
+    my @keys = $hint.spans.grep({ .style.fg == $theme.accent });
+    ok @keys.elems == 3 && @keys.all.style.bold,
+        "three key spans, all accent and bold";
+};
+
+subtest "the status line takes its colour from the palette" => {
+    plan 5;
+    my $theme = App::Moneymoor::Themes::load('nord');
+    my $login = existing-login($theme);
+    my $root  = $login.build;
+    my $status = dialog-border($root).content.children[3].children[0];
+
+    is $status.text, '', "starts empty";
+    is $status.style.fg, $theme.fg-dim, "and dim";
+
+    # The two DB.connect messages go through verbatim — they say
+    # different things and the user needs to know which one they got.
+    $login.set-status('Invalid passphrase (or corrupted budget file)', :error);
+    is $status.text, 'Invalid passphrase (or corrupted budget file)',
+        "shows a wrong-key message unaltered";
+    $login.set-status('Not an encrypted budget file (plain SQLite file)',
+                      :error);
+    is $status.text, 'Not an encrypted budget file (plain SQLite file)',
+        "and a wrong-file message unaltered";
+    is $status.style.fg, $theme.fg-red,
+        "an error is painted in the palette's red";
+};
+
+subtest "picking a budget in the Select swaps the form in place" => {
+    plan 8;
+    my $theme = App::Moneymoor::Themes::load('catppuccin');
+    my $login = existing-login($theme);
+    my $root  = $login.build;
+    my @blocks = dialog-border($root).content.children;
+    my $form   = @blocks[2];
+
+    nok $login.in-new-db-mode, "opens on the open-a-budget branch";
+    is $form.children.elems, 1, "one block: the passphrase field";
+    is $login.selected-budget, 'household',
+        "and reports the budget the Select is parked on";
+
+    # The last entry is always '+ Create new budget…'.
+    $login.budget-select.select-index(2);
+    ok $login.in-new-db-mode, "selecting it switches branch";
+    nok $login.selected-budget.defined,
+        "the create row is not a budget, so it names none";
+    is $form.children.elems, 2,
+        "the same container now holds warning + fields";
+    is $form.children.map(&fixed-rows).sum + gap-rows($form), FORM-ROWS,
+        "and still spends exactly its {FORM-ROWS} rows";
+
+    $login.budget-select.select-index(0);
+    nok $login.in-new-db-mode, "picking a real budget switches back";
+};
+
+subtest "every focus-next target the screen asks for is handled" => {
+    # The screen has no App, so it asks for focus moves by name and
+    # C<App::Moneymoor::UI> resolves them. Both halves are strings
+    # matched at runtime: a target with no arm in UI is a dialog that
+    # silently leaves focus on a widget that was just destroyed, and
+    # nothing else in the suite would see it (UI cannot be driven
+    # without a terminal).
+    my constant UI-SRC = 'lib/App/Moneymoor/UI.rakumod';
+
+    my $src = LOGIN-SRC.IO.slurp;
+    my @targets = $src.match(/ 'target' \s* '=>' \s* \' (<-[']>+) \' /, :g)
+                      .map({ .[0].Str }).unique.sort;
+    my $ui = UI-SRC.IO.slurp;
+
+    plan @targets.elems + 1;
+    ok @targets.elems >= 3,
+        "the screen asks for {@targets.elems} focus targets";
+    for @targets -> $t {
+        ok $ui.contains("when '$t'"),
+            "UI handles the '$t' target";
+    }
+};
+
+subtest "Ctrl+N gets to the create form, and takes focus with it" => {
+    plan 7;
+    # The hint line advertises Ctrl+N, so it has to be a real bind —
+    # the footer is the one place a user goes to find out what the keys
+    # are, and a key that does nothing there is worse than no hint.
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+    my $login = existing-login($theme);
+    my $root  = $login.build;
+
+    my @asked = collect-from $login.on-login, {
+        ok press-key($root, 'ctrl+n'), "the root consumes Ctrl+N";
+    };
+
+    ok $login.in-new-db-mode, "which switches to the create-a-budget form";
+    nok $login.selected-budget.defined,
+        "the picker moved with it, onto the create row";
+
+    # The field that had focus lived in the container the switch just
+    # cleared, so the screen has to ask for focus to be moved — it has
+    # no App of its own to move it with.
+    is @asked.elems, 1, "and it asks its owner for exactly one focus move";
+    is @asked[0]<action>, 'focus-next', "a focus-next request";
+    is @asked[0]<target>, 'name', "onto the budget-name field";
+
+    # Idempotent: pressing it again in create mode must not re-enter the
+    # mode (which would rebuild the form and lose a half-typed name).
+    my $name-field = $login.name-input;
+    press-key($root, 'ctrl+n');
+    ok $login.name-input === $name-field,
+        "pressing it again leaves the form (and anything typed) alone";
+};
+
+subtest "both forms build the same shape under any palette" => {
+    my @names = App::Moneymoor::Themes::all-names();
+    plan @names.elems * 2;
+
+    # A structural fingerprint: widget classes and their sizings, in
+    # tree order. It must not vary with the palette — only the colours
+    # may.
+    sub shape($root --> Str) {
+        descendants(dialog-border($root)).map({
+            .^name ~ ':' ~ .sizing.mode ~ ':' ~ .sizing.value
+        }).join('|');
+    }
+
+    my $reference = App::Moneymoor::Themes::load(@names[0]);
+    my %ref = (
+        'open a budget'   => shape(existing-login($reference).build),
+        'create a budget' => shape(new-login($reference).build),
+    );
+
+    for @names -> $name {
+        my $theme = App::Moneymoor::Themes::load($name);
+        is shape(existing-login($theme).build), %ref{'open a budget'},
+            "$name: open-a-budget form has the reference shape";
+        is shape(new-login($theme).build), %ref{'create a budget'},
+            "$name: create-a-budget form has the reference shape";
+    }
+};

@@ -1,0 +1,274 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+
+plan 12;
+
+subtest 'rule 2: fully funded card spending moves to the payment envelope' => {
+    plan 8;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.spend(account => VISA, date => '2026-03-14', amount => 7250,
+             category => GROCERIES);
+
+    my $view = $f.compute;
+    my $groceries = $view.category('2026-03-01', GROCERIES);
+    is $groceries.activity, -7250, 'the card spend is activity on the category';
+    is $groceries.available, 32750, 'which reduces what is available';
+    is $groceries.credit-overspend, 0, 'and is fully covered';
+
+    my $payment = $view.category('2026-03-01', VISA-PAY);
+    is $payment.moved-in, 7250, 'the payment envelope received the coverage';
+    is $payment.available, 7250, 'and that is its whole balance';
+
+    is $view.period('2026-03-01').cash-balance, 180000,
+        'no cash moved — that is the point of a credit card';
+    is $view.account-balance(VISA).working, -7250, 'the card owes it instead';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'the move log names the transaction that caused it' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    my $txn = $f.spend(account => VISA, date => '2026-03-14', amount => 7250,
+                       category => GROCERIES);
+
+    my $view = $f.compute;
+    my @moves = $view.moves;
+    is @moves.elems, 1, 'one move';
+    is @moves[0].cause, 'card-coverage', 'caused by card coverage';
+    is @moves[0].from-category-id, GROCERIES, 'out of the category';
+    is @moves[0].to-category-id, VISA-PAY, 'into the payment envelope';
+    is @moves[0].transaction-id, $txn, 'pointing at the transaction';
+};
+
+subtest 'rule 2: partly funded card spending covers what it can' => {
+    plan 8;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign('2026-03-01', GROCERIES, 5000);
+    $f.spend(account => VISA, date => '2026-03-14', amount => 7250,
+             category => GROCERIES);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $groceries = $view.category('2026-03-01', GROCERIES);
+    is $groceries.available, -2250, 'the category is overspent';
+    is $groceries.credit-overspend, 2250, 'by exactly the uncovered card spend';
+    is $groceries.cash-overspend, 0, 'and none of it is cash overspending';
+    ok $groceries.has-flag('credit-overspend'), 'the row is flagged';
+
+    is $view.category('2026-03-01', VISA-PAY).available, 5000,
+        'the payment envelope got everything the category had';
+
+    is $view.category('2026-04-01', GROCERIES).carry-in, 0,
+        'the hole does not carry — the debt stays on the card';
+    is $view.rta('2026-04-01'),
+        $view.rta('2026-03-01'),
+        'and Ready to Assign is not charged for it';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'credit overspending and cash overspending in the same month' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    # Nothing assigned: 100.00 on the card and 40.00 from the current
+    # account, all of it uncovered.
+    $f.spend(account => VISA, date => '2026-03-10', amount => 10000,
+             category => DINING);
+    $f.spend(account => CURRENT, date => '2026-03-11', amount => 4000,
+             category => DINING);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $dining = $view.category('2026-03-01', DINING);
+    is $dining.available, -14000, 'the whole lot is a hole';
+    is $dining.credit-overspend, 10000, 'the card part is credit overspending';
+    is $dining.cash-overspend, 4000, 'the debit part is cash overspending';
+    is $view.rta('2026-04-01'), 96000,
+        'only the cash part is charged to next month';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a carrying envelope carries the cash hole and still writes off the card'
+        => {
+    plan 8;
+    # `carry-overspend` is a CASH-overspending rule and nothing else.
+    # Credit overspending is debt on the card, and carrying it in the
+    # envelope as well as leaving it on the card would count the same
+    # money twice against the master invariant — so it is still written
+    # off at the boundary, whatever the flag says.
+    my $f = standard-facts();
+    $f.add-category(7, 'Expenses', sort-order => 3, carry-overspend => True);
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    # Nothing assigned: 100.00 on the card and 40.00 from the current
+    # account, exactly the mixed case above but on a carrying envelope.
+    $f.spend(account => VISA, date => '2026-03-10', amount => 10000,
+             category => 7);
+    $f.spend(account => CURRENT, date => '2026-03-11', amount => 4000,
+             category => 7);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $march = $view.category('2026-03-01', 7);
+    is $march.available, -14000, 'the whole lot is a hole';
+    is $march.credit-overspend, 10000, 'the card part is credit overspending';
+    is $march.cash-overspend, 0,
+        'and the debit part is not cash overspending — it carries instead';
+    ok $march.has-flag('credit-overspend'), 'both flags are set: the card one';
+    ok $march.has-flag('carried-negative'), 'and the carried one';
+
+    is $view.category('2026-04-01', 7).carry-in, -4000,
+        'so exactly the cash hole crosses the boundary';
+    is $view.rta('2026-04-01'), 100000,
+        'and neither half is charged to Ready to Assign';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a later inflow retroactively funds earlier card spending' => {
+    plan 6;
+    my $f = standard-facts();
+    # Spend on the card with nothing assigned, then get 200.00 back
+    # into the bank against the same category later in the month.
+    $f.spend(account => VISA, date => '2026-03-10', amount => 30000,
+             category => GROCERIES);
+    $f.refund(account => CURRENT, date => '2026-03-20', amount => 20000,
+              category => GROCERIES);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $groceries = $view.category('2026-03-01', GROCERIES);
+    is $groceries.available, -10000, 'the category is still 100.00 short';
+    is $groceries.credit-overspend, 10000, 'and that is all credit overspend';
+    is $view.category('2026-03-01', VISA-PAY).available, 20000,
+        'but the refund funded 200.00 of the card spending after the fact';
+    is $view.category('2026-04-01', VISA-PAY).carry-in, 20000,
+        'and the payment envelope keeps it';
+    is $view.period('2026-03-01').cash-balance, 20000, 'the cash is real';
+    is $view.invariant-errors.join('; '), '',
+        'which is the whole reason coverage is computed from month totals';
+};
+
+subtest 'paying the card spends the payment envelope' => {
+    plan 6;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.spend(account => VISA, date => '2026-03-14', amount => 25000,
+             category => GROCERIES);
+    $f.transfer(from => CURRENT, to => VISA, date => '2026-03-28',
+                amount => 25000);
+
+    my $view = $f.compute;
+    my $payment = $view.category('2026-03-01', VISA-PAY);
+    is $payment.moved-in, 25000, 'coverage came in';
+    is $payment.activity, -25000, 'and the payment went out';
+    is $payment.available, 0, 'leaving the envelope empty, as it should be';
+    is $view.period('2026-03-01').cash-balance, 75000, 'the cash really left';
+    is $view.account-balance(VISA).working, 0, 'and the card is clear';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a refund on the card releases the cash it had reserved' => {
+    plan 7;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.spend(account => VISA, date => '2026-03-14', amount => 25000,
+             category => GROCERIES);
+    $f.refund(account => VISA, date => '2026-03-18', amount => 10000,
+              category => GROCERIES);
+
+    my $view = $f.compute;
+    my $groceries = $view.category('2026-03-01', GROCERIES);
+    is $groceries.activity, -15000, 'the refund nets off the spending';
+    is $groceries.available, 25000, 'so the category gets the money back';
+
+    my $payment = $view.category('2026-03-01', VISA-PAY);
+    is $payment.moved-out, 10000, 'the payment envelope gave up the reserve';
+    is $payment.available, 15000, 'leaving only what is still owed';
+    is $view.account-balance(VISA).working, -15000,
+        'which matches the card balance';
+
+    my @refund-moves = $view.moves.grep({ .cause eq 'card-refund' });
+    is @refund-moves.elems, 1, 'the release is logged as a move';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a refund with nothing reserved pushes the envelope negative' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.refund(account => VISA, date => '2026-03-18', amount => 5000,
+              category => GROCERIES);
+
+    my $view = $f.compute(through-period => '2026-04-01');
+    my $payment = $view.category('2026-03-01', VISA-PAY);
+    is $payment.available, -5000, 'the payment envelope goes negative';
+    ok $payment.has-flag('payment-negative'), 'and is flagged, not rejected';
+    is $view.category('2026-03-01', GROCERIES).available, 5000,
+        'while the category has the refund to spend again';
+    is $view.category('2026-04-01', VISA-PAY).carry-in, -5000,
+        'a negative payment envelope carries — you still owe less than you '
+        ~ 'have set aside';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'income received on the card raises Ready to Assign, not the envelope' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => VISA, date => '2026-03-05', amount => 5000);
+
+    my $view = $f.compute;
+    is $view.rta('2026-03-01'), 5000, 'the money is assignable';
+    is $view.category('2026-03-01', VISA-PAY).available, -5000,
+        'and the payment envelope releases the cash it had reserved for the '
+        ~ 'debt this inflow cancelled';
+    is $view.period('2026-03-01').cash-balance, 0, 'no cash arrived';
+    is $view.moves.grep({ .cause eq 'card-inflow-to-rta' }).elems, 1,
+        'the release is logged';
+    is $view.invariant-errors.join('; '), '',
+        'the invariant holds — adding it to the envelope instead would '
+        ~ 'invent envelope money no cash backs';
+};
+
+subtest 'a cash advance is the mirror image of a card payment' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.transfer(from => VISA, to => CURRENT, date => '2026-03-05',
+                amount => 10000);
+
+    my $view = $f.compute;
+    is $view.period('2026-03-01').cash-balance, 10000, 'the cash arrived';
+    is $view.category('2026-03-01', VISA-PAY).available, 10000,
+        'and the payment envelope holds it, because it is owed straight back';
+    is $view.account-balance(VISA).working, -10000, 'the card owes it';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'two cards keep their own envelopes' => {
+    plan 6;
+    my $f = standard-facts();
+    my $amex = $f.add-account(5, 'Amex', 'credit');
+    my $amex-pay = $f.add-category(6, 'Amex', kind => 'payment',
+                                   payment-account-id => 5, sort-order => 1001);
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 30000);
+    $f.spend(account => VISA, date => '2026-03-10', amount => 12000,
+             category => GROCERIES);
+    $f.spend(account => 5, date => '2026-03-11', amount => 8000,
+             category => GROCERIES);
+
+    my $view = $f.compute;
+    is $view.category('2026-03-01', VISA-PAY).available, 12000, 'the Visa envelope';
+    is $view.category('2026-03-01', 6).available, 8000, 'the Amex envelope';
+    is $view.category('2026-03-01', GROCERIES).available, 10000,
+        'the category paid for both';
+
+    my @moves = $view.moves;
+    is @moves.elems, 2, 'one move per card';
+    is @moves.map(*.to-category-id).sort.join(','), "{ VISA-PAY },6",
+        'each pointing at the right envelope';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};

@@ -1,0 +1,182 @@
+use Test;
+use lib 'lib';
+
+use Selkie::Sizing;
+use Selkie::Widget::Text;
+
+use App::Moneymoor::Screen::Main;
+use App::Moneymoor::Screen::Main::Keybinds;
+use App::Moneymoor::Screen::Main::Subscriptions;
+use App::Moneymoor::Screen::Reports;
+use App::Moneymoor::View::HintBar;
+
+# t/69's and t/75's treatment, for the reports tab.
+#
+# The same two things nothing else can catch.
+#
+# 1. The tab reaches Screen::Main through accessors resolved by string
+#    inside closures that only run on a keypress or a store tick. A
+#    renamed accessor compiles cleanly and takes the app down later.
+# 2. The hint footer is hand-maintained. Every key it advertises has
+#    to be a key that exists, or the footer is lying in the one place
+#    the user looks to find out what the keys are.
+#
+# Source-level, because building the tab needs a notcurses App and
+# there is no terminal in a test run.
+
+plan 6;
+
+my constant REPORTS-SRC  = 'lib/App/Moneymoor/Screen/Reports.rakumod';
+my constant KEYBINDS-SRC = 'lib/App/Moneymoor/Screen/Main/Keybinds.rakumod';
+my constant SUBS-SRC     = 'lib/App/Moneymoor/Screen/Main/Subscriptions.rakumod';
+
+# Lines that are neither Pod nor comment — the ones that actually run.
+sub code-lines(Str $path --> List) {
+    my @out;
+    my Bool $in-pod = False;
+    for $path.IO.lines -> $line {
+        $in-pod = True  if $line.starts-with('=begin pod');
+        if $in-pod {
+            $in-pod = False if $line.starts-with('=end pod');
+            next;
+        }
+        next if $line.trim.starts-with('#');
+        @out.push($line);
+    }
+    @out.List;
+}
+
+sub keys-bound-in(Str $path --> SetHash) {
+    my $set = SetHash.new;
+    for code-lines($path) -> $line {
+        for $line.match(/ 'on-key:' \s* \' (<-[']>+) \' /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    $set;
+}
+
+sub keys-bound-on(Str $path, Str $widget --> SetHash) {
+    my $set = SetHash.new;
+    my $rx = / '$!' $widget '.on-key:' \s* \' (<-[']>+) \' /;
+    for code-lines($path) -> $line {
+        for $line.match($rx, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    $set;
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'every $main.method Screen::Reports calls exists on Main' => {
+    my $set = SetHash.new;
+    for code-lines(REPORTS-SRC) -> $line {
+        for $line.match(/ '$main.' ( <[a..z\-]>+ ) /, :g) -> $m {
+            $set{ $m[0].Str } = True;
+        }
+    }
+    plan $set.elems;
+    for $set.keys.sort -> $name {
+        ok App::Moneymoor::Screen::Main.^find_method($name).defined,
+            "Screen::Main has method '$name'";
+    }
+};
+
+my constant TAB-SEAM = <build install-subscriptions install-keybinds
+                        handle-resize refresh refresh-summary refresh-chart
+                        chart summary rows hidden-count by-group>;
+
+subtest 'the shell resolves the tab through a real accessor' => {
+    plan 3 + TAB-SEAM.elems;
+    # `reports-tab` is called by name from three places, all of them
+    # outside this class: two install seams and the resize fan-out.
+    ok App::Moneymoor::Screen::Main.^find_method('reports-tab').defined,
+        'Screen::Main.reports-tab exists';
+    ok KEYBINDS-SRC.IO.slurp.contains('$main.reports-tab'),
+        'the keybind seam installs the tab\'s keys';
+    ok SUBS-SRC.IO.slurp.contains('$main.reports-tab'),
+        'the subscription seam installs its channels';
+
+    for TAB-SEAM -> $name {
+        ok App::Moneymoor::Screen::Reports.^find_method($name).defined,
+            "Screen::Reports answers '$name'";
+    }
+};
+
+subtest '§4.6\'s one key is bound on the chart' => {
+    plan 3;
+    my $chart = keys-bound-on(REPORTS-SRC, 'chart');
+    ok $chart{'b'}, "'b' toggles the aggregation";
+
+    # The period keys are global — the banner and the budget grid read
+    # the same `app/period`, so binding them per tab would be three
+    # copies of one behaviour.
+    my $global = keys-bound-in(KEYBINDS-SRC);
+    ok $global{'['} && $global{']'},
+        'and [ ] stay on the screen root, where the period lives';
+
+    nok $chart{'enter'},
+        'nothing takes Enter on this tab — there is nothing to activate';
+};
+
+subtest 'the reports hint bar advertises only keys that exist' => {
+    my $chart  = keys-bound-on(REPORTS-SRC, 'chart');
+    my $global = keys-bound-in(KEYBINDS-SRC);
+
+    my @hints = hint-groups('reports');
+    plan @hints.elems;
+    for @hints -> $group {
+        my Str $key = $group.key.lc;
+        if $key eq '[ ]' {
+            ok $global{'['} && $global{']'},
+                "the footer's '[ ]' ({$group.value}) is two real binds";
+        } else {
+            ok $chart{$key} || $global{$key},
+                "the footer's '{$group.key}' ({$group.value}) is a real bind";
+        }
+    }
+};
+
+subtest 'the tab writes its own titles, and the shell knows it' => {
+    plan 3;
+    # The shell's pane-title subscription used to cover `reports` with
+    # a hard-coded 'Spending by category'. It cannot any more: the
+    # title says which aggregation is on, and only the tab knows.
+    my $subs = SUBS-SRC.IO.slurp;
+    nok $subs.contains('Spending by category'),
+        'the shell no longer owns the chart\'s title';
+    ok REPORTS-SRC.IO.slurp.contains('chart-title'),
+        'the tab does, through the pure builder';
+    ok REPORTS-SRC.IO.slurp.contains('summary-title'),
+        'and the strip\'s too';
+};
+
+subtest 'the mode-aware footer resolves reconcile over register' => {
+    plan 5;
+    # A stand-in for Main: `hint-for-focus` reads `.pane-contexts` and
+    # nothing else, which is what keeps the mode override testable
+    # without a store.
+    my class PaneHost { has @.pane-contexts }
+
+    # Real widgets: `hint-for-focus` treats an undefined focus as "no
+    # focus at all", so a type object would answer generic whatever the
+    # map said.
+    my $register = Selkie::Widget::Text.new(text => '', sizing => Sizing.flex);
+    my $sidebar  = Selkie::Widget::Text.new(text => '', sizing => Sizing.flex);
+    my $host = PaneHost.new(pane-contexts => [
+        $sidebar => 'sidebar', $register => 'register',
+    ]);
+
+    is hint-for-focus($host, $register), 'register',
+        'ordinarily the register gets the register hints';
+    is hint-for-focus($host, $register, reconciling => True), 'reconcile',
+        'and reconcile mode overrides them';
+    is hint-for-focus($host, $sidebar, reconciling => True), 'sidebar',
+        'but only for the register — the sidebar is how the mode ends';
+    is hint-for-focus($host, Nil, reconciling => True), 'generic',
+        'and no focus is still no context';
+
+    ok ('reconcile' ∈ hint-contexts().Set),
+        'the context the override names exists in the hint table';
+};

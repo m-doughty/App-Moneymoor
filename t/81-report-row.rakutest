@@ -1,0 +1,413 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::ReportRow;
+
+# The reports tab's numbers, with no terminal and no database.
+#
+# The facts come from BudgetFixtures through the engine's real
+# `compute`, so "activity" here is the activity the derivation
+# actually produces rather than a figure this test invented — which
+# matters, because the whole module is a set of opinions about what
+# the derivation's numbers mean:
+#
+#   * spending is -activity, and only when activity is negative;
+#   * payment envelopes are the card's spending counted twice;
+#   * a transfer between two on-budget accounts is not cash flow;
+#   * a transfer to a tracking account is.
+#
+# PERIOD is pinned and every expectation is a literal. Nothing in the
+# module under test reads the clock.
+
+plan 14;
+
+my constant PERIOD = '2026-03-01';
+my constant NEXT   = '2026-04-01';
+
+my constant BILLS-GROUP = 10;
+my constant FUN-GROUP   = 20;
+my constant CARDS-GROUP = 30;
+
+my $theme = App::Moneymoor::Themes::load('gruvbox');
+
+sub group(Int $id, Str $name, Int $sort-order, Bool :$system = False) {
+    App::Moneymoor::Model::CategoryGroup.new(:$id, :$name, :$sort-order,
+                                             :$system);
+}
+
+sub category(Int $id, Str $name, Int :$group-id, Str :$kind = 'standard',
+             Int :$payment-account-id) {
+    App::Moneymoor::Model::Category.new(
+        :$id, :$name, :$group-id, :$kind, :$payment-account-id);
+}
+
+sub the-categories(--> List) {
+    (
+        category(RTA,       'Ready to Assign', kind => 'rta'),
+        category(GROCERIES, 'Groceries',  group-id => BILLS-GROUP),
+        category(DINING,    'Dining Out', group-id => FUN-GROUP),
+        category(VISA-PAY,  'Visa', kind => 'payment',
+                 group-id => CARDS-GROUP, payment-account-id => VISA),
+    );
+}
+
+sub the-groups(--> List) {
+    (
+        group(BILLS-GROUP, 'Monthly Bills', 1),
+        group(FUN-GROUP,   'Fun Money',     2),
+        group(CARDS-GROUP, 'Credit Card Payments', 3, :system),
+    );
+}
+
+# £1,800 in, £400 assigned to Groceries and £150 to Dining, then
+# £72.50 of groceries on the card and £22.00 of dinner in cash.
+sub spending-facts(--> Facts) {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign(PERIOD, GROCERIES, 40000);
+    $f.assign(PERIOD, DINING, 15000);
+    $f.spend(account => VISA, date => '2026-03-14',
+             amount => 7250, category => GROCERIES);
+    $f.spend(account => CURRENT, date => '2026-03-16',
+             amount => 2200, category => DINING);
+    $f;
+}
+
+sub rows-of($view, Bool :$by-group = False --> List) {
+    spending-rows(categories => the-categories(), groups => the-groups(),
+                  :$view, period => PERIOD, :$by-group);
+}
+
+sub accounts-by-id(Facts $f --> Hash) { $f.accounts.map({ .id => $_ }).Hash }
+sub peers-by-id(Facts $f --> Hash) {
+    $f.transactions.map({ .id => .account-id }).Hash;
+}
+
+#| Every transaction filed in C<$period>. Under the default monthly/1
+#| scheme a period is a calendar month, so its start's C<YYYY-MM>
+#| prefix is exactly the set of dates that bucket into it.
+sub in-period(Facts $f, Str $period --> List) {
+    my Str $ym = $period.substr(0, 7);
+    $f.transactions.grep({ .date.starts-with($ym) }).List;
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'spending is what left the envelopes, biggest first' => {
+    plan 6;
+    my @rows = rows-of(spending-facts().compute(through-period => PERIOD));
+
+    is @rows.elems, 2, 'the two envelopes that saw money leave';
+    is @rows[0]<name>, 'Groceries', 'the biggest leads';
+    is @rows[0]<pence>, 7250, 'as a positive figure, not a negative one';
+    is @rows[1]<name>, 'Dining Out', 'then the next';
+    is @rows[1]<pence>, 2200, 'also positive';
+    is @rows[0]<kind>, 'category', 'each row says what it is';
+};
+
+subtest 'the two envelopes that are not spending' => {
+    plan 3;
+    my $f = spending-facts();
+    my $view = $f.compute(through-period => PERIOD);
+    my @rows = rows-of($view);
+
+    # The rta row is where £1,800 arrived. It is inflow, and the
+    # summary strip's job; a bar for it would be the biggest thing on
+    # the chart and would mean nothing.
+    nok @rows.first({ $_<id> == RTA }).defined,
+        'Ready to Assign is not an envelope anybody spent';
+
+    # The card's payment envelope carries a derived coverage move for
+    # the £72.50 — the same £72.50 already sitting on Groceries.
+    ok $view.category(PERIOD, VISA-PAY).activity != 0
+       || $view.category(PERIOD, VISA-PAY).moved-in != 0,
+        'the payment envelope did move this period';
+    nok @rows.first({ $_<id> == VISA-PAY }).defined,
+        'but it is not a bar, or every card purchase would be on the '
+        ~ 'chart twice';
+};
+
+subtest 'a refund is not negative spending' => {
+    plan 3;
+    my $f = spending-facts();
+    # £80 back onto Dining Out: more came in than went out, so the
+    # envelope's activity for the period is positive.
+    $f.refund(account => CURRENT, date => '2026-03-20',
+              amount => 8000, category => DINING);
+    my $view = $f.compute(through-period => PERIOD);
+
+    ok $view.category(PERIOD, DINING).activity > 0,
+        'the derivation says the envelope gained money';
+    my @rows = rows-of($view);
+    is @rows.elems, 1, 'and it is simply not on the chart';
+    is @rows[0]<name>, 'Groceries', 'leaving the one that really spent';
+};
+
+subtest 'an empty period charts nothing at all' => {
+    plan 2;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    my $view = $f.compute(through-period => PERIOD);
+
+    is rows-of($view).elems, 0,
+        'money arriving is not money spent';
+    is spending-total(rows-of($view)), 0, 'and the total is zero, not undef';
+};
+
+subtest 'a period outside the derivation is zero, not a throw' => {
+    plan 3;
+    my $view = spending-facts().compute(through-period => PERIOD);
+
+    # `BudgetView.period` answers with a type object here, and an
+    # attribute accessor on a type object throws — so both guards are
+    # load-bearing, not defensive.
+    is assigned-total($view, '2019-01-01'), 0, 'no period, no assignments';
+    is assigned-total(Nil, PERIOD), 0, 'nor before the first recompute';
+    is spending-rows(categories => the-categories(), view => Nil,
+                     period => PERIOD).elems, 0,
+        'and the rows come back empty rather than blowing up a repaint';
+};
+
+subtest 'by group sums the envelopes under their headings' => {
+    plan 6;
+    my @rows = rows-of(spending-facts().compute(through-period => PERIOD),
+                       :by-group);
+
+    is @rows.elems, 2, 'two groups saw money leave';
+    is @rows[0]<name>, 'Monthly Bills', 'named for the group, not the envelope';
+    is @rows[0]<pence>, 7250, 'carrying its members\' spending';
+    is @rows[0]<kind>, 'group', 'and saying which it is';
+    is @rows[0]<id>, BILLS-GROUP, 'keyed on the group';
+    is @rows[1]<name>, 'Fun Money', 'in the same descending order';
+};
+
+subtest 'grouping adds the spending, not the activity' => {
+    plan 2;
+    my $f = spending-facts();
+    # Two envelopes in one group: one spent £30, the other was refunded
+    # £10 net. The group spent £30 — the refund is a fact about that
+    # envelope's balance, not about what the group paid out.
+    $f.add-category(50, 'Water');
+    $f.spend(account => CURRENT, date => '2026-03-18',
+             amount => 3000, category => 50);
+    $f.refund(account => CURRENT, date => '2026-03-19',
+              amount => 1000, category => 60);
+    $f.add-category(60, 'Refunded');
+
+    my @categories = (|the-categories(),
+                      category(50, 'Water',    group-id => BILLS-GROUP),
+                      category(60, 'Refunded', group-id => BILLS-GROUP));
+    my @rows = spending-rows(:@categories, groups => the-groups(),
+                             view => $f.compute(through-period => PERIOD),
+                             period => PERIOD, :by-group);
+    my $bills = @rows.first({ $_<id> == BILLS-GROUP });
+    is $bills<pence>, 7250 + 3000,
+        'groceries plus water, with the refund contributing nothing';
+
+    # A category filed under no group at all goes in the same bucket
+    # the envelope grid puts it in.
+    my @loose = (|the-categories(), category(70, 'Loose'));
+    $f.add-category(70, 'Loose');
+    $f.spend(account => CURRENT, date => '2026-03-21',
+             amount => 500, category => 70);
+    my @with-loose = spending-rows(categories => @loose,
+                                   groups => the-groups(),
+                                   view => $f.compute(through-period => PERIOD),
+                                   period => PERIOD, :by-group);
+    ok @with-loose.first({ $_<name> eq 'Ungrouped' }).defined,
+        'and an ungrouped envelope lands in Ungrouped';
+};
+
+subtest 'the chart is cut to the rows it has, and says so' => {
+    plan 8;
+    my @rows = (1..5).map(-> $i {
+        %( kind => 'category', id => $i, name => "cat$i",
+           pence => 1000 * (6 - $i) )
+    }).List;
+
+    my %all = top-spending(@rows, 5);
+    is %all<rows>.elems, 5, 'everything fits';
+    is %all<hidden>, 0, 'nothing hidden';
+    is more-label(%all<hidden>), '', 'and no caption';
+
+    my %cut = top-spending(@rows, 3);
+    is %cut<rows>.elems, 3, 'three bars';
+    is-deeply %cut<rows>.map({ $_<name> }).List, ('cat1', 'cat2', 'cat3'),
+        'the biggest three — the cut is defensible because they are '
+        ~ 'sorted';
+    is %cut<hidden>, 2, 'two left behind';
+    is more-label(%cut<hidden>), '+2 more…', 'and a caption saying so';
+
+    # A pane too short for a single bar still has a bottom title.
+    is-deeply top-spending(@rows, 0), %( rows => (), hidden => 5 ),
+        'no room at all is still an honest answer';
+};
+
+subtest 'bars carry their figure, right-aligned, money first' => {
+    plan 5;
+    my @rows = (
+        %( kind => 'category', id => 1, name => 'Groceries', pence => 41250 ),
+        %( kind => 'category', id => 2, name => 'Coffee',    pence => 420 ),
+    );
+    my @bars = report-bars(@rows);
+
+    is @bars[0]<label>, '£412.50  Groceries', 'the figure leads';
+    is @bars[1]<label>, '  £4.20  Coffee',
+        'padded to the widest, so the decimal points line up';
+    is @bars[0]<value>, 412.5,
+        'and the value is in pounds — BarChart labels its axis from it, '
+        ~ 'and an axis in pence is not an axis about money';
+    is @bars[1]<value>, 4.2, 'pence and all';
+    is-deeply report-bars(()).List, (), 'no rows, no bars';
+};
+
+subtest 'cash flow is what crossed the budget boundary' => {
+    plan 6;
+    my $f = spending-facts();
+    my %accounts = accounts-by-id($f);
+    my %peers = peers-by-id($f);
+    my %flow = cash-flow(transactions => in-period($f, PERIOD),
+                         :%accounts, peer-accounts => %peers);
+
+    is %flow<inflow>, 180000, 'the salary came in';
+    is %flow<outflow>, -7250 - 2200,
+        'both spends went out, kept signed';
+    is %flow<net>, 180000 - 9450, 'and the net is their sum';
+
+    # A tracking account is outside the budget, so nothing on it counts
+    # as this budget's cash flow.
+    $f.spend(account => ISA, date => '2026-03-17', amount => 5000,
+             category => GROCERIES);
+    my %off = cash-flow(transactions => in-period($f, PERIOD),
+                        accounts => accounts-by-id($f),
+                        peer-accounts => peers-by-id($f));
+    is %off<outflow>, -9450,
+        'a transaction on a tracking account is not the budget\'s';
+
+    # Nor is a period with nothing in it a problem.
+    my %empty = cash-flow(transactions => (), :%accounts);
+    is %empty<inflow>, 0, 'an empty period is zero in';
+    is %empty<net>, 0, 'and zero net';
+};
+
+subtest 'the transfer matrix' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+
+    # On-budget to on-budget: two legs, net zero, and counting them
+    # would put £500 in both columns while nothing entered or left.
+    $f.transfer(from => CURRENT, to => SAVINGS, date => '2026-03-05',
+                amount => 50000);
+    my %inside = cash-flow(transactions => in-period($f, PERIOD),
+                           accounts => accounts-by-id($f),
+                           peer-accounts => peers-by-id($f));
+    is %inside<inflow>, 100000, 'the sweep added nothing to inflow';
+    is %inside<outflow>, 0, 'nor anything to outflow';
+
+    # On-budget to tracking: the money really did leave the budget.
+    $f.transfer(from => CURRENT, to => ISA, date => '2026-03-06',
+                amount => 20000, parts => [(GROCERIES) => -20000]);
+    my %out = cash-flow(transactions => in-period($f, PERIOD),
+                        accounts => accounts-by-id($f),
+                        peer-accounts => peers-by-id($f));
+    is %out<outflow>, -20000, 'a transfer to a tracking account counts';
+
+    # And a leg whose peer cannot be resolved counts, because the
+    # alternative is silently dropping real money from the report.
+    my %blind = cash-flow(transactions => in-period($f, PERIOD),
+                          accounts => accounts-by-id($f));
+    is %blind<outflow>, -50000 - 20000,
+        'with no peer index every leg on an on-budget account counts';
+};
+
+subtest 'the summary strip' => {
+    plan 8;
+    my $f = spending-facts();
+    my $view = $f.compute(through-period => PERIOD);
+    my @spending = rows-of($view);
+    my %sum = report-summary(
+        transactions => in-period($f, PERIOD),
+        accounts => accounts-by-id($f), peer-accounts => peers-by-id($f),
+        :$view, period => PERIOD, :@spending);
+
+    is %sum<assigned>, 55000, 'assigned is the period\'s own total';
+    is %sum<spent>, 9450, 'spent is the sum of exactly what is charted';
+    is %sum<text>,
+        'Inflow £1,800.00 · Outflow £94.50 · Net £1,705.50   '
+        ~ 'Assigned £550.00 · Spent £94.50',
+        'and the strip reads as §4.6 draws it';
+    ok %sum<text>.contains('Outflow £94.50'),
+        'outflow is printed as a magnitude — the word says the direction';
+
+    my @spans = summary-spans(%sum, :$theme);
+    is @spans.map(*.text).join, %sum<text>,
+        'the spans say exactly what the line does';
+    is @spans.first({ .text.starts-with('Net') }).style.fg, $theme.fg-green,
+        'a positive net is green';
+    nok @spans.grep({ .text.contains("\n") }).elems,
+        'and no span carries a newline — it is one line in a two-row box';
+
+    # A period that spent more than it took in. Built as bare figures,
+    # which also proves the span builder derives its own segments when
+    # it is handed a hash that has none.
+    my %red = %( inflow => 0, outflow => -100, net => -100,
+                 assigned => 0, spent => 100 );
+    is summary-spans(%red, :$theme).first({ .text.starts-with('Net') })
+        .style.fg, $theme.fg-red, 'and a negative one is red';
+};
+
+subtest 'how deep a box the strip needs' => {
+    plan 9;
+
+    # March's own figures, so the line being measured is a real one
+    # rather than a string invented to make the arithmetic work.
+    my %sum = %( inflow => 180000, outflow => -9450, net => 170550,
+                 assigned => 55000, spent => 9450 );
+    my Str $line = summary-line(%sum);
+    ok $line.chars > 40, 'the strip is long enough for this to be a question';
+
+    is summary-rows-needed($line, $line.chars), SUMMARY-ROWS-MIN,
+        'a strip that fits its box exactly gets the frame and one line';
+    is summary-rows-needed($line, $line.chars - 1), SUMMARY-ROWS,
+        'and one cell over is what buys the second line';
+    is summary-rows-needed($line, $line.chars + 40), SUMMARY-ROWS-MIN,
+        'room to spare changes nothing — the box does not grow with it';
+
+    # Four rows is a ceiling, not a count: a terminal too narrow for
+    # two lines of strip shows a cut strip, because the chart
+    # underneath is what the tab is for.
+    is summary-rows-needed($line, 10), SUMMARY-ROWS,
+        'a box far too narrow still gets four rows and no more';
+
+    is summary-rows-needed('', 96), SUMMARY-ROWS-MIN,
+        'an empty strip is a strip that fits';
+    is summary-rows-needed(Str, 96), SUMMARY-ROWS-MIN,
+        'and so is no strip at all';
+
+    # A widget with no plane reports zero columns. That is "nobody has
+    # measured this yet", not "this pane is zero cells wide", and
+    # guessing short there would cut the strip on the frame the tab is
+    # mounted.
+    is summary-rows-needed($line, 0), SUMMARY-ROWS,
+        'an unmeasured box falls back to the tallest the pane gets';
+    is summary-rows-needed($line, -4), SUMMARY-ROWS,
+        'as does one whose chrome has already eaten its width';
+};
+
+subtest 'the two frame titles' => {
+    plan 5;
+    is chart-title(False), 'Spending by category', '§4.6\'s default';
+    is chart-title(True),  'Spending by group', 'and what b switches to';
+    is summary-title('March 2026'), 'March 2026 summary',
+        'the strip is named for its period';
+    is summary-title(''), 'Summary',
+        'a period the label could not parse leaves no dangling word';
+    is summary-title(Str), 'Summary', 'and neither does no period at all';
+};

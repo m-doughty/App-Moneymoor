@@ -1,0 +1,564 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Gateway::Account;
+use App::Moneymoor::Gateway::Assignment;
+use App::Moneymoor::Gateway::Category;
+use App::Moneymoor::Gateway::Transaction;
+
+plan 16;
+
+my $db-path = $*TMPDIR.add("moneymoor-gw-category-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $gw = App::Moneymoor::Gateway::Category.new(:$db);
+my $accounts = App::Moneymoor::Gateway::Account.new(:$db);
+my $transactions = App::Moneymoor::Gateway::Transaction.new(:$db);
+my $assignments = App::Moneymoor::Gateway::Assignment.new(:$db);
+
+subtest 'groups: create, find, order' => {
+    plan 5;
+    my $bills = $gw.create-group(App::Moneymoor::Model::CategoryGroup.new(
+        name => 'Monthly Bills', sort-order => 10));
+    my $fun = $gw.create-group(App::Moneymoor::Model::CategoryGroup.new(
+        name => 'Fun Money', sort-order => 20));
+
+    ok $bills.id.defined, 'create-group returns the stored row';
+    nok $bills.is-system, 'a user group is not a system group';
+
+    my @groups = $gw.find-groups;
+    is @groups.map(*.name).join('|'),
+        'Monthly Bills|Fun Money|Credit Card Payments',
+        'groups come back in sort order (the seeded payment group sorts last)';
+
+    is $gw.find-group-by-name('Fun Money').id, $fun.id,
+        'find-group-by-name works';
+    nok $gw.find-group-by-id(99999).defined,
+        'a missing group is a type object';
+};
+
+subtest 'groups: hiding and validation' => {
+    plan 4;
+    my $hidden = $gw.create-group(App::Moneymoor::Model::CategoryGroup.new(
+        name => 'Retired', sort-order => 30, hidden => True));
+    nok $gw.find-groups.first({ .name eq 'Retired' }).defined,
+        'a hidden group is excluded by default';
+    ok $gw.find-groups(:include-hidden).first({ .name eq 'Retired' }).defined,
+        'and included with :include-hidden';
+
+    my $dup = $gw.create-group(App::Moneymoor::Model::CategoryGroup.new(
+        name => 'Monthly Bills'));
+    ok $dup ~~ Failure, 'duplicate group names are refused';
+    $dup.so;
+
+    my $empty = $gw.create-group(App::Moneymoor::Model::CategoryGroup.new(
+        name => '  '));
+    ok $empty ~~ Failure, 'an empty group name is refused';
+    $empty.so;
+};
+
+subtest 'groups: the system group is untouchable' => {
+    plan 3;
+    my $system = $gw.find-group-by-name('Credit Card Payments');
+    ok $system.is-system, 'the seeded payment group is marked system';
+
+    my $renamed = $gw.update-group(App::Moneymoor::Model::CategoryGroup.new(
+        id => $system.id, name => 'My Cards', system => True));
+    ok $renamed ~~ Failure, 'it cannot be renamed';
+    $renamed.so;
+
+    my $deleted = $gw.delete-group($system.id);
+    ok $deleted ~~ Failure, 'it cannot be deleted';
+    $deleted.so;
+};
+
+subtest 'groups: deleting one ungroups its categories' => {
+    plan 2;
+    my $doomed = $gw.create-group(App::Moneymoor::Model::CategoryGroup.new(
+        name => 'Temporary', sort-order => 40));
+    my $inside = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Inside Temporary', group-id => $doomed.id));
+
+    ok $gw.delete-group($doomed.id), 'the group is deleted';
+    my $survivor = $gw.find-by-id($inside.id);
+    ok $survivor.defined && !$survivor.group-id.defined,
+        'its category survives, ungrouped';
+};
+
+subtest 'categories: create, find, order' => {
+    plan 6;
+    my $bills = $gw.find-group-by-name('Monthly Bills');
+    my $rent = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Rent', group-id => $bills.id, sort-order => 1));
+    my $power = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Electricity', group-id => $bills.id, sort-order => 2));
+
+    ok $rent.id.defined, 'create returns the stored row';
+    is $rent.kind, 'standard', 'user categories are standard';
+    is $gw.find-by-name('Rent').id, $rent.id, 'find-by-name works';
+
+    my @in-group = $gw.find-by-group($bills.id);
+    is @in-group.map(*.name).join('|'), 'Rent|Electricity',
+        'find-by-group returns them in sort order';
+
+    nok $gw.find-by-id(99999).defined, 'a missing category is a type object';
+
+    my $dup = $gw.create(App::Moneymoor::Model::Category.new(name => 'Rent'));
+    ok $dup ~~ Failure, 'duplicate category names are refused';
+    $dup.so;
+};
+
+subtest 'categories: system rows cannot be minted by hand' => {
+    plan 4;
+    my $payment = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Fake Card', kind => 'payment'));
+    ok $payment ~~ Failure, 'a payment category cannot be created here';
+    $payment.so;
+
+    my $rta = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Second RTA', kind => 'rta'));
+    ok $rta ~~ Failure, 'a second Ready to Assign row cannot be created';
+    $rta.so;
+
+    my $system = $gw.rta-category;
+    ok $system.defined && $system.is-rta, 'the seeded rta row is found by kind';
+    is $gw.find-all(:include-hidden).grep(*.is-rta).elems, 1,
+        'and there is exactly one of it';
+};
+
+subtest 'categories: hiding' => {
+    plan 3;
+    my $dining = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Dining Out', sort-order => 5));
+    ok $gw.hide($dining.id), 'hide succeeds';
+    nok $gw.find-all.first({ .name eq 'Dining Out' }).defined,
+        'a hidden category is excluded by default';
+    ok $gw.find-all(:include-hidden).first({ .name eq 'Dining Out' }).defined,
+        'and included with :include-hidden';
+    $gw.unhide($dining.id);
+};
+
+subtest 'categories: update rules' => {
+    plan 5;
+    my $power = $gw.find-by-name('Electricity');
+    my $fun = $gw.find-group-by-name('Fun Money');
+    ok $gw.update(App::Moneymoor::Model::Category.new(
+        id => $power.id, name => 'Power', group-id => $fun.id, sort-order => 7)),
+        'a standard category can be renamed and regrouped';
+    my $reloaded = $gw.find-by-id($power.id);
+    is $reloaded.name, 'Power', 'the rename landed';
+    is $reloaded.group-id, $fun.id, 'so did the regroup';
+
+    my $kind-change = $gw.update(App::Moneymoor::Model::Category.new(
+        id => $power.id, name => 'Power', kind => 'payment'));
+    ok $kind-change ~~ Failure, 'the kind cannot be changed';
+    $kind-change.so;
+
+    my $rta = $gw.rta-category;
+    my $rename-system = $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rta.id, name => 'Inflow', kind => 'rta'));
+    ok $rename-system ~~ Failure, 'a system category cannot be renamed';
+    $rename-system.so;
+};
+
+subtest 'categories: system rows may still be reordered and hidden' => {
+    plan 2;
+    my $rta = $gw.rta-category;
+    ok $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rta.id, name => $rta.name, kind => 'rta',
+        sort-order => -5, hidden => True)),
+        'sort order and hidden are display choices, so they are allowed';
+    my $reloaded = $gw.find-by-id($rta.id);
+    ok $reloaded.sort-order == -5 && $reloaded.hidden,
+        'and they landed';
+    $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rta.id, name => $rta.name, kind => 'rta',
+        sort-order => -1, hidden => False));
+};
+
+subtest 'categories: carrying overspending round-trips, and system rows refuse it'
+        => {
+    plan 9;
+    # One Bool with an engine rule behind it (Service::Budget, rule 3).
+    # The gateway stores it and enforces exactly one thing about it:
+    # never on a system row, with the same refusal a rename gets.
+    my $plain = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Ordinary Envelope', sort-order => 70));
+    nok $plain.carry-overspend,
+        'an envelope created without the flag is on the forcing rule';
+
+    my $carrying = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Reimbursables', sort-order => 71, carry-overspend => True));
+    ok $carrying.carry-overspend, 'create persists the flag';
+    ok $gw.find-by-id($carrying.id).carry-overspend, 'and it reloads';
+
+    ok $gw.update(App::Moneymoor::Model::Category.new(
+        id => $carrying.id, name => 'Reimbursables',
+        group-id => $carrying.group-id, sort-order => 71,
+        carry-overspend => False)),
+        'update turns it back off';
+    nok $gw.find-by-id($carrying.id).carry-overspend, 'and that reloads too';
+
+    # The whole-row contract, stated out loud: `update` writes every
+    # column it is given, so an editor that does not carry the flag
+    # through puts the envelope back on the default rule. This is the
+    # same trap the target tuple has, and the reason the category editor
+    # renders the checkbox rather than passing the row's value along.
+    $gw.update(App::Moneymoor::Model::Category.new(
+        id => $carrying.id, name => 'Reimbursables',
+        group-id => $carrying.group-id, sort-order => 71,
+        carry-overspend => True));
+    $gw.update(App::Moneymoor::Model::Category.new(
+        id => $carrying.id, name => 'Reimbursables (renamed)',
+        group-id => $carrying.group-id, sort-order => 71));
+    nok $gw.find-by-id($carrying.id).carry-overspend,
+        'a whole-row update that omits the flag clears it, as it does a target';
+
+    # A payment envelope already carries by kind and Ready to Assign has
+    # no available to carry, so the flag is refused on both — the same
+    # rule as a rename or a target, not a second one.
+    my $rta = $gw.rta-category;
+    my $flagged = $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rta.id, name => $rta.name, kind => 'rta',
+        sort-order => $rta.sort-order, carry-overspend => True));
+    ok $flagged ~~ Failure, 'a system row refuses the flag';
+    like $flagged.exception.message, /'system category'/,
+        'with the system-row wording';
+    $flagged.so;
+    nok $gw.find-by-id($rta.id).carry-overspend, 'and nothing was written';
+};
+
+subtest 'categories: targets round-trip, and are guarded' => {
+    plan 10;
+    # The whole of the target contract, at the layer that enforces it.
+    # The UI refuses a negative one too, on the dialog's error line, but
+    # the gateway is not the UI's only caller and must not rely on it.
+    my $plain = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'No Target Here', sort-order => 40));
+    is $plain.target-pence, 0, 'an envelope created without one has 0';
+    nok $plain.has-target, 'and says so by name';
+
+    my $rent = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Rent Target', sort-order => 41, target-pence => 75000));
+    is $rent.target-pence, 75000, 'create persists a target';
+    ok $rent.has-target, 'and has-target agrees';
+
+    ok $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rent.id, name => 'Rent Target', group-id => $rent.group-id,
+        sort-order => 41, target-pence => 80000)),
+        'update persists a changed one';
+    is $gw.find-by-id($rent.id).target-pence, 80000, 'and it reloads';
+
+    # Zero is how a target is cleared — the editor's blank field — so it
+    # has to be an ordinary update and not a refusal.
+    $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rent.id, name => 'Rent Target', group-id => $rent.group-id,
+        sort-order => 41, target-pence => 0));
+    nok $gw.find-by-id($rent.id).has-target, 'zero clears it';
+
+    my $negative = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Owes Money', target-pence => -100));
+    ok $negative ~~ Failure, 'a negative target is refused on create';
+    # A target is per budget PERIOD, which is a calendar month only on
+    # a budget that is on the calendar-month scheme — so the refusal
+    # must not call it a monthly one.
+    ok $negative.exception.message.starts-with('A target cannot be negative'),
+        'and the refusal names it a target, not a monthly target';
+    $negative.so;
+
+    my $negative-update = $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rent.id, name => 'Rent Target', group-id => $rent.group-id,
+        sort-order => 41, target-pence => -1));
+    ok $negative-update ~~ Failure, 'and on update';
+    $negative-update.so;
+};
+
+subtest 'categories: a system row has no target to want' => {
+    plan 7;
+    # A payment envelope's figure is the card's balance and Ready to
+    # Assign is not an envelope at all, so a target on either is refused
+    # exactly as a rename is — the same rule, not a second one.
+    my $rta = $gw.rta-category;
+    is $rta.target-pence, 0, 'the seeded rta row has no target';
+
+    my $targeted = $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rta.id, name => $rta.name, kind => 'rta',
+        sort-order => $rta.sort-order, target-pence => 50000));
+    ok $targeted ~~ Failure, 'giving it one is refused';
+    like $targeted.exception.message, /'system category'/,
+        'with the system-row wording, not a target-specific one';
+    $targeted.so;
+
+    is $gw.find-by-id($rta.id).target-pence, 0, 'and nothing was written';
+
+    # All five target columns, not just the amount: a system row with a
+    # goal date is a row the budget tab would then have to render.
+    my $dated = $gw.update(App::Moneymoor::Model::Category.new(
+        id => $rta.id, name => $rta.name, kind => 'rta',
+        sort-order => $rta.sort-order, target-pence => 50000,
+        target-kind => 'by_period', target-period => '2027-04-05',
+        target-start => '2026-08-01'));
+    ok $dated ~~ Failure, 'nor a by-period one';
+    $dated.so;
+
+    # set-target refuses outright rather than by comparing fields:
+    # calling it on a system row is an attempt to give it a target
+    # however innocuous the arguments are.
+    my $direct = $gw.set-target($rta.id, kind => 'refill', pence => 0);
+    ok $direct ~~ Failure,
+        'and set-target refuses a system row even for a no-op';
+    like $direct.exception.message, /'system category'/,
+        'with the same wording';
+    $direct.so;
+};
+
+subtest 'categories: the target tuple is validated as a whole' => {
+    plan 17;
+    # Every rule from the gateway's TARGETS section, on the path an
+    # explicit caller takes. The UI is not the only caller and the
+    # CHECK constraint is not a message.
+    my $gap = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Tuple Probe', sort-order => 60));
+
+    sub with-target(*%target) {
+        App::Moneymoor::Model::Category.new(
+            id => $gap.id, name => $gap.name, sort-order => 60, |%target);
+    }
+
+    my $unknown = $gw.update(with-target(
+        target-pence => 40000, target-kind => 'sideways'));
+    ok $unknown ~~ Failure, 'an unknown kind is refused';
+    like $unknown.exception.message, /'Unknown target kind'/,
+        'by name, rather than by SQLite constraint error';
+    $unknown.so;
+
+    my $created-unknown = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Never Created', target-pence => 40000,
+        target-kind => 'nonsense'));
+    ok $created-unknown ~~ Failure, 'on create as well as on update';
+    $created-unknown.so;
+
+    # Zero is "no target", and no target has exactly one shape.
+    my $empty-aside = $gw.update(with-target(
+        target-pence => 0, target-kind => 'set_aside'));
+    ok $empty-aside ~~ Failure, 'a set-aside of nothing is refused';
+    like $empty-aside.exception.message, /'above zero'/,
+        'pointing at the amount';
+    $empty-aside.so;
+
+    ok $gw.update(with-target(target-pence => 0)),
+        'while a refill of nothing is how a target is cleared';
+
+    # by_period is complete or it is refused.
+    my $no-goal = $gw.update(with-target(
+        target-pence => 500000, target-kind => 'by_period',
+        target-start => '2026-08-01'));
+    ok $no-goal ~~ Failure, 'a by-period target with no goal date is refused';
+    like $no-goal.exception.message, /'goal date'/, 'saying which field';
+    $no-goal.so;
+
+    my $bad-goal = $gw.update(with-target(
+        target-pence => 500000, target-kind => 'by_period',
+        target-period => '2027-02-30', target-start => '2026-08-01'));
+    ok $bad-goal ~~ Failure, 'and so is one whose goal is not a real date';
+    $bad-goal.so;
+
+    my $no-stamp = $gw.update(with-target(
+        target-pence => 500000, target-kind => 'by_period',
+        target-period => '2027-04-05'));
+    ok $no-stamp ~~ Failure, 'a by-period target with no stamped start too';
+    like $no-stamp.exception.message, /'set-target'/,
+        'naming the front door that stamps it';
+    $no-stamp.so;
+
+    my $negative-repeat = $gw.update(with-target(
+        target-pence => 500000, target-kind => 'by_period',
+        target-period => '2027-04-05', target-start => '2026-08-01',
+        target-repeat => -1));
+    ok $negative-repeat ~~ Failure, 'a negative repeat is refused';
+    $negative-repeat.so;
+
+    # Every other kind carries none of it — refused, not normalised,
+    # because an explicit caller with two ideas should hear about it.
+    my $stray-repeat = $gw.update(with-target(
+        target-pence => 40000, target-repeat => 3));
+    ok $stray-repeat ~~ Failure, 'a refill target with a repeat is refused';
+    $stray-repeat.so;
+
+    my $stray-date = $gw.update(with-target(
+        target-pence => 10000, target-kind => 'set_aside',
+        target-period => '2027-04-05'));
+    ok $stray-date ~~ Failure, 'as is a set-aside carrying a goal date';
+    like $stray-date.exception.message, /'by_period'/,
+        'saying where those fields belong';
+    $stray-date.so;
+
+    ok $gw.update(with-target(
+        target-pence => 500000, target-kind => 'by_period',
+        target-period => '2027-04-05', target-start => '2026-08-01',
+        target-repeat => 3)),
+        'a complete by-period tuple is stored';
+    my $reloaded = $gw.find-by-id($gap.id);
+    is-deeply
+        ($reloaded.target-kind, $reloaded.target-pence,
+         $reloaded.target-period, $reloaded.target-start,
+         $reloaded.target-repeat),
+        ('by_period', 500000, '2027-04-05', '2026-08-01', 3),
+        'and reloads exactly as it was written';
+};
+
+subtest 'categories: set-target writes the tuple and nothing else' => {
+    plan 11;
+    my $envelope = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Set Target Probe', sort-order => 61, target-pence => 100));
+
+    ok $gw.set-target($envelope.id, kind => 'refill', pence => 40000),
+        'a refill target is set';
+    my $refilled = $gw.find-by-id($envelope.id);
+    is $refilled.target-pence, 40000, 'the amount landed';
+    is $refilled.name, 'Set Target Probe', 'and the row is otherwise as it was';
+    is $refilled.sort-order, 61, 'sort order included';
+
+    ok $gw.set-target($envelope.id, kind => 'by_period', pence => 5_000_000,
+                      period => '2027-04-05', start => '2026-08-01',
+                      repeat => 3),
+        'and a by-period one';
+    my $goal = $gw.find-by-id($envelope.id);
+    is-deeply
+        ($goal.target-kind, $goal.target-period, $goal.target-start,
+         $goal.target-repeat),
+        ('by_period', '2027-04-05', '2026-08-01', 3),
+        'with its whole tuple';
+
+    # A Date where a date string belongs: callers that hold one would
+    # only stringify it themselves.
+    ok $gw.set-target($envelope.id, kind => 'by_period', pence => 5_000_000,
+                      period => Date.new('2027-04-05'),
+                      start => Date.new('2026-08-01')),
+        'a Date is accepted for either date';
+    is $gw.find-by-id($envelope.id).target-repeat, 0,
+        'and an omitted repeat is a one-shot goal again';
+
+    ok $gw.set-target($envelope.id, kind => 'refill', pence => 40000),
+        'going back to refill is allowed';
+    my $back = $gw.find-by-id($envelope.id);
+    nok ($back.target-period.defined || $back.target-start.defined
+         || $back.target-repeat != 0),
+        'and clears the fields refill does not use';
+
+    my $missing = $gw.set-target(999999, kind => 'refill', pence => 1000);
+    ok $missing ~~ Failure, 'a row that does not exist is refused';
+    $missing.so;
+};
+
+subtest 'categories: delete refuses to rewrite history' => {
+    plan 6;
+    my $rta = $gw.rta-category;
+    my $deleted-system = $gw.delete($rta.id);
+    ok $deleted-system ~~ Failure, 'a system category cannot be deleted';
+    $deleted-system.so;
+
+    my $spent = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Has History'));
+    my $account = $accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Current', type => 'cash'));
+    $transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $account.id, date => '2026-03-01', amount => -500),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $spent.id, amount => -500)],
+    );
+    my $r = $gw.delete($spent.id);
+    ok $r ~~ Failure, 'a category with transactions cannot be deleted';
+    like $r.exception.message, /'hide it instead'/, 'and hide is suggested';
+    $r.so;
+
+    my $funded = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Has Assignments'));
+    $assignments.set('2026-03-01', $funded.id, 1000);
+    my $r2 = $gw.delete($funded.id);
+    ok $r2 ~~ Failure, 'a category with assignments cannot be deleted';
+    $r2.so;
+
+    my $unused = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Never Used'));
+    ok $gw.delete($unused.id), 'a category with no history can be deleted';
+    nok $gw.find-by-id($unused.id).defined, 'and it is gone';
+};
+
+subtest 'categories: zeroed periods are not history' => {
+    plan 10;
+    # Regression: `assignments.set` upserts a row even for an amount of
+    # 0, so counting rows rather than money made every envelope that had
+    # ever been budgeted to permanently undeletable — the user could
+    # empty it, watch the budget agree it held nothing, and still be
+    # told it had "2 period(s) of assignments".
+    sub assignment-rows(Int $id --> Int) {
+        ($db.query-one('SELECT count(*) AS n FROM assignments
+                        WHERE category_id = ?', $id)<n> // 0).Int;
+    }
+
+    my $emptied = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Funded Then Emptied'));
+    $assignments.set('2026-03-01', $emptied.id, 1000);
+    $assignments.set('2026-04-01', $emptied.id, 2500);
+    my $still = $gw.delete($emptied.id);
+    ok $still ~~ Failure, 'while funded it is still refused';
+    like $still.exception.message, /'2 period(s) of non-zero assignments'/,
+        'and the message counts the periods that hold money';
+    $still.so;
+
+    $assignments.set('2026-03-01', $emptied.id, 0);
+    $assignments.set('2026-04-01', $emptied.id, 0);
+    is assignment-rows($emptied.id), 2,
+        'zeroing leaves the rows behind — that is the bug this covers';
+    ok $gw.delete($emptied.id), 'once zeroed it can be deleted';
+    nok $gw.find-by-id($emptied.id).defined, 'and it is gone';
+    is assignment-rows($emptied.id), 0,
+        'the leftover zero rows went with it';
+
+    # A period that has not happened yet is still money the user has
+    # committed: budgeting forward and then deleting the envelope would
+    # silently return that money to Ready to Assign.
+    my $future = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Funded Ahead'));
+    $assignments.set('2026-03-01', $future.id, 0);
+    $assignments.set('2027-01-01', $future.id, 7500);
+    my $ahead = $gw.delete($future.id);
+    ok $ahead ~~ Failure, 'a future-period assignment still refuses';
+    like $ahead.exception.message, /'1 period(s) of non-zero assignments'/,
+        'counting only the funded period';
+    $ahead.so;
+
+    # Splits outrank everything: zero assignments do not unlock a
+    # category that has been spent from.
+    my $spent-then-zeroed = $gw.create(App::Moneymoor::Model::Category.new(
+        name => 'Spent Then Zeroed'));
+    my $account = $accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Zeroing Test', type => 'cash'));
+    $transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $account.id, date => '2026-03-02', amount => -250),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $spent-then-zeroed.id, amount => -250)],
+    );
+    $assignments.set('2026-03-01', $spent-then-zeroed.id, 0);
+    my $spent-refusal = $gw.delete($spent-then-zeroed.id);
+    ok $spent-refusal ~~ Failure,
+        'a category with splits is refused however empty its envelope';
+    like $spent-refusal.exception.message, /'transaction(s) are categorized'/,
+        'and it is the splits refusal, not the assignments one';
+    $spent-refusal.so;
+};

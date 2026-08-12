@@ -1,0 +1,285 @@
+use Test;
+use lib 'lib';
+
+use Selkie::Alpha;
+use Selkie::Style;
+use Selkie::Theme;
+use App::Moneymoor::Theme;
+use App::Moneymoor::Themes;
+
+# Completeness guard for the palette layer.
+#
+# t/18-themes proves every registered name loads and produces a
+# Selkie::Theme. This file proves the palettes are *complete* rather
+# than merely constructible:
+#
+#   1. The derived-colour slots (accent, bg-surface) exist, are sane,
+#      and actually lift off the base background.
+#   2. to-selkie fills every Selkie slot that Selkie would otherwise
+#      default. This is the regression that bites in practice: Selkie's
+#      defaults for dropdown / toast / overlay-title / the chart family
+#      derive from *Selkie's* built-in blue-grey constants, not from the
+#      slots we hand it, so a slot we forget silently keeps its Selkie
+#      colour and the app ships a Gruvbox UI with Tokyo-Night dropdowns.
+#      Nothing in a headless test can see that; only this comparison can.
+#   3. The framed-modal chrome (frame / title / key / scrim) says what
+#      it means, and the scrim keeps both channels on AlphaBlend —
+#      alpha is a two-bit enum, so losing the mode turns a tint into a
+#      solid rectangle rather than merely a weaker tint.
+#   4. All three TabBar slots carry an explicit background, which the
+#      pill-style strip renders from.
+#   5. Text stays readable on the backgrounds we pair it with.
+#   6. blend / banner-gradient / flash-colour behave.
+
+plan 8;
+
+my @NAMES = App::Moneymoor::Themes::all-names();
+
+# Every Selkie::Theme slot that has a default in Selkie::Theme — i.e.
+# every slot a Moneymoor palette can silently fail to override.
+my @DEFAULTED-SLOTS = <
+    control-focused selection input-ghost dropdown dropdown-highlight
+    overlay-title overlay-key modal-backdrop toast
+    modal-frame modal-title modal-key modal-scrim tab-focus-accent
+    password-empty password-weak password-fair password-good
+    password-strong password-very-strong
+    graph-axis graph-axis-label graph-grid graph-line graph-fill
+    graph-legend-bg
+>;
+
+#| Everything about a Style that a user can see, as a comparable string.
+#| Comparing this rather than object identity means "we passed a fresh
+#| Style object that happens to carry Selkie's default colours" still
+#| counts as a failure — which is the whole point of the guard.
+#|
+#| Alpha is part of the visual identity, not an afterthought: an
+#| C<AlphaBlend> scrim and an opaque one carrying the same RGB paint
+#| completely different screens (see L<Selkie::Alpha>), so a slot that
+#| dropped its blend mode has to read as a different key.
+sub visual-key(Selkie::Style $s --> Str) {
+    join '/',
+        $s.fg.defined ?? $s.fg.fmt('%06X') !! 'inherit',
+        $s.bg.defined ?? $s.bg.fmt('%06X') !! 'inherit',
+        ($s.bold          ?? 'B' !! '-'),
+        ($s.italic        ?? 'I' !! '-'),
+        ($s.underline     ?? 'U' !! '-'),
+        ($s.strikethrough ?? 'S' !! '-'),
+        ($s.fg-alpha.defined ?? $s.fg-alpha.key !! 'opaque'),
+        ($s.bg-alpha.defined ?? $s.bg-alpha.key !! 'opaque');
+}
+
+# --- WCAG 2.x relative luminance / contrast ratio ---------------------
+sub srgb-channel(Int $c --> Numeric) {
+    my $s = $c / 255;
+    $s <= 0.03928 ?? $s / 12.92 !! (($s + 0.055) / 1.055) ** 2.4;
+}
+
+sub relative-luminance(UInt $rgb --> Numeric) {
+      0.2126 * srgb-channel(($rgb +> 16) +& 0xFF)
+    + 0.7152 * srgb-channel(($rgb +>  8) +& 0xFF)
+    + 0.0722 * srgb-channel( $rgb        +& 0xFF);
+}
+
+sub contrast-ratio(UInt $a, UInt $b --> Numeric) {
+    my ($lo, $hi) = (relative-luminance($a), relative-luminance($b)).sort;
+    ($hi + 0.05) / ($lo + 0.05);
+}
+
+subtest "every palette carries a sane accent + bg-surface" => {
+    plan @NAMES.elems * 5;
+    for @NAMES -> $name {
+        my $t = load($name);
+        ok $t.defined, "$name: constructs";
+        ok $t.accent.defined && 0 <= $t.accent <= 0xFFFFFF,
+            "$name: accent is a 24-bit colour";
+        ok $t.bg-surface.defined && 0 <= $t.bg-surface <= 0xFFFFFF,
+            "$name: bg-surface is a 24-bit colour";
+        isnt $t.bg-surface, $t.bg-base,
+            "$name: bg-surface lifts off bg-base";
+        # A surface darker than the page reads as a hole, not a panel.
+        # (Equal-to-bg-highlight is fine and expected for the schemes
+        # that ship no colour in between — Catppuccin, Gruvbox, Nord,
+        # Solarized, Kanagawa.)
+        ok relative-luminance($t.bg-surface) > relative-luminance($t.bg-base),
+            "$name: bg-surface is brighter than bg-base";
+    }
+};
+
+subtest "to-selkie re-themes every slot Selkie would otherwise default" => {
+    plan @NAMES.elems * @DEFAULTED-SLOTS.elems;
+    my $fallback = Selkie::Theme.default;
+    for @NAMES -> $name {
+        my $selkie = load($name).to-selkie;
+        for @DEFAULTED-SLOTS -> $slot {
+            isnt visual-key($selkie.slot($slot)),
+                 visual-key($fallback.slot($slot)),
+                 "$name: $slot is not Selkie's default";
+        }
+    }
+};
+
+subtest "framed-modal chrome carries the palette, and the scrim blends" => {
+    # The four S4 slots a framed, scrimmed modal paints from. The
+    # previous subtest only proves they aren't Selkie's defaults; this
+    # one pins *what* they are, and in particular that the scrim keeps
+    # both channels on AlphaBlend. Notcurses alpha is a two-bit enum —
+    # an opaque scrim isn't a weaker scrim, it's a solid rectangle over
+    # the screen, so the mode is load-bearing rather than cosmetic.
+    plan @NAMES.elems * 8;
+    for @NAMES -> $name {
+        my $t      = load($name);
+        my $selkie = $t.to-selkie;
+
+        is $selkie.modal-frame.fg, $t.accent,
+            "$name: modal-frame takes the accent (a modal is always lit)";
+        is $selkie.modal-frame.bg, $t.bg-base,
+            "$name: modal-frame sits on bg-base";
+
+        is $selkie.modal-title.fg, $t.accent, "$name: modal-title is the accent";
+        ok $selkie.modal-title.bold, "$name: modal-title is bold";
+
+        is $selkie.modal-key.fg, $t.fg-purple,
+            "$name: modal-key matches the overlay-key hue";
+
+        is $selkie.modal-scrim.bg,
+            App::Moneymoor::Theme.blend($t.bg-base, 0x000000, 0.5),
+            "$name: scrim tints toward the palette's own background";
+        is $selkie.modal-scrim.fg-alpha, AlphaBlend,
+            "$name: scrim foreground blends";
+        is $selkie.modal-scrim.bg-alpha, AlphaBlend,
+            "$name: scrim background blends";
+    }
+};
+
+subtest "every tab slot carries the background a pill renders from" => {
+    # Moneymoor's perspective strip runs TabPill + FocusColor, where a
+    # tab's background is not decoration — it is the entire "which tab
+    # is this" signal, and TabBar merges tab-focus-accent OVER
+    # tab-active on the focused tab (Selkie's TabBar Pod, FOCUS
+    # INDICATION). Three things break silently if a background goes
+    # missing, none of them visible to any other test here:
+    #
+    #   tab-active without a bg    → the pill has no fill at all
+    #   tab-inactive without a bg  → Widget.apply-style only writes the
+    #                                channels a Style defines, so every
+    #                                tab drawn after the pill keeps the
+    #                                pill's fill (t/66 renders this)
+    #   tab-focus-accent without a bg → the merge leaves the unfocused
+    #                                pill's fill in place and focus
+    #                                stops being visible at all
+    plan @NAMES.elems * 6;
+    for @NAMES -> $name {
+        my $t      = load($name);
+        my $selkie = $t.to-selkie;
+
+        is $selkie.tab-active.bg, $t.bg-surface,
+            "$name: the active pill is filled with bg-surface";
+        ok $selkie.tab-active.bold, "$name: the active tab is bold";
+        is $selkie.tab-inactive.bg, $t.bg-base,
+            "$name: inactive tabs state bg-base rather than inheriting";
+        is $selkie.tab-focus-accent.bg, $t.accent,
+            "$name: a focused pill is filled with the accent";
+        is $selkie.tab-focus-accent.fg, $t.bg-base,
+            "$name: and reverses the page colour out of it";
+        # Same pairing as `selection` — one focus/selection colour
+        # language across the app, not two that nearly match.
+        is visual-key($selkie.tab-focus-accent).substr(0, 13),
+           visual-key($selkie.selection).substr(0, 13),
+            "$name: the focused pill matches the selection colours";
+    }
+};
+
+subtest "text stays readable on the backgrounds we pair it with" => {
+    # Floors are set just under the measured minimum across all eleven
+    # palettes, so they catch a *new* palette (or an edited one) that
+    # drops below what the current set achieves — not so tight that a
+    # legitimate scheme trips them.
+    #
+    # Measured 2026-08-02 (WCAG contrast ratio, worst palette in
+    # brackets):
+    #   fg-base   on bg-base     min 4.75  (solarized)
+    #   fg-base   on bg-surface  min 4.11  (solarized)
+    #   fg-dim    on bg-surface  min 1.36  (nord)
+    #   fg-banner on bg-surface  min 4.86  (solarized)  ← unfocused pill
+    #   bg-base   on accent      min 4.08  (solarized)  ← focused pill
+    #
+    # The last two are the perspective strip's two pill states. They
+    # are label-on-fill pairs rather than text-on-page pairs, and the
+    # label is bold in both, so they are held to the AA body floor and
+    # the AA large floor respectively.
+    #
+    # Nord is the outlier and it is Nord's own doing: nord3 (#4C566A),
+    # the scheme's canonical comment colour, is famously dim and sits
+    # barely above polar-night-1. We keep the palette faithful and set
+    # the dim floor where it catches collapse (dim text drowning
+    # entirely in its surface) rather than where it would fail Nord.
+    my constant BASE-FLOOR    = 4.5;   # WCAG AA for body text
+    my constant SURFACE-FLOOR = 3.0;   # WCAG AA for large text
+    my constant DIM-FLOOR     = 1.3;
+
+    plan @NAMES.elems * 5;
+    for @NAMES -> $name {
+        my $t = load($name);
+        my $base    = contrast-ratio($t.fg-base, $t.bg-base);
+        my $surface = contrast-ratio($t.fg-base, $t.bg-surface);
+        my $dim     = contrast-ratio($t.fg-dim,  $t.bg-surface);
+        my $pill    = contrast-ratio($t.fg-banner, $t.bg-surface);
+        my $lit     = contrast-ratio($t.bg-base,   $t.accent);
+        cmp-ok $base, '>=', BASE-FLOOR,
+            "$name: fg-base on bg-base ({$base.round(0.01)})";
+        cmp-ok $surface, '>=', SURFACE-FLOOR,
+            "$name: fg-base on bg-surface ({$surface.round(0.01)})";
+        cmp-ok $dim, '>=', DIM-FLOOR,
+            "$name: fg-dim on bg-surface ({$dim.round(0.01)})";
+        cmp-ok $pill, '>=', BASE-FLOOR,
+            "$name: tab label on an unfocused pill ({$pill.round(0.01)})";
+        cmp-ok $lit, '>=', SURFACE-FLOOR,
+            "$name: tab label on a focused pill ({$lit.round(0.01)})";
+    }
+};
+
+subtest "blend" => {
+    plan 12;
+    my $T = App::Moneymoor::Theme;   # attribute-free: works on the type object
+
+    is $T.blend(0x123456, 0xFEDCBA, 0),   0x123456, 't = 0 returns the first colour';
+    is $T.blend(0x123456, 0xFEDCBA, 1),   0xFEDCBA, 't = 1 returns the second colour';
+    is $T.blend(0x000000, 0xFFFFFF, 0.5), 0x808080, 'midpoint of black and white';
+    is $T.blend(0xFF0000, 0x00FF00, 0.5), 0x808000, 'blends each channel independently';
+    is $T.blend(0x102030, 0x102030, 0.37), 0x102030, 'blending a colour with itself is identity';
+
+    is $T.blend(0x000000, 0xFFFFFF, -1),  0x000000, 'negative weight clamps to the first colour';
+    is $T.blend(0x000000, 0xFFFFFF, 2),   0xFFFFFF, 'weight above 1 clamps to the second colour';
+
+    # Rat(Real) coercion: literals, Nums and Ints all land.
+    is $T.blend(0x000000, 0xFFFFFF, 0.5e0), 0x808080, 'accepts a Num weight';
+    is $T.blend(0x000000, 0xFFFFFF, 1/4),   0x404040, 'accepts a fractional Rat weight';
+
+    # Monotonicity per channel — the property a gradient depends on.
+    my @reds = (0, 0.25, 0.5, 0.75, 1).map({ ($T.blend(0x000000, 0xFF0000, $_) +> 16) +& 0xFF });
+    # Parens matter: `ok [<=] @reds, 'msg'` reduces over the message too.
+    ok ([<=] @reds), 'channel value is monotonic in t';
+    is @reds[0], 0,   'ramp starts at 0';
+    is @reds[*-1], 255, 'ramp ends at 255';
+};
+
+subtest "banner-gradient" => {
+    plan @NAMES.elems * 4;
+    for @NAMES -> $name {
+        my $t     = load($name);
+        my @stops = $t.banner-gradient;
+        is @stops.elems, 2, "$name: two stops";
+        is @stops[0], $t.bg-banner, "$name: first stop is the flat banner background";
+        is @stops[1], App::Moneymoor::Theme.blend($t.bg-banner, $t.accent, 0.35),
+            "$name: second stop leans 35% toward the accent";
+        ok @stops.all ~~ (0 .. 0xFFFFFF), "$name: both stops are 24-bit colours";
+    }
+};
+
+subtest "flash-colour" => {
+    plan @NAMES.elems;
+    for @NAMES -> $name {
+        my $t = load($name);
+        is $t.flash-colour, $t.fg-green, "$name: flashes to the palette's green";
+    }
+};

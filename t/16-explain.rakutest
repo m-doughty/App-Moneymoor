@@ -1,0 +1,112 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+use App::Moneymoor::Util::Money;
+
+plan 5;
+
+# One month of realistic card use, hand-computed:
+#
+#   assigned to Groceries          400.00
+#   assigned to Dining              80.00
+#   card shop (Groceries)          -72.50   covered  72.50
+#   card dinner (Dining)          -120.00   covered  80.00  (40.00 over)
+#   card refund (Groceries)         12.00   released 12.00
+#   statement paid from current   -140.50
+#
+#   Visa payment envelope = 72.50 + 80.00 - 12.00 - 140.50 = -0.00
+sub scenario(--> Facts) {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 200000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.assign('2026-03-01', DINING, 8000);
+    $f.spend(account => VISA, date => '2026-03-08', amount => 7250,
+             category => GROCERIES);
+    $f.spend(account => VISA, date => '2026-03-15', amount => 12000,
+             category => DINING);
+    $f.refund(account => VISA, date => '2026-03-22', amount => 1200,
+              category => GROCERIES);
+    $f.transfer(from => CURRENT, to => VISA, date => '2026-03-28',
+                amount => 14050);
+    $f;
+}
+
+subtest 'the scenario derives the numbers the comment claims' => {
+    plan 6;
+    my $view = scenario().compute;
+    is $view.category('2026-03-01', GROCERIES).available, 33950,
+        'Groceries: 400.00 - 72.50 + 12.00 = 339.50';
+    is $view.category('2026-03-01', DINING).available, -4000,
+        'Dining: 80.00 - 120.00, overspent';
+    is $view.category('2026-03-01', DINING).credit-overspend, 4000,
+        'all of it on the card';
+    is $view.category('2026-03-01', VISA-PAY).available, 0,
+        'and the statement payment emptied the payment envelope exactly';
+    is $view.account-balance(VISA).working, -4000,
+        'leaving the card owing the uncovered 40.00';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'the move log explains the payment envelope end to end' => {
+    plan 5;
+    my $view = scenario().compute;
+    my @moves = $view.moves-for('2026-03-01', category-id => VISA-PAY);
+    is @moves.elems, 3, 'three derived moves touch the payment envelope';
+
+    # available = assigned + activity + moved-in - moved-out, and for
+    # this envelope assigned is zero, so the move log plus the
+    # statement payment IS the balance.
+    my Int $in  = @moves.grep({ .to-category-id == VISA-PAY })
+                        .map(*.amount).sum;
+    my Int $out = @moves.grep({ .from-category-id == VISA-PAY })
+                        .map(*.amount).sum;
+    is $in, 15250, 'coverage in: 72.50 + 80.00';
+    is $out, 1200, 'release out: the 12.00 refund';
+
+    my $envelope = $view.category('2026-03-01', VISA-PAY);
+    is $envelope.moved-in - $envelope.moved-out, $in - $out,
+        'which is exactly what the derivation applied';
+    is $envelope.carry-in + $envelope.assigned + $envelope.activity
+        + $envelope.moved-in - $envelope.moved-out,
+        $envelope.available,
+        'and the row adds up: rule 1, with the derived moves included';
+};
+
+subtest 'each move names its cause, its card and its transaction' => {
+    plan 4;
+    my $view = scenario().compute;
+    my @moves = $view.moves-for('2026-03-01', category-id => VISA-PAY);
+
+    is @moves.grep({ .cause eq 'card-coverage' }).elems, 2,
+        'two coverage moves';
+    is @moves.grep({ .cause eq 'card-refund' }).elems, 1,
+        'one refund release';
+    ok @moves.grep({ !.account-id.defined }).elems == 0,
+        'every move names the card that caused it';
+    ok @moves.grep({ !.transaction-id.defined }).elems == 0,
+        'and the transaction';
+};
+
+subtest 'moves-for narrows to one category, or to the whole month' => {
+    plan 4;
+    my $view = scenario().compute;
+    is $view.moves-for('2026-03-01').elems, 3, 'the whole month';
+    is $view.moves-for('2026-03-01', category-id => GROCERIES).elems, 2,
+        'Groceries: one coverage out, one refund in';
+    is $view.moves-for('2026-03-01', category-id => DINING).elems, 1,
+        'Dining: only the partial coverage';
+    is $view.moves-for('2026-04-01').elems, 0,
+        'a month with no card activity has no moves';
+};
+
+subtest 'a move renders as a readable line' => {
+    plan 2;
+    my $view = scenario().compute;
+    my $first = $view.moves-for('2026-03-01')[0];
+    like $first.Str, /'2026-03-01'/, 'the line names the month';
+    like $first.Str, / $(format-pence($first.amount)) /,
+        'and the amount, formatted as money';
+};

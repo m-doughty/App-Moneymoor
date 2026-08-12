@@ -1,0 +1,591 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Service::Target;
+use App::Moneymoor::Util::Money;
+use App::Moneymoor::Util::Period;
+
+# The pure target suite: no database, no clock, no widgets. Facts in
+# through BudgetFixtures, a derived view out of `compute`, and every
+# assertion here is about what App::Moneymoor::Service::Target makes of
+# it.
+#
+# The by-period sections run under more than one period scheme, because
+# the derivation is written in periods and not in months: the counting
+# is `periods-through`'s, so a plan under monthly/14 must produce the
+# same schedule as the same plan under monthly/1, only keyed
+# differently. A scheme-specific milestone would be a bug that only a
+# user paid on the 14th ever saw.
+
+plan 16;
+
+my constant TAX-GOAL = 5_000_000;    # £50,000
+my constant VAT-GOAL =   300_000;    # £3,000
+
+#| A date well inside a period under every scheme below, so that each
+#| one's `period-of` lands somewhere sensible.
+my constant SEED = '2026-08-20';
+
+my @schemes =
+    %( name => 'monthly/1',
+       scheme => App::Moneymoor::Util::Period.default-scheme ),
+    %( name => 'monthly/14',
+       scheme => App::Moneymoor::Util::Period.monthly(anchor-day => 14) );
+
+#| The repeat sections add a weekly scheme: cycles are counted in
+#| periods, and "every 3" under a fortnightly budget has to mean three
+#| fortnights and not a quarter.
+my @repeat-schemes = |@schemes,
+    %( name => 'weekly/2',
+       scheme => App::Moneymoor::Util::Period.weekly(
+           weeks => 2, anchor => '2026-08-14') );
+
+#| C<$n> consecutive period keys, starting with the period containing
+#| C<$seed>. Every fixture below is written against these rather than
+#| against literal dates, which is what makes it scheme-generic.
+sub run-of(App::Moneymoor::Util::Period:D $scheme, Str:D $seed,
+           Int:D $n --> Array) {
+    my Str @keys = $scheme.period-of($seed);
+    @keys.push($scheme.next-period(@keys[*-1])) for ^($n - 1);
+    @keys.Array;
+}
+
+#| The £50,000 tax pot: a nine-period plan over C<@p>, stamped in the
+#| first of them, with its goal in the last.
+sub tax-of(@p, *%extra --> App::Moneymoor::Model::Category) {
+    App::Moneymoor::Model::Category.new(
+        id            => GROCERIES,
+        name          => 'Tax',
+        target-pence  => TAX-GOAL,
+        target-kind   => 'by_period',
+        target-period => @p[8],
+        target-start  => @p[0],
+        |%extra,
+    );
+}
+
+#| The quarterly VAT pot: three periods to the first bill, repeating
+#| every three periods after that.
+sub vat-of(@q, *%extra --> App::Moneymoor::Model::Category) {
+    App::Moneymoor::Model::Category.new(
+        id            => GROCERIES,
+        name          => 'VAT',
+        target-pence  => VAT-GOAL,
+        target-kind   => 'by_period',
+        target-period => @q[2],
+        target-start  => @q[0],
+        target-repeat => 3,
+        |%extra,
+    );
+}
+
+#| Facts with money in the bank at C<@p[0]>, so every period exists in
+#| the view and Ready to Assign is never the thing under test.
+sub funded-facts(@p --> Facts) {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => @p[0], amount => 20_000_000);
+    $f;
+}
+
+# --- the two kinds that need no schedule ----------------------------
+
+subtest 'no target is nothing to fund' => {
+    plan 5;
+    my @p = run-of(@schemes[0]<scheme>, SEED, 2);
+    my $scheme = @schemes[0]<scheme>;
+    my $f = funded-facts(@p);
+    my $view = $f.compute(through-period => @p[1], :$scheme);
+
+    my $none = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Groceries');
+    is target-ask($view, $scheme, $none, @p[0]), 0,
+        'an envelope with no target asks for nothing';
+    is target-milestone($view, $scheme, $none, @p[0]), 0,
+        'and shows no figure';
+    is describe-target($none, $scheme), '', 'and has no caption';
+    is-deeply target-cycle($scheme, $none, @p[0]), %(),
+        'and is in no cycle';
+
+    # A category that has never been inserted has nothing to look up,
+    # and the answer is a number rather than an exception: these are
+    # called from render paths.
+    my $unsaved = App::Moneymoor::Model::Category.new(
+        name => 'Unsaved', target-pence => 40000);
+    is target-ask($view, $scheme, $unsaved, @p[0]), 0,
+        'nor does a category with no id';
+};
+
+subtest 'refill measures available, exactly as v0.1 did' => {
+    plan 5;
+    my $scheme = @schemes[0]<scheme>;
+    my @p = run-of($scheme, SEED, 2);
+    my $refill = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Groceries', target-pence => 40000);
+
+    my $f = funded-facts(@p);
+    my $view = $f.compute(through-period => @p[1], :$scheme);
+    is target-ask($view, $scheme, $refill, @p[0]), 40000,
+        'an empty envelope asks for the whole level';
+
+    $f.assign(@p[0], GROCERIES, 40000);
+    $view = $f.compute(through-period => @p[1], :$scheme);
+    is target-ask($view, $scheme, $refill, @p[0]), 0, 'funded, it asks nothing';
+
+    # Carry-in satisfies a refill target — that is the whole point of
+    # the kind, and the whole reason the other two exist.
+    is target-ask($view, $scheme, $refill, @p[1]), 0,
+        'and the next period asks nothing either, because the money is '
+            ~ 'still there';
+
+    $f.spend(account => CURRENT, date => @p[1], amount => 15000,
+             category => GROCERIES);
+    $view = $f.compute(through-period => @p[1], :$scheme);
+    is target-ask($view, $scheme, $refill, @p[1]), 15000,
+        'spending it down is what opens the ask';
+    is target-milestone($view, $scheme, $refill, @p[1]), 40000,
+        'and the figure shown is the level itself';
+};
+
+subtest 'set-aside measures what you put in, not what is there' => {
+    plan 7;
+    my $scheme = @schemes[0]<scheme>;
+    my @p = run-of($scheme, SEED, 3);
+    my $fund = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Christmas', target-pence => 10000,
+        target-kind => 'set_aside');
+
+    my $f = funded-facts(@p);
+    $f.assign(@p[0], GROCERIES, 10000);
+    my $view = $f.compute(through-period => @p[2], :$scheme);
+    is target-ask($view, $scheme, $fund, @p[0]), 0,
+        'met exactly at the amount assigned';
+
+    # The failure refill has with an accumulating fund: last period's
+    # money is still in the envelope, and it must not silence this one.
+    is target-ask($view, $scheme, $fund, @p[1]), 10000,
+        'carry-in does not satisfy it — next period wants its own £100';
+
+    $f.assign(@p[1], GROCERIES, 4000);
+    $view = $f.compute(through-period => @p[2], :$scheme);
+    is target-ask($view, $scheme, $fund, @p[1]), 6000,
+        'a part payment leaves the rest of it';
+
+    # A refund is money coming back, not money saved.
+    $f.refund(account => CURRENT, date => @p[1], amount => 6000,
+              category => GROCERIES);
+    $view = $f.compute(through-period => @p[2], :$scheme);
+    is target-ask($view, $scheme, $fund, @p[1]), 6000,
+        'a refund into the envelope does not count as saving';
+
+    # Pulling this period's money back out undoes the contribution,
+    # because `assigned` is a signed sum for the period.
+    $f.assign(@p[1], GROCERIES, -2000);
+    $f.assign(@p[1], DINING, 6000);
+    $view = $f.compute(through-period => @p[2], :$scheme);
+    is target-ask($view, $scheme, $fund, @p[1]), 12000,
+        'pulling money back out re-opens the ask, past the target';
+    ok target-ask($view, $scheme, $fund, @p[1]) > 10000,
+        'and a negative assignment asks for more than the target, '
+            ~ 'because you are further from the plan than you started';
+
+    is target-milestone($view, $scheme, $fund, @p[1]), 10000,
+        'the figure shown is the per-period amount';
+};
+
+# --- the by-period schedule -----------------------------------------
+
+subtest 'by-period: a straight line to the goal' => {
+    plan 3 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 9);
+        my $view = funded-facts(@p).compute(through-period => @p[8], :$scheme);
+        my $tax = tax-of(@p);
+
+        my @asks = @p.map({ target-ask($view, $scheme, $tax, $_) });
+        is-deeply @asks, [555555, 1111111, 1666666, 2222222, 2777777,
+                          3333333, 3888888, 4444444, 5000000],
+            "$name: an empty pot is asked for each milestone in turn";
+
+        # 5,000,000 over nine periods is £5,555.55 a period, and nine of
+        # those is £49,999.95. The plan still ends on the number the
+        # user typed.
+        isnt @asks[0] * 9, TAX-GOAL,
+            "$name: the per-period step does not divide the goal";
+        is @asks[8], TAX-GOAL,
+            "$name: and the last milestone is exactly the goal anyway";
+    }
+};
+
+subtest 'by-period: before the plan starts, nothing is asked' => {
+    plan 2 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 9);
+        my $view = funded-facts(@p).compute(through-period => @p[8], :$scheme);
+        my $tax = tax-of(@p);
+        my Str $before = $scheme.prev-period(@p[0]);
+
+        is target-ask($view, $scheme, $tax, $before), 0,
+            "$name: the period before the stamp asks nothing";
+        is-deeply target-cycle($scheme, $tax, $before), %(),
+            "$name: and is in no cycle";
+    }
+};
+
+subtest 'by-period: getting ahead makes later periods ask less' => {
+    plan 3 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 9);
+        my $f = funded-facts(@p);
+        $f.assign(@p[0], GROCERIES, 1_000_000);      # £10,000 up front
+        my $view = $f.compute(through-period => @p[8], :$scheme);
+        my $tax = tax-of(@p);
+
+        is target-ask($view, $scheme, $tax, @p[0]), 0,
+            "$name: the first period is past its milestone already";
+        is target-ask($view, $scheme, $tax, @p[1]), 111111,
+            "$name: and the second asks only for the distance to the line";
+        is target-ask($view, $scheme, $tax, @p[8]), 4_000_000,
+            "$name: the goal period still asks for the rest of the goal";
+    }
+};
+
+subtest 'by-period: a raid reappears at once, and stays' => {
+    plan 4 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 9);
+        my $f = funded-facts(@p);
+        # Exactly on plan at the fifth period's milestone.
+        $f.assign(@p[0], GROCERIES, 2_777_777);
+        my $view = $f.compute(through-period => @p[8], :$scheme);
+        my $tax = tax-of(@p);
+        is target-ask($view, $scheme, $tax, @p[4]), 0,
+            "$name: on plan, nothing is asked";
+
+        # The boiler: £5,000 moved out to another envelope, mid-plan.
+        # This is `move-money` in fact form — one assignment down, the
+        # other up.
+        $f.assign(@p[4], GROCERIES, -500_000);
+        $f.assign(@p[4], DINING, 500_000);
+        $view = $f.compute(through-period => @p[8], :$scheme);
+
+        is target-ask($view, $scheme, $tax, @p[4]), 500_000,
+            "$name: the gap reappears in that very period, unspread";
+        is target-ask($view, $scheme, $tax, @p[5]), 1_055_556,
+            "$name: and persists, growing with the next milestone";
+        is target-ask($view, $scheme, $tax, @p[8]), 2_722_223,
+            "$name: the goal period asks for whatever is still missing";
+    }
+};
+
+subtest 'by-period: a raid by spending reads the same as a raid by move' => {
+    plan 2;
+    my $scheme = @schemes[0]<scheme>;
+    my @p = run-of($scheme, SEED, 9);
+    my $f = funded-facts(@p);
+    $f.assign(@p[0], GROCERIES, 2_777_777);
+    my $tax = tax-of(@p);
+
+    my $view = $f.compute(through-period => @p[8], :$scheme);
+    is target-ask($view, $scheme, $tax, @p[4]), 0, 'on plan, nothing asked';
+
+    $f.spend(account => CURRENT, date => @p[4], amount => 500_000,
+             category => GROCERIES);
+    $view = $f.compute(through-period => @p[8], :$scheme);
+    is target-ask($view, $scheme, $tax, @p[4]), 500_000,
+        'catch-up fires on a spend too — it is the pot being emptied '
+            ~ 'that matters, not how';
+};
+
+subtest 'by-period: the base is the carry-in, and it is derived' => {
+    plan 4 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 9);
+        my Str $before = $scheme.prev-period(@p[0]);
+
+        # £20,000 already saved before the plan was stamped.
+        my $f = funded-facts(@p);
+        $f.assign($before, GROCERIES, 2_000_000);
+        my $view = $f.compute(through-period => @p[8], :$scheme);
+        my $tax = tax-of(@p);
+
+        is target-milestone($view, $scheme, $tax, @p[0]), 2_333_333,
+            "$name: a pre-funded pot ramps from what is in it";
+        is target-ask($view, $scheme, $tax, @p[0]), 333_333,
+            "$name: so it is asked only for the remaining gap";
+
+        # Retroactive history edit: the base is read out of the view
+        # every time, never snapshotted, so the whole schedule
+        # re-derives.
+        $f.assign($before, GROCERIES, 1_000_000);
+        $view = $f.compute(through-period => @p[8], :$scheme);
+        is target-milestone($view, $scheme, $tax, @p[0]), 1_444_444,
+            "$name: correcting the history re-derives the schedule";
+        is target-ask($view, $scheme, $tax, @p[8]), 4_000_000,
+            "$name: and the goal is still the goal";
+    }
+};
+
+subtest 'by-period: a pot already over its goal never asks' => {
+    plan 3 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 9);
+        my Str $before = $scheme.prev-period(@p[0]);
+
+        my $f = funded-facts(@p);
+        $f.assign($before, GROCERIES, 6_000_000);     # £60,000 for a
+        my $view = $f.compute(through-period => @p[8], :$scheme);
+        my $tax = tax-of(@p);                         # £50,000 goal
+
+        my @asks = @p.map({ target-ask($view, $scheme, $tax, $_) });
+        is-deeply @asks, [0 xx 9],
+            "$name: N - base is negative, and nothing is ever asked";
+
+        my @milestones = @p.map({ target-milestone($view, $scheme, $tax, $_) });
+        is @milestones.grep(* > TAX-GOAL).elems, 0,
+            "$name: no milestone above the goal";
+        is @milestones[0], TAX-GOAL,
+            "$name: the milestone is clamped to the goal, not to the base";
+    }
+};
+
+subtest 'by-period: past the goal, and a goal already past' => {
+    plan 6 * @schemes.elems;
+    for @schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @p = run-of($scheme, SEED, 11);
+        my $f = funded-facts(@p);
+        $f.assign(@p[0], GROCERIES, TAX-GOAL);        # funded in full
+        my $tax = tax-of(@p);                          # goal at @p[8]
+        my $view = $f.compute(through-period => @p[10], :$scheme);
+
+        is target-ask($view, $scheme, $tax, @p[9]), 0,
+            "$name: past the goal, a full pot asks nothing";
+        is target-milestone($view, $scheme, $tax, @p[9]), TAX-GOAL,
+            "$name: the milestone stays at the goal for ever after";
+        is-deeply target-cycle($scheme, $tax, @p[9]), %(),
+            "$name: with no cycle to be in";
+
+        # A one-shot target past its goal is refill-to-N: spend the pot
+        # and it asks for it back, in full, at once. No outflow credit
+        # — that belongs to the goal period alone.
+        $f.spend(account => CURRENT, date => @p[9], amount => 1_000_000,
+                 category => GROCERIES);
+        $view = $f.compute(through-period => @p[10], :$scheme);
+        is target-ask($view, $scheme, $tax, @p[9]), 1_000_000,
+            "$name: and spending from it asks for it back — refill to N";
+
+        # A goal that was already in the past when the plan was
+        # stamped: no ramp to compute, so the milestone is the goal
+        # from the stamp onwards.
+        my $late = tax-of(@p, target-period => @p[0], target-start => @p[3]);
+        is target-ask($view, $scheme, $late, @p[9]), 1_000_000,
+            "$name: a goal stamped after it was due asks for the whole gap";
+        is target-ask($view, $scheme, $late, @p[2]), 0,
+            "$name: but still asks nothing before the stamp";
+    }
+};
+
+# --- repeating goals ------------------------------------------------
+
+subtest 'repeating: the cycles tile the periods after the first goal' => {
+    plan 5 * @repeat-schemes.elems;
+    for @repeat-schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @q = run-of($scheme, SEED, 8);
+        my $vat = vat-of(@q);
+
+        my %first = target-cycle($scheme, $vat, @q[0]);
+        is-deeply %first, %( start => @q[0], goal => @q[2],
+                             index => 1, of => 3 ),
+            "$name: the first period is 1 of 3, ending on the goal";
+        is-deeply target-cycle($scheme, $vat, @q[2]),
+                  %( start => @q[0], goal => @q[2], index => 3, of => 3 ),
+            "$name: the goal period is the last of its cycle";
+        is-deeply target-cycle($scheme, $vat, @q[3]),
+                  %( start => @q[3], goal => @q[5], index => 1, of => 3 ),
+            "$name: the next period opens the next cycle";
+        is target-cycle($scheme, $vat, @q[7])<index>, 2,
+            "$name: two cycles on, the index still counts from the cycle";
+        is target-cycle($scheme, $vat, @q[7])<start>, @q[6],
+            "$name: and the cycle starts one period after the last goal";
+    }
+};
+
+subtest 'repeating: paying the bill in the goal period is not a raid' => {
+    plan 6 * @repeat-schemes.elems;
+    for @repeat-schemes -> %s {
+        my ($scheme, $name) = %s<scheme>, %s<name>;
+        my @q = run-of($scheme, SEED, 8);
+        my $vat = vat-of(@q);
+        my $f = funded-facts(@q);
+        $f.assign(@q[$_], GROCERIES, 100_000) for ^3;    # on plan
+
+        my $view = $f.compute(through-period => @q[7], :$scheme);
+        is target-ask($view, $scheme, $vat, @q[2]), 0,
+            "$name: fully saved, the goal period asks nothing";
+
+        # The bill, paid in the goal period. Available drops to zero
+        # and the pot has done its job.
+        $f.spend(account => CURRENT, date => @q[2], amount => VAT-GOAL,
+                 category => GROCERIES);
+        $view = $f.compute(through-period => @q[7], :$scheme);
+        is target-ask($view, $scheme, $vat, @q[2]), 0,
+            "$name: paying it leaves the ask at zero for the rest of "
+                ~ "the period";
+        is $view.category(@q[2], GROCERIES).available, 0,
+            "$name: even though the envelope is empty";
+
+        # The next cycle re-derives its base from the carry-in, which
+        # is what is left after the bill.
+        is target-ask($view, $scheme, $vat, @q[3]), 100_000,
+            "$name: and the next cycle ramps again from nothing";
+
+        # The same spend in a period that is not the goal period is a
+        # raid, and catch-up fires.
+        my $g = funded-facts(@q);
+        $g.assign(@q[$_], GROCERIES, 100_000) for ^3;
+        $g.spend(account => CURRENT, date => @q[1], amount => VAT-GOAL,
+                 category => GROCERIES);
+        my $raided = $g.compute(through-period => @q[7], :$scheme);
+        is target-ask($raided, $scheme, $vat, @q[1]), 300_000,
+            "$name: the same spend one period early reads as a raid";
+        ok target-ask($raided, $scheme, $vat, @q[1])
+            > target-milestone($raided, $scheme, $vat, @q[1]),
+            "$name: asking for more than the milestone, because the pot "
+                ~ "is empty and the milestone is not";
+    }
+};
+
+subtest 'repeating: leftovers, shortfalls and net outflow' => {
+    plan 4;
+    my $scheme = @schemes[0]<scheme>;
+    my @q = run-of($scheme, SEED, 8);
+    my $vat = vat-of(@q);
+
+    # Over-saved: £4,500 in, £3,000 out, so £1,500 carries into the
+    # next cycle and becomes its base.
+    my $f = funded-facts(@q);
+    $f.assign(@q[$_], GROCERIES, 150_000) for ^3;
+    $f.spend(account => CURRENT, date => @q[2], amount => VAT-GOAL,
+             category => GROCERIES);
+    my $view = $f.compute(through-period => @q[7], :$scheme);
+    is $view.category(@q[3], GROCERIES).carry-in, 150_000,
+        'what is left after the bill carries into the next cycle';
+    is target-milestone($view, $scheme, $vat, @q[3]), 200_000,
+        'and is the base the next ramp starts from';
+    is target-ask($view, $scheme, $vat, @q[3]), 50_000,
+        'so only the remaining gap is asked for';
+
+    # Net outflow, not gross: a payment refunded in the same goal
+    # period did not leave, so the ask is exactly what it would have
+    # been had neither happened.
+    my $g = funded-facts(@q);
+    $g.assign(@q[$_], GROCERIES, 100_000) for ^2;      # £2,000 saved
+    $g.spend(account => CURRENT, date => @q[2], amount => 100_000,
+             category => GROCERIES);
+    $g.refund(account => CURRENT, date => @q[2], amount => 100_000,
+              category => GROCERIES);
+    my $netted = $g.compute(through-period => @q[7], :$scheme);
+    is target-ask($netted, $scheme, $vat, @q[2]), 100_000,
+        'a spend refunded in the goal period credits nothing — the '
+            ~ 'outflow is the net one';
+};
+
+# --- captions and figures -------------------------------------------
+
+subtest 'the captions say what the target is' => {
+    plan 8;
+    my $scheme = @schemes[0]<scheme>;
+    LEAVE set-money-locale;
+
+    my $refill = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Groceries', target-pence => 40000);
+    is describe-target($refill, $scheme), 'Refill to £400.00 each period',
+        'refill names the level';
+
+    my $aside = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Christmas', target-pence => 10000,
+        target-kind => 'set_aside');
+    is describe-target($aside, $scheme), 'Set aside £100.00 each period',
+        'set-aside names the per-period amount';
+
+    my @p = run-of($scheme, SEED, 9);
+    my $tax = tax-of(@p);
+    is describe-target($tax, $scheme), '£50,000.00 by April 2027',
+        'by-period names the goal and the period it is due in';
+
+    is describe-target(tax-of(@p, target-repeat => 3), $scheme),
+        '£50,000.00 by April 2027 · every 3 periods',
+        'a repeating goal says how often';
+    is describe-target(tax-of(@p, target-repeat => 1), $scheme),
+        '£50,000.00 by April 2027 · every period',
+        'and drops the count in the singular';
+
+    # The goal is named by its PERIOD, so the same plan reads
+    # differently under a scheme whose windows are not months — which
+    # is the point of storing a date and resolving it late.
+    my $payday = App::Moneymoor::Util::Period.monthly(anchor-day => 14);
+    is describe-target($tax, $payday), '£50,000.00 by 14 Mar – 13 Apr 2027',
+        'under a payday scheme it names the payday window';
+
+    set-money-locale(symbol => '€', decimal-mark => ',');
+    is describe-target($refill, $scheme), 'Refill to €400,00 each period',
+        'the caption follows the display locale';
+    set-money-locale;
+
+    is describe-target(App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Broken', target-pence => 50000,
+        target-kind => 'by_period'), $scheme), '',
+        'a by-period target with no goal date has nothing to say';
+};
+
+subtest 'nothing here throws, whatever it is handed' => {
+    plan 6;
+    my $scheme = @schemes[0]<scheme>;
+    my @p = run-of($scheme, SEED, 2);
+    my $view = funded-facts(@p).compute(through-period => @p[1], :$scheme);
+
+    # Gateway::Category refuses to write any of these; a hand-edited
+    # budget file is what they guard, and a render path is where the
+    # answer is wanted.
+    my $no-stamp = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Tax', target-pence => TAX-GOAL,
+        target-kind => 'by_period', target-period => '2027-04-05');
+    is target-ask($view, $scheme, $no-stamp, @p[0]), 0,
+        'a by-period target with no stamped start derives nothing';
+
+    my $rubbish = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Tax', target-pence => TAX-GOAL,
+        target-kind => 'by_period', target-period => '2027-02-30',
+        target-start => @p[0]);
+    is target-ask($view, $scheme, $rubbish, @p[0]), 0,
+        'nor does one whose goal is not a real date';
+
+    my $unknown = App::Moneymoor::Model::Category.new(
+        id => GROCERIES, name => 'Tax', target-pence => 40000,
+        target-kind => 'sideways');
+    is target-ask($view, $scheme, $unknown, @p[0]), 40000,
+        'an unrecognised kind reads as refill, the shape a row that '
+            ~ 'lost its kind meant';
+
+    my $tax = tax-of(run-of($scheme, SEED, 9));
+    is target-ask($view, $scheme, $tax, 'not-a-date'), 0,
+        'a malformed viewed period answers zero rather than throwing';
+    is target-ask($view, $scheme, $tax, '2999-01-01'), TAX-GOAL,
+        'and a period far beyond the view is simply an empty envelope';
+
+    # A viewed period that is not a period start is read as the period
+    # containing it, exactly as the stored dates are.
+    is target-ask($view, $scheme, $tax, SEED),
+        target-ask($view, $scheme, $tax, @p[0]),
+        'and a date inside a period answers for that period';
+};

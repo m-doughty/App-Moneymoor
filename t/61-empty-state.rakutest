@@ -1,0 +1,51 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::View::EmptyState;
+
+# Pure copy lookup for the budget table / register / reports / sidebar
+# "nothing here yet" state — no store, no theme, no widget.
+
+my constant @STATES = <budget register reports sidebar>;
+
+plan 4;
+
+subtest "every state returns 1-2 non-empty lines" => {
+    plan @STATES.elems * 2;
+    for @STATES -> $s {
+        my @lines = empty-state-for($s);
+        ok 1 <= @lines.elems <= 2, "$s: 1-2 lines";
+        ok @lines.all.chars > 0, "$s: no blank lines";
+    }
+};
+
+subtest "the agreed copy table, verbatim" => {
+    plan @STATES.elems;
+
+    is-deeply empty-state-for('budget').List,
+        ('No envelopes yet — n to create one',), "budget";
+    is-deeply empty-state-for('register').List,
+        ('No transactions — n to add one',), "register";
+    is-deeply empty-state-for('reports').List,
+        ('No spending to show yet',), "reports";
+    is-deeply empty-state-for('sidebar').List,
+        ('No accounts yet', 'n to add your first account'), "sidebar";
+};
+
+subtest "unknown states fall back to the generic message" => {
+    plan 2;
+    is-deeply empty-state-for('made-up').List, ('nothing here',),
+        "a state name that doesn't exist";
+    is-deeply empty-state-for('').List, ('nothing here',),
+        "empty string";
+};
+
+subtest "icons default cleanly and don't affect any current state" => {
+    plan @STATES.elems;
+    my $nerd = icons('nerd');
+    for @STATES -> $s {
+        is-deeply empty-state-for($s, :icons($nerd)), empty-state-for($s),
+            "$s: no state reads from the icon tier today";
+    }
+};

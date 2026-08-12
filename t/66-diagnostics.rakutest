@@ -1,0 +1,171 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+
+use App::Moneymoor::Themes;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The diagnostics dialog (Ctrl+G) is the only place the derivation's
+# own complaints reach a human. Two of the four things it prints —
+# `warnings` and `invariant-errors` — should be empty on any budget
+# written through the gateways, so the copy that appears when they
+# aren't has to be unmissable and has to say what it means. That copy
+# is never exercised in normal use, which is exactly why it is worth a
+# test: a silent regression here shows up only in the bug report that
+# never gets filed.
+#
+# `diagnostic-spans` reads three things off the screen (theme, cached
+# view, viewed period), so a three-field stand-in is enough and no
+# terminal is involved. The views come from BudgetFixtures — pure
+# facts, no database, no clock.
+#
+# The dialog prints RAW period keys, not the caption a scheme composes:
+# it is the thing somebody pastes into a bug report, and "August 2026"
+# does not say which bucket a figure landed in.
+
+plan 6;
+
+my constant PERIOD = '2026-03-01';
+
+my class FakeMain {
+    has $.theme;
+    has $.view;
+    has Str $.viewed-period;
+}
+
+sub spans-for($view, Str $period = PERIOD --> List) {
+    App::Moneymoor::Screen::Main::Modals::diagnostic-spans(
+        FakeMain.new(
+            theme         => App::Moneymoor::Themes::load('gruvbox'),
+            view          => $view,
+            viewed-period => $period,
+        ),
+    );
+}
+
+sub text-of(@spans --> Str) { @spans.map(*.text).join }
+
+# A clean budget: money in, money assigned, money spent, nothing the
+# derivation can't account for.
+sub clean-view() {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => PERIOD, amount => 180000);
+    $f.assign(PERIOD, GROCERIES, 40000);
+    $f.spend(account => CURRENT, date => '2026-03-14',
+             amount => 7250, category => GROCERIES);
+    $f.compute(through-period => PERIOD);
+}
+
+# A budget with a fact the derivation cannot make sense of: a
+# transaction whose date isn't a date. The gateways make this
+# impossible; the fixture builder deliberately doesn't validate, which
+# is how the warning path gets exercised at all.
+sub warned-view() {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => PERIOD, amount => 180000);
+    $f.txn(account => CURRENT, date => 'not-a-date', amount => -5000,
+           parts => [(GROCERIES) => -5000]);
+    $f.compute(through-period => PERIOD);
+}
+
+subtest "a clean budget reports clean, in as many words" => {
+    plan 6;
+    my $text = text-of(spans-for(clean-view()));
+
+    ok $text.contains('Warnings: none'),
+        "warnings say 'none' rather than printing nothing";
+    ok $text.contains('Invariant errors: none'),
+        "and so do invariant errors";
+    nok $text.contains('indicates a bug'),
+        "no bug warning on a healthy budget";
+    ok $text.contains('Period  ' ~ PERIOD), "the viewed period is named";
+    # The range line: raw start keys, and however many buckets the
+    # derivation actually produced between them.
+    ok $text.contains('Periods 1 (' ~ PERIOD ~ ' … ' ~ PERIOD ~ ')'),
+        "the derived range is listed by its raw period keys";
+    ok $text.contains('Digest  '), "and the digest is there for a bug report";
+};
+
+subtest "the digest line is a fingerprint, not the serialisation" => {
+    plan 5;
+    my $view = clean-view();
+    my $text = text-of(spans-for($view));
+    my $fp = App::Moneymoor::Screen::Main::Modals::digest-fingerprint(
+        $view.canonical-digest);
+
+    ok $text.contains($fp), "the fingerprint is printed";
+    is $fp.chars, 16, "16 hex digits";
+    ok $fp ~~ /^ <[0..9a..f]> ** 16 $/, "lowercase hex only";
+
+    # `canonical-digest` is the whole derivation — every balance the
+    # user owns, on hundreds of lines. Pasting that into a public issue
+    # is exactly what the fingerprint exists to avoid.
+    nok $text.contains($view.canonical-digest),
+        "the raw serialisation is NOT in the dialog";
+
+    # Same state, same fingerprint — which is the only property a bug
+    # report needs from it.
+    my $again = clean-view();
+    is App::Moneymoor::Screen::Main::Modals::digest-fingerprint(
+           $again.canonical-digest),
+       $fp,
+       "an identical budget fingerprints identically";
+};
+
+subtest "a warning is red, counted, and labelled as a bug" => {
+    plan 5;
+    my $view  = warned-view();
+    my @spans = spans-for($view);
+    my $text  = text-of(@spans);
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+
+    ok $view.warnings.elems > 0,
+        "the fixture really did produce a warning (guards the test itself)";
+    ok $text.contains("Warnings ({$view.warnings.elems})"),
+        "the heading carries the count";
+    ok $text.contains('this indicates a bug'),
+        "and says outright that this is abnormal";
+    ok $text.contains($view.warnings[0]),
+        "the warning text itself is printed, not just a count";
+
+    my @red = @spans.grep({ .style.defined && .style.fg == $theme.fg-red });
+    ok @red.elems > 0, "painted in the palette's red";
+};
+
+subtest "the flags line reports the viewed period's flags" => {
+    plan 2;
+    # Overspend the Groceries envelope: nothing assigned, money spent,
+    # so the period picks up a cash-overspend flag.
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => PERIOD, amount => 180000);
+    $f.spend(account => CURRENT, date => '2026-03-14',
+             amount => 5000, category => GROCERIES);
+    my $view = $f.compute(through-period => PERIOD);
+
+    my $text = text-of(spans-for($view));
+    ok $view.period(PERIOD).flags.elems > 0,
+        "the fixture really did raise a flag";
+    ok $text.contains($view.period(PERIOD).flags[0]),
+        "and the dialog names it";
+};
+
+subtest "a period outside the derived range degrades honestly" => {
+    plan 2;
+    # Navigating back before the first fact is an ordinary thing to do,
+    # and `view.period` answers with a type object there. The dialog has
+    # to survive it — a throw inside a modal build takes the app down.
+    my $text = text-of(spans-for(clean-view(), '1999-01-01'));
+    ok $text.contains('Period  1999-01-01'), "the period is still named";
+    ok $text.contains('Flags   (none)'),
+        "and its absent flags read as '(none)', not as a crash";
+};
+
+subtest "no view yet says so instead of printing Nils" => {
+    plan 2;
+    my $text = text-of(spans-for(Any));
+    is $text, 'No budget computed yet.',
+        "the pre-first-recompute window has its own line";
+    nok $text.contains('Nil'), "and no type objects leak into the copy";
+};

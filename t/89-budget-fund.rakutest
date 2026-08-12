@@ -1,0 +1,798 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Border;
+use Selkie::Widget::Select;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::BudgetRow;
+use App::Moneymoor::View::HintBar;
+use App::Moneymoor::Screen::Budget;
+use App::Moneymoor::Screen::Main::Modals;
+
+# Monthly targets, from the keypress to the pence in the file.
+#
+# Two features share this file because they share their whole
+# semantics: `f` (fund every underfunded envelope) and the assign
+# field's `=n` / `=` are the same sentence — "make this envelope's
+# AVAILABLE equal that" — said about a period and about one row. Both
+# are adjustments by a difference, never sets, and the difference is
+# where every interesting bug would live.
+#
+# What is real here: the database (a fresh SQLCipher file per
+# scenario), the workspace, the derivation, the store, the budget
+# tab, its keybinds and its subscriptions. Only Screen::Main is faked,
+# with t/86's stand-in plus its modal seam.
+#
+# A fresh file per scenario rather than one shared one, because
+# fund-all is a statement about EVERY envelope in the budget: an
+# envelope left behind by a previous subtest is not stray data, it is
+# a different question being asked.
+#
+# The period is pinned and no expectation below reads the clock.
+
+plan 14;
+
+my constant PERIOD = '2026-03-01';
+
+# The by-period fixtures below stamp their own plan start through the
+# gateway rather than through Service::Workspace.set-target, which
+# stamps `current-period` — the one clock read in the distribution.
+# A schedule pinned to January is a schedule this file can write
+# literals against; one stamped today would ask for a different figure
+# every month.
+my constant PLAN-START = '2026-01-01';
+my constant PLAN-GOAL  = '2026-05-31';   # a date inside the May period
+
+my @dbs;
+my @db-paths;
+LEAVE {
+    .disconnect for @dbs.grep(*.is-connected);
+    for @db-paths -> $path { unlink $path if $path.IO.e }
+}
+
+# --- The stand-in screen ---------------------------------------------
+
+my class FakeApp {
+    has @.toasts;
+    method toast(Str:D $message --> Nil) { @!toasts.push($message); Nil }
+}
+
+my class FakeMain {
+    has $.app is required;
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.content-host is required;
+    has $.view is rw;
+    has $.budget-tab is rw;
+    has %.categories-by-id;
+    has %.groups-by-id;
+    has @.mounted;
+    has @.modals;               # what with-modal was handed
+    has Int $.rebuilds is rw = 0;
+
+    method icons() { icons() }
+    method current-tab(--> Str) { 'budget' }
+    method viewed-period(--> Str) {
+        ($!store.get-in('app', 'period') // PERIOD).Str;
+    }
+    method category(Int $id) { $id.defined ?? %!categories-by-id{$id} !! Nil }
+    method group(Int $id)    { $id.defined ?? %!groups-by-id{$id}     !! Nil }
+    method categories(--> List) { %!categories-by-id.values.List }
+    method groups(--> List)     { %!groups-by-id.values.List }
+    method rebuild-content(--> Nil) { $!rebuilds++; Nil }
+
+    method set-view($view --> Nil) {
+        $!view = $view;
+        %!categories-by-id = $!workspace.categories.find-all(:include-hidden)
+                                .map({ .id => $_ }).Hash;
+        %!groups-by-id = $!workspace.categories.find-groups(:include-hidden)
+                             .map({ .id => $_ }).Hash;
+        Nil
+    }
+
+    method pane-border(Str:D $title, $sizing --> Selkie::Widget::Border) {
+        Selkie::Widget::Border.new(:$sizing, :$title, padding => 1);
+    }
+
+    method mount-pane($parent, Selkie::Widget::Border $border,
+                      $pane, Str:D $context --> Nil) {
+        $border.set-content($pane);
+        $parent.add($border);
+        $border.set-store($!store);
+        @!mounted.push($pane => $context);
+        Nil
+    }
+
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { body($emitted) };
+    }
+}
+
+#|( A budget of its own, seeded by C<&seed> and then mounted: fresh
+    file, fresh workspace, fresh store, a built and keybound tab.
+
+    C<&seed> is handed the workspace and the three rows every scenario
+    wants (a cash account, a group, and the Ready-to-Assign row) and
+    returns a Hash of whatever else it made, which is merged into the
+    context so a subtest can name its envelopes. )
+sub budget(&seed --> Hash) {
+    my Str $db-path =
+        $*TMPDIR.add("moneymoor-budget-fund-{$*PID}-{@db-paths.elems}.db").Str;
+    @db-paths.push($db-path);
+    my $db = App::Moneymoor::DB.new(:$db-path);
+    $db.connect('testpass');
+    @dbs.push($db);
+
+    my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+    my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Current', type => 'cash'));
+    my $bills = $ws.categories.create-group(
+        App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                                 sort-order => 1));
+    my $rta = $ws.categories.rta-category;
+    my %extra = seed($ws, $current, $bills, $rta);
+
+    my $host  = Selkie::Layout::VBox.new(sizing => Sizing.flex);
+    my $store = mock-store;
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+    $host.set-theme($theme.to-selkie);
+    my $app   = FakeApp.new;
+    my $main  = FakeMain.new(
+        :$app, :$store, workspace => $ws, content-host => $host, :$theme,
+    );
+    my @toasts;
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        on-view   => -> $v { $main.set-view($v) },
+        toast     => -> Str $m { @toasts.push($m) },
+    ).register($store);
+    $host.set-store($store);
+
+    my $tab = App::Moneymoor::Screen::Budget.new(main => $main);
+    $tab.build($host);
+    $tab.install-subscriptions;
+    $tab.install-keybinds;
+    $main.budget-tab = $tab;
+
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PERIOD);
+    %( :$ws, :$current, :$bills, :$rta, :$tab, :$main, :$store, :$app,
+       :@toasts, |%extra );
+}
+
+#| Money into Ready to Assign, so there is something to fund with.
+sub fund-the-budget($ws, $current, $rta, Int:D $amount --> Nil) {
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-01',
+            amount => $amount),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $rta.id, amount => $amount)],
+    );
+    Nil
+}
+
+#| A standard envelope in the scenario's group. Hiding is done after
+#| the fact, through the gateway, because that is how the app does it.
+sub envelope($ws, $bills, Str:D $name, Int:D :$sort-order,
+             Int :$target-pence = 0) {
+    $ws.categories.create(App::Moneymoor::Model::Category.new(
+        :$name, group-id => $bills.id, :$sort-order, :$target-pence));
+}
+
+#| An envelope with a target of a kind the `envelope` helper cannot
+#| express, written through the gateway's narrow target write.
+sub kinded($ws, $bills, Str:D $name, Int:D :$sort-order, Str:D :$kind,
+           Int:D :$pence, Str :$period, Str :$start, Int :$repeat = 0) {
+    my $c = envelope($ws, $bills, $name, :$sort-order);
+    $ws.categories.set-target($c.id, :$kind, :$pence, :$period, :$start,
+                              :$repeat);
+    $ws.categories.find-by-id($c.id);
+}
+
+#| Every string a modal paints, joined — the copy the user reads.
+sub copy-of($modal --> Str) {
+    my @texts;
+    my @queue = $modal.content;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @texts.push($w.text) if $w.can('text');
+        @texts.append($w.spans.map(*.text)) if $w.can('spans');
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @texts.join(' ');
+}
+
+#| The one text field in a dialog that has exactly one.
+sub input-of($modal) {
+    my @queue = $modal.content;
+    my $found;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        if $w ~~ Selkie::Widget::TextInput {
+            $found = $w;
+            @queue = ();
+        } else {
+            @queue.append($w.children) if $w.can('children');
+            @queue.push($w.content) if $w.can('content') && $w.content.defined;
+        }
+    }
+    $found;
+}
+
+#| The dialog's error line: the last flex Text at the top of its
+#| content, which is where every refusal in these modals lands.
+sub status($modal --> Str) {
+    my @texts = $modal.content.children.grep({ $_ ~~ Selkie::Widget::Text });
+    (@texts.tail andthen .text) // '';
+}
+
+#| Put the grid's cursor on a row and let the selection subscription run.
+sub cursor-onto(%m, &matching --> Bool) {
+    my $idx = %m<tab>.table.rows.first(&matching, :k);
+    return False without $idx;
+    %m<tab>.table.select-index($idx.UInt);
+    %m<store>.tick;
+    True;
+}
+
+sub cursor-onto-envelope(%m, $category --> Bool) {
+    cursor-onto(%m, { $_<kind> eq 'category' && $_<id> == $category.id });
+}
+
+#| Open the assign dialog on the selected row, type C<$text>, press
+#| Enter. Returns the modal, so the caller can read its error line.
+sub type-assign(%m, Str:D $text) {
+    press-key(%m<tab>.table, 'a');
+    my $modal = %m<main>.modals.tail;
+    my $input = input-of($modal);
+    $input.set-text($text);
+    $input.set-focused(True);
+    press-key($input, 'enter');
+    $input.set-focused(False);
+    %m<store>.tick;
+    $modal;
+}
+
+sub assigned-now(%m, $category --> Int) {
+    %m<ws>.assignments.amount-for(PERIOD, $category.id);
+}
+
+sub available-now(%m, $category --> Int) {
+    %m<main>.view.category(PERIOD, $category.id).available;
+}
+
+sub rev(%m --> Int) { (state-at(%m<store>, 'ws', 'rev') // 0).Int }
+
+#| The detail rail's text. The rail is the second child of the HBox the
+#| grid is mounted in — the one widget in the tab that is not behind
+#| `mount-pane`, because Screen::Budget adds it itself.
+sub rail-text(%m --> Str) {
+    my $rail = %m<tab>.table.parent.parent.children[1];
+    ($rail andthen $rail.content.spans.map(*.text).join) // '';
+}
+
+#| Open the editor on the selected row, fill in the target fields the
+#| kind reads, and save. Returns the modal.
+sub edit-target(%m, Str:D :$amount!, Int :$kind-index) {
+    press-key(%m<tab>.table, 'e');
+    my $editor = %m<main>.modals.tail;
+    my %field;
+    for $editor.content.children -> $child {
+        next unless $child.can('children');
+        my @kids = $child.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %field{ @kids[0].text } = @kids[1];
+    }
+    with $kind-index {
+        my @selects = $editor.content.children.grep(
+            { $_ ~~ Selkie::Widget::Select });
+        @selects[1].select-index($_.UInt);
+    }
+    %field<Target>.set-text($amount);
+    %field<Target>.set-focused(True);
+    press-key(%field<Target>, 'enter');
+    %field<Target>.set-focused(False);
+    %m<store>.tick;
+    $editor;
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'f funds every underfunded envelope, and only those' => {
+    plan 12;
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 200000);
+        my %e =
+            short   => envelope($ws, $bills, 'Groceries',
+                                sort-order => 1, target-pence => 40000),
+            exact   => envelope($ws, $bills, 'Rent',
+                                sort-order => 2, target-pence => 75000),
+            empty   => envelope($ws, $bills, 'Dining Out',
+                                sort-order => 3, target-pence => 8000),
+            no-goal => envelope($ws, $bills, 'Fun Money', sort-order => 4),
+            over    => envelope($ws, $bills, 'Splurge',
+                                sort-order => 5, target-pence => 5000),
+            retired => envelope($ws, $bills, 'Old Gym',
+                                sort-order => 6, target-pence => 10000);
+        $ws.set-assigned(PERIOD, %e<short>.id,   15000);
+        $ws.set-assigned(PERIOD, %e<exact>.id,   75000);
+        $ws.set-assigned(PERIOD, %e<no-goal>.id,  5000);
+        $ws.set-assigned(PERIOD, %e<over>.id,    12000);
+        $ws.categories.hide(%e<retired>.id);
+        %e;
+    });
+
+    # The cursor starts on a group header, which is the point: `f` is
+    # about the period, not about the row under the cursor.
+    is %m<tab>.table.selected-row<kind>, 'group',
+        'the cursor is on a header, where a per-row key would refuse';
+
+    my Int $before = rev(%m);
+    press-key(%m<tab>.table, 'f');
+    is %m<main>.modals.elems, 1, 'f asks first';
+
+    my Str $copy = copy-of(%m<main>.modals[0]);
+    ok $copy.contains('Groceries') && $copy.contains('+£250.00'),
+        'the underfunded envelope is listed with what it would take';
+    ok $copy.contains('Dining Out') && $copy.contains('+£80.00'),
+        'and so is the one with nothing in it at all';
+    ok $copy.contains('£330.00'), 'with a total under them';
+
+    # Four exclusions, each of them a ruling: already on target, no
+    # target at all, over target (fund-all only ever adds), and hidden
+    # (a retired envelope is not part of this period's plan).
+    # Full names, not fragments: the dialog's own heading is "Fund 2
+    # envelopes to target", so a bare 'Fun' would match the copy that
+    # is supposed to prove 'Fun Money' is absent.
+    my @excluded = 'Rent', 'Fun Money', 'Splurge', 'Old Gym';
+    is @excluded.grep({ $copy.contains($_) }).join(', '), '',
+        'nothing already funded, untargeted, over target or hidden is listed';
+
+    press-key(%m<main>.modals[0], 'enter');
+    %m<store>.tick;
+
+    is rev(%m), $before + 1,
+        'one write, one recompute — not one per envelope';
+    is assigned-now(%m, %m<short>), 40000, 'the short envelope reached target';
+    is assigned-now(%m, %m<empty>), 8000,  'so did the empty one';
+    is assigned-now(%m, %m<over>), 12000,
+        'the over-target envelope was not pulled back down';
+    is assigned-now(%m, %m<retired>), 0, 'and the hidden one was left alone';
+    ok %m<app>.toasts.tail.contains('Funded 2 envelopes')
+       && %m<app>.toasts.tail.contains('£330.00'),
+        'the toast says how many and how much';
+};
+
+subtest 'a budget already on plan is told, not asked' => {
+    plan 4;
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 100000);
+        my $rent = envelope($ws, $bills, 'Rent',
+                            sort-order => 1, target-pence => 50000);
+        $ws.set-assigned(PERIOD, $rent.id, 50000);
+        %( :$rent );
+    });
+
+    my Int $before = rev(%m);
+    press-key(%m<tab>.table, 'f');
+    is %m<main>.modals.elems, 0,
+        'no modal — its only possible answer would be "do nothing"';
+    ok %m<app>.toasts.tail.contains('All targets funded'),
+        'a toast says so instead';
+    is rev(%m), $before, 'and nothing was written';
+    is assigned-now(%m, %m<rent>), 50000, 'the envelope is untouched';
+};
+
+subtest 'a budget with no targets at all has nothing to fund' => {
+    plan 2;
+    # The same path as "already funded", reached the other way — an
+    # envelope with no target must never be swept up by `f`.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 100000);
+        %( plain => envelope($ws, $bills, 'Odds and Ends', sort-order => 1) );
+    });
+
+    press-key(%m<tab>.table, 'f');
+    is %m<main>.modals.elems, 0, 'nothing opens';
+    is assigned-now(%m, %m<plain>), 0, 'and nothing is assigned';
+};
+
+subtest 'overspending Ready to Assign is stated in words, then allowed' => {
+    plan 6;
+    # £100 in, £500 of target. YNAB-style: this is a real step on the
+    # way to a plan (the money is coming), so the app must be
+    # unmistakable about it rather than forbid it.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 10000);
+        %( car => envelope($ws, $bills, 'Car Insurance',
+                           sort-order => 1, target-pence => 50000) );
+    });
+
+    press-key(%m<tab>.table, 'f');
+    my $modal = %m<main>.modals[0];
+    my Str $copy = copy-of($modal);
+    ok $copy.contains('overspends Ready to Assign'),
+        'the modal says plainly what it is about to do';
+    ok $copy.contains('£400.00'), 'and by how much';
+    ok $copy.contains('-£400.00'),
+        'showing the resulting Ready to Assign, not just the shortfall';
+
+    press-key($modal, 'enter');
+    %m<store>.tick;
+    is assigned-now(%m, %m<car>), 50000,
+        'confirming still applies the whole thing';
+    is %m<main>.view.rta(PERIOD), -40000,
+        'and Ready to Assign is negative, exactly as the modal said';
+    ok %m<app>.toasts.tail.contains('Funded 1 envelope'),
+        'singular, because there was one of them';
+};
+
+subtest 'the assign field: =n funds to a figure' => {
+    plan 6;
+    # £150 assigned, £25 spent ⇒ £125 available. `=450` is an
+    # adjustment by 325, not a set to 450: setting ASSIGNED to 450
+    # would leave 425 available and not what was typed.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 200000);
+        my $groceries = envelope($ws, $bills, 'Groceries', sort-order => 1);
+        $ws.set-assigned(PERIOD, $groceries.id, 15000);
+        $ws.transactions.create(
+            App::Moneymoor::Model::Transaction.new(
+                account-id => $current.id, date => '2026-03-08',
+                amount => -2500),
+            splits => [App::Moneymoor::Model::Split.new(
+                category-id => $groceries.id, amount => -2500)],
+        );
+        %( :$groceries );
+    });
+
+    ok cursor-onto-envelope(%m, %m<groceries>), 'the cursor is on it';
+    is available-now(%m, %m<groceries>), 12500, 'with £125 available';
+
+    my Int $before = rev(%m);
+    type-assign(%m, '=450');
+
+    is available-now(%m, %m<groceries>), 45000, 'available is now £450';
+    is assigned-now(%m, %m<groceries>), 47500,
+        'reached by adjusting assigned by the difference, not by setting it';
+    is rev(%m), $before + 1, 'one write';
+    ok %m<app>.toasts.tail.contains('Funded Groceries to £450.00')
+       && %m<app>.toasts.tail.contains('+£325.00'),
+        'and the toast carries both the destination and the signed delta';
+};
+
+subtest 'the assign field: a bare = funds to the target' => {
+    plan 6;
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 200000);
+        my $rent = envelope($ws, $bills, 'Rent',
+                            sort-order => 1, target-pence => 75000);
+        my $loose = envelope($ws, $bills, 'Odds and Ends', sort-order => 2);
+        $ws.set-assigned(PERIOD, $rent.id, 20000);
+        $ws.set-assigned(PERIOD, $loose.id, 3000);
+        %( :$rent, :$loose );
+    });
+
+    ok cursor-onto-envelope(%m, %m<rent>), 'the cursor is on the targeted one';
+    type-assign(%m, '=');
+    is available-now(%m, %m<rent>), 75000, '= takes it to its target';
+    is assigned-now(%m, %m<rent>), 75000, 'through an adjustment';
+
+    # No target, and the dialog must stay open on its own error line
+    # rather than close over a request it cannot answer.
+    ok cursor-onto-envelope(%m, %m<loose>), 'onto the untargeted one';
+    my Int $before = rev(%m);
+    my $modal = type-assign(%m, '=');
+    ok status($modal).contains('No target set'),
+        'the dialog says so on its error line';
+    is rev(%m), $before, 'and dispatches nothing at all';
+};
+
+subtest 'a system envelope is refused = with advice it can take' => {
+    plan 3;
+    # A payment envelope has no target and its editor has no Target
+    # field, so "edit the envelope to add one" would be advice the
+    # engine will never let the user follow.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 100000);
+        my $card = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+            name => 'Visa', type => 'credit'));
+        %( payment => $ws.accounts.payment-category-for($card.id) );
+    });
+
+    ok cursor-onto-envelope(%m, %m<payment>),
+        'the cursor is on the card\'s payment envelope';
+    my $modal = type-assign(%m, '=');
+    ok status($modal).contains('belongs to the engine'),
+        'the refusal says why, not "go and set one"';
+
+    # '=n' is still perfectly legal there: funding a card payment
+    # envelope to a figure is an ordinary thing to do.
+    type-assign(%m, '=250');
+    is available-now(%m, %m<payment>), 25000, 'but =n still works on it';
+};
+
+subtest 'a fund-to that is already there writes nothing' => {
+    plan 5;
+    # The no-op upsert is the point: it would be a no-op in the file
+    # and anything but a no-op in the app, bumping ws/rev and
+    # re-deriving the whole budget to announce that nothing changed.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 200000);
+        my $rent = envelope($ws, $bills, 'Rent',
+                            sort-order => 1, target-pence => 40000);
+        $ws.set-assigned(PERIOD, $rent.id, 40000);
+        %( :$rent );
+    });
+
+    ok cursor-onto-envelope(%m, %m<rent>), 'the cursor is on it';
+    my Int $before = rev(%m);
+    type-assign(%m, '=400');
+    is rev(%m), $before, 'no recompute';
+    is assigned-now(%m, %m<rent>), 40000, 'and no write';
+    ok %m<app>.toasts.tail.contains('already at £400.00'),
+        'the user is told why nothing happened';
+
+    # The bare form resolves to the same figure and so takes the same
+    # path — the zero-delta guard lives after the resolution, not
+    # inside the '=n' branch alone.
+    my Int $again = rev(%m);
+    type-assign(%m, '=');
+    is rev(%m), $again, 'a bare = on a met target is a no-op too';
+};
+
+subtest 'a saved target repaints the grid it changed' => {
+    plan 5;
+    # The trap this pins: a target moves no money, so the derivation's
+    # digest is byte-identical before and after saving one. Only the
+    # catalogue token can see it — and if it could not, the Target
+    # column would keep the old figure until something unrelated
+    # happened to repaint the grid.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 100000);
+        %( rent => envelope($ws, $bills, 'Rent', sort-order => 1) );
+    });
+
+    my sub target-cell-now(--> Str) {
+        my $row = %m<tab>.table.rows.first(
+            { $_<kind> eq 'category' && $_<id> == %m<rent>.id });
+        ($row andthen $row<target>) // '';
+    }
+
+    is target-cell-now().trim, '', 'the column starts blank';
+    my Str $digest-before = (state-at(%m<store>, 'budget', 'digest') // '').Str;
+    my Str $token-before  = (state-at(%m<store>, 'budget', 'catalogue') // '').Str;
+
+    ok cursor-onto-envelope(%m, %m<rent>), 'the cursor is on the envelope';
+    press-key(%m<tab>.table, 'e');
+    my $editor = %m<main>.modals.tail;
+    my %field;
+    for $editor.content.children -> $child {
+        next unless $child.can('children');
+        my @kids = $child.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %field{ @kids[0].text } = @kids[1];
+    }
+    %field<Target>.set-text('750');
+    %field<Target>.set-focused(True);
+    press-key(%field<Target>, 'enter');
+    %field<Target>.set-focused(False);
+    %m<store>.tick;
+
+    is (state-at(%m<store>, 'budget', 'digest') // '').Str, $digest-before,
+        'the derivation is byte-identical — a target moves no money';
+    isnt (state-at(%m<store>, 'budget', 'catalogue') // '').Str, $token-before,
+        'so the catalogue token is what has to move, and does';
+    is target-cell-now(), money-cell(75000, TARGET-COLS),
+        'and the grid is repainted with the new figure';
+};
+
+subtest 'f funds a mixed budget by each envelope\'s own plan' => {
+    plan 11;
+    # One of each kind, each underfunded in its own sense, and the
+    # sense is the point: a refill measures available, a set-aside
+    # measures THIS PERIOD's assignments, and a goal measures its
+    # milestone. Christmas is deliberately carrying £50 in from
+    # February, so a refill-shaped reading of it would ask for £10
+    # instead of £60 — the bug this kind exists to fix.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 400000);
+        my %e =
+            rent => envelope($ws, $bills, 'Rent',
+                             sort-order => 1, target-pence => 75000),
+            xmas => kinded($ws, $bills, 'Christmas', sort-order => 2,
+                           kind => 'set_aside', pence => 10000),
+            tax  => kinded($ws, $bills, 'Tax', sort-order => 3,
+                           kind => 'by_period', pence => 500000,
+                           period => PLAN-GOAL, start => PLAN-START);
+        $ws.set-assigned(PERIOD, %e<rent>.id, 20000);
+        $ws.set-assigned('2026-02-01', %e<xmas>.id, 5000);
+        $ws.set-assigned(PERIOD, %e<xmas>.id, 4000);
+        $ws.set-assigned(PERIOD, %e<tax>.id, 100000);
+        %e;
+    });
+
+    is available-now(%m, %m<xmas>), 9000,
+        'the set-aside is carrying £50 in and has had £40 this period';
+
+    # March is the third of the five periods from January to May, so
+    # the plan wants three fifths of £5,000 by now — which is what the
+    # grid's Target column shows for it, and not the £5,000 goal.
+    my $tax-row = %m<tab>.table.rows.first(
+        { $_<kind> eq 'category' && $_<id> == %m<tax>.id });
+    is $tax-row<target>, money-cell(300000, TARGET-COLS),
+        'the grid shows the goal\'s milestone, not its total';
+
+    my Int $before = rev(%m);
+    press-key(%m<tab>.table, 'f');
+    my Str $copy = copy-of(%m<main>.modals[0]);
+
+    ok $copy.contains('Rent') && $copy.contains('+£550.00')
+       && $copy.contains('(to £750.00)'),
+        'the refill asks for the gap to its level';
+    ok $copy.contains('Christmas') && $copy.contains('+£60.00')
+       && $copy.contains('(to £100.00)'),
+        'the set-aside asks for the rest of this period\'s contribution';
+    ok $copy.contains('Tax') && $copy.contains('+£2,000.00')
+       && $copy.contains('(to £3,000.00)'),
+        'and the goal asks for the gap to its milestone';
+    nok $copy.contains('£5,000.00'),
+        'the £5,000 goal is nowhere in the list — that is the rail\'s story';
+    ok $copy.contains('£2,610.00'), 'with the three asks totalled';
+
+    press-key(%m<main>.modals[0], 'enter');
+    %m<store>.tick;
+
+    is rev(%m), $before + 1, 'one write for the three of them';
+    is assigned-now(%m, %m<rent>), 75000, 'the refill reached its level';
+    is assigned-now(%m, %m<xmas>), 10000,
+        'the set-aside got this period\'s £100 in full, carry-in notwithstanding';
+    is assigned-now(%m, %m<tax>), 300000, 'and the goal reached its milestone';
+};
+
+subtest 'a bare = adjusts by the ask, whatever the kind' => {
+    plan 8;
+    # `=` used to be "fund to the target", which is only the same
+    # question as "fund this period's plan" for a refill. Both of these
+    # envelopes would move by the wrong amount under the old reading.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 400000);
+        my %e =
+            xmas => kinded($ws, $bills, 'Christmas', sort-order => 1,
+                           kind => 'set_aside', pence => 10000),
+            tax  => kinded($ws, $bills, 'Tax', sort-order => 2,
+                           kind => 'by_period', pence => 500000,
+                           period => PLAN-GOAL, start => PLAN-START);
+        $ws.set-assigned('2026-02-01', %e<xmas>.id, 5000);
+        $ws.set-assigned(PERIOD, %e<xmas>.id, 4000);
+        $ws.set-assigned(PERIOD, %e<tax>.id, 100000);
+        %e;
+    });
+
+    ok cursor-onto-envelope(%m, %m<xmas>), 'the cursor is on the set-aside';
+    type-assign(%m, '=');
+    is assigned-now(%m, %m<xmas>), 10000,
+        'it moved by the ask — £60, not the £10 a fund-to would have found';
+    ok %m<app>.toasts.tail.contains('+£60.00')
+       && %m<app>.toasts.tail.contains('target £100.00'),
+        'and the toast names the adjustment and what it funds';
+
+    ok cursor-onto-envelope(%m, %m<tax>), 'onto the goal';
+    type-assign(%m, '=');
+    is available-now(%m, %m<tax>), 300000,
+        'which lands exactly on this period\'s milestone';
+    ok %m<app>.toasts.tail.contains('target £3,000.00'),
+        'named as the milestone, not as the £5,000 goal';
+
+    # Already on plan: the same no-write path a zero-delta fund-to
+    # takes, and for the same reason.
+    my Int $before = rev(%m);
+    type-assign(%m, '=');
+    is rev(%m), $before, 'a second = writes nothing at all';
+    ok %m<app>.toasts.tail.contains('already funded to its target'),
+        'and says why';
+};
+
+subtest 'a saved target repaints the rail beside the grid' => {
+    plan 6;
+    # The pre-existing bug this pins: the rail's subscription was keyed
+    # on the derivation's digest and the cursor, and a target moves no
+    # money — so saving one repainted the grid and left the rail showing
+    # the old block until the selection happened to move.
+    my %m = budget(-> $ws, $current, $bills, $rta {
+        fund-the-budget($ws, $current, $rta, 100000);
+        %( rent => envelope($ws, $bills, 'Rent', sort-order => 1) );
+    });
+
+    ok cursor-onto-envelope(%m, %m<rent>), 'the cursor is on the envelope';
+    nok rail-text(%m).contains('Target'),
+        'which has no target, so the rail has no target block';
+
+    edit-target(%m, amount => '750');
+    ok rail-text(%m).contains('£750.00'),
+        'saving one paints the block without the cursor having moved';
+    is state-at(%m<store>, 'budget', 'selected-category-id'), %m<rent>.id,
+        'and the selection is exactly where it was';
+
+    # A kind change at the SAME pence: the grid's figure does not move
+    # (a set-aside's figure is its own amount), so the token is the only
+    # thing that can carry the change to the screen — and the rail is
+    # where the change is visible.
+    my Str $token-before = (state-at(%m<store>, 'budget', 'catalogue') // '').Str;
+    edit-target(%m, amount => '750', kind-index => 1);
+    isnt (state-at(%m<store>, 'budget', 'catalogue') // '').Str, $token-before,
+        'a kind change at the same amount still moves the catalogue token';
+    ok rail-text(%m).contains('/period'),
+        'and the rail says the same figure means something else now';
+};
+
+subtest 'the confirm copy, at the boundary either side of zero' => {
+    plan 6;
+    # Spending every last penny is the goal state of this method, not a
+    # warning — so the copy is asserted directly at `after == 0`, which
+    # end-to-end scenarios reach only by accident.
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+    my @one = %( id => 1, name => 'Rent', target => 75000,
+                 available => 25000, delta => 50000 ),;
+
+    my Str $exact = App::Moneymoor::Screen::Main::Modals::fund-all-spans(
+        @one, total => 50000, rta => 50000, after => 0, :$theme,
+    ).map(*.text).join;
+    nok $exact.contains('overspends'),
+        'spending the last penny is the goal, not a warning';
+    ok $exact.contains('Fund 1 envelope to target'),
+        'singular, and it says what it is about to do';
+    ok $exact.contains('+£500.00') && $exact.contains('(to £750.00)'),
+        'each line carries the delta and where it lands';
+
+    my Str $over = App::Moneymoor::Screen::Main::Modals::fund-all-spans(
+        @one, total => 50000, rta => 49999, after => -1, :$theme,
+    ).map(*.text).join;
+    ok $over.contains('overspends Ready to Assign'),
+        'one penny past it, and the warning is there';
+    ok $over.contains('£0.01'), 'stating the amount, however small';
+
+    # The warning is styled, not just worded: a red line the user's eye
+    # lands on before they read it.
+    my @spans = App::Moneymoor::Screen::Main::Modals::fund-all-spans(
+        @one, total => 50000, rta => 49999, after => -1, :$theme,
+    );
+    is @spans.first({ .text.contains('overspends') }).style.fg,
+        $theme.fg-red, 'in the palette\'s red';
+};
+
+subtest 'the footer advertises f, and only where it is bound' => {
+    plan 2;
+    my @budget = hint-groups('budget');
+    is @budget.first({ $_.key eq 'f' }).value, 'fund',
+        'the budget footer carries f';
+    # t/69 reconciles the whole table against the binds; this is the
+    # one pair that has to stay true for the key added here.
+    ok 'lib/App/Moneymoor/Screen/Budget.rakumod'.IO.slurp
+        .contains("on-key: 'f'"),
+        'and the grid binds it';
+};

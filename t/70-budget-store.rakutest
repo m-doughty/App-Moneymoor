@@ -1,0 +1,336 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Test::Store;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The budget tab's half of the store: the grid's cursor, its collapse
+# set, and the second change token the grid needs because the
+# derivation's digest cannot see a category's name.
+#
+# Plus the assign field end to end — parsed by the modal's own pure
+# function, applied through the one mutation effect, against a real
+# SQLCipher file. A hand-built fixture cannot fail the way a gateway
+# fails, and the failure path (the digest must NOT move) is the half of
+# this that matters.
+#
+# Every period is derived from PINNED-PERIOD; nothing here reads the
+# clock.
+
+plan 8;
+
+my constant PINNED-PERIOD = '2026-03-01';
+my constant NEXT-PERIOD   = '2026-04-01';
+
+my $db-path = $*TMPDIR.add("moneymoor-budget-store-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Dining Out', group-id => $bills.id, sort-order => 2));
+my $rta = $ws.categories.rta-category;
+
+# £1,000 in, so there is something to assign and the derivation has a
+# reason to range over the pinned period at all.
+$ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => '2026-03-01',
+        amount => 100000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 100000)],
+);
+
+sub fixture(--> Hash) {
+    my @toasts;
+    my @views;
+    my $handlers = App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        toast     => -> Str $m { @toasts.push($m) },
+        on-view   => -> $v { @views.push($v) },
+    );
+    my $store = mock-store;
+    $handlers.register($store);
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PINNED-PERIOD);
+    { :$store, :$handlers, :@toasts, :@views };
+}
+
+# The set/adjust half of what the Assign modal's submit body does,
+# minus the widgets: parse with the shared pure function, then send the
+# matching gateway call through the one mutation effect.
+#
+# Deliberately only those two modes. The field also takes '=n' and '=',
+# which resolve against the envelope's available and its target — facts
+# this store-level helper has no business knowing — so those are driven
+# through the real dialog in t/89 instead. A `=` reaching here would be
+# a test asking the wrong question, so it is refused rather than
+# silently treated as a set.
+sub type-assign($store, Str:D $text, Int:D $category-id --> Bool) {
+    my $parsed = App::Moneymoor::Screen::Main::Modals::parse-assign-input($text);
+    if $parsed ~~ Failure {
+        $parsed.so;
+        return False;
+    }
+    my Str $mode = $parsed<mode>;
+    die "type-assign handles set/adjust only; '$text' is $mode — see t/89"
+        unless $mode eq 'set' | 'adjust';
+    my Int $amount = $parsed<amount>;
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $mode eq 'adjust'
+            ?? $ws.assignments.adjust(PINNED-PERIOD, $category-id, $amount)
+            !! $ws.set-assigned(PINNED-PERIOD, $category-id, $amount)
+    });
+    True;
+}
+
+sub assigned-now(Int:D $id --> Int) {
+    $ws.assignments.amount-for(PINNED-PERIOD, $id);
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'budget/select-category carries the grid\'s cursor' => {
+    plan 3;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    dispatch-and-tick($store, 'budget/select-category',
+                      category-id => $groceries.id);
+    is state-at($store, 'budget', 'selected-category-id'), $groceries.id,
+        'the selected envelope reaches the store';
+
+    dispatch-and-tick($store, 'budget/select-category',
+                      category-id => $dining.id);
+    is state-at($store, 'budget', 'selected-category-id'), $dining.id,
+        'and moving the cursor replaces it';
+
+    # A group header is not a category, and the rail has to be able to
+    # say so — a stale id left behind would have it describing a row
+    # the cursor has left.
+    dispatch-and-tick($store, 'budget/select-category', category-id => Int);
+    nok state-at($store, 'budget', 'selected-category-id').defined,
+        'a header row clears the selection rather than keeping the last one';
+};
+
+subtest 'budget/toggle-group folds and unfolds' => {
+    plan 5;
+    my %f = fixture();
+    my $store = %f<store>;
+    my Str $key = $bills.id.Str;
+
+    is-deeply state-at($store, 'budget', 'collapsed-groups'), %(),
+        'everything starts open';
+
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => $bills.id);
+    ok state-at($store, 'budget', 'collapsed-groups'){$key},
+        'one press folds it';
+
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => $bills.id);
+    nok state-at($store, 'budget', 'collapsed-groups'){$key},
+        'the next unfolds it';
+    is-deeply state-at($store, 'budget', 'collapsed-groups'), %(),
+        'and leaves no residue behind — an unfolded group is absent, '
+            ~ 'not present-and-false';
+
+    # The ungrouped bucket collapses through the same path, on the
+    # synthetic id 0.
+    dispatch-and-tick($store, 'budget/toggle-group', group-id => 0);
+    ok state-at($store, 'budget', 'collapsed-groups'){'0'},
+        'including the ungrouped bucket';
+};
+
+subtest 'the catalogue token sees what the digest cannot' => {
+    plan 10;
+    my %f = fixture();
+    my $store = %f<store>;
+    my $digest-before    = state-at($store, 'budget', 'digest');
+    my $catalogue-before = state-at($store, 'budget', 'catalogue');
+
+    ok $catalogue-before.chars > 0, 'the bootstrap seeds it';
+
+    # A brand-new envelope has no money and no history, so the
+    # derivation omits it entirely — this is precisely the change the
+    # digest cannot see, and precisely the change the grid must repaint
+    # for.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.categories.create(App::Moneymoor::Model::Category.new(
+            name => 'Car Tax', group-id => $bills.id, sort-order => 3));
+    });
+    is state-at($store, 'budget', 'digest'), $digest-before,
+        'creating an empty envelope leaves the derivation byte-identical';
+    isnt state-at($store, 'budget', 'catalogue'), $catalogue-before,
+        'but the catalogue token moves, so the grid repaints';
+
+    # Renaming is the same story.
+    my $car-tax = $ws.categories.find-by-name('Car Tax');
+    my $catalogue-created = state-at($store, 'budget', 'catalogue');
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.categories.update(App::Moneymoor::Model::Category.new(
+            id => $car-tax.id, group-id => $car-tax.group-id,
+            name => 'Vehicle Tax', kind => $car-tax.kind,
+            sort-order => $car-tax.sort-order));
+    });
+    is state-at($store, 'budget', 'digest'), $digest-before,
+        'renaming does not touch the derivation either';
+    isnt state-at($store, 'budget', 'catalogue'), $catalogue-created,
+        'and the token moves again';
+
+    # And it is a content token, not a counter: an identical catalogue
+    # must produce an identical string, or every recompute would
+    # rebuild every row.
+    my $stable = state-at($store, 'budget', 'catalogue');
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    is state-at($store, 'budget', 'catalogue'), $stable,
+        'an unchanged catalogue tokenises byte-identically';
+
+    # The token carries the WHOLE target tuple, because all five columns
+    # change what the grid and the rail draw while moving no money at
+    # all. A goal is the shape that uses every one of them.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.categories.set-target($car-tax.id, kind => 'by_period',
+            pence => 50000, period => '2026-11-07', start => '2026-01-01',
+            repeat => 3);
+    });
+    my $with-goal = state-at($store, 'budget', 'catalogue');
+    isnt $with-goal, $stable, 'setting a goal moves the token';
+    is state-at($store, 'budget', 'digest'), $digest-before,
+        'while the derivation stays byte-identical — a target moves no money';
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    is state-at($store, 'budget', 'catalogue'), $with-goal,
+        'and a catalogue carrying a whole target tuple is still byte-stable';
+
+    # Same amount, same kind, same goal date — only the stamped plan
+    # start moves, which re-ramps every milestone after it. If the token
+    # could not see that, the grid would keep drawing the old schedule.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.categories.set-target($car-tax.id, kind => 'by_period',
+            pence => 50000, period => '2026-11-07', start => '2026-02-01',
+            repeat => 3);
+    });
+    isnt state-at($store, 'budget', 'catalogue'), $with-goal,
+        're-stamping a plan start moves it too';
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.categories.delete($car-tax.id);
+    });
+};
+
+subtest 'a bare figure sets, a signed one adjusts' => {
+    plan 6;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    ok type-assign($store, '400', $groceries.id), 'typed "400"';
+    is assigned-now($groceries.id), 40000, 'set to £400.00';
+
+    ok type-assign($store, '+5', $groceries.id), 'typed "+5"';
+    is assigned-now($groceries.id), 40500, 'adjusted up by a fiver';
+
+    ok type-assign($store, '-2.50', $groceries.id), 'typed "-2.50"';
+    is assigned-now($groceries.id), 40250, 'and back down by £2.50';
+
+    $ws.assignments.delete(PINNED-PERIOD, $groceries.id);
+};
+
+subtest 'the field accepts what a human types' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    ok type-assign($store, '£1,234.56', $groceries.id), 'symbol and commas';
+    is assigned-now($groceries.id), 123456, 'parsed exactly';
+
+    # Negative assignments are legal — pulling money back out of a
+    # category that had none this period — and parentheses are how the
+    # field expresses one, because the leading minus means "adjust".
+    ok type-assign($store, '(5.00)', $groceries.id), 'accountant negative';
+    is assigned-now($groceries.id), -500, 'set to minus five pounds';
+
+    $ws.assignments.delete(PINNED-PERIOD, $groceries.id);
+};
+
+subtest 'a malformed amount never reaches the database' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+    my $digest-before = state-at($store, 'budget', 'digest');
+
+    nok type-assign($store, 'four hundred', $groceries.id),
+        'the parse refuses it';
+    is assigned-now($groceries.id), 0, 'nothing was written';
+    is state-at($store, 'budget', 'digest'), $digest-before,
+        'and the digest did not move';
+    is %f<toasts>.elems, 0,
+        'nor was anything toasted — the dialog stays open and says so '
+            ~ 'inline instead';
+};
+
+subtest 'a refused write toasts and leaves the digest alone' => {
+    plan 3;
+    my %f = fixture();
+    my $store = %f<store>;
+    my $digest-before = state-at($store, 'budget', 'digest');
+
+    # Assigning to Ready to Assign is the canonical refusal: it is the
+    # pool assignments come *from*.
+    ok type-assign($store, '250', $rta.id), 'the field parses fine';
+    ok %f<toasts>[0].contains('Ready to Assign'),
+        'and the gateway\'s own message is what the user sees';
+    is state-at($store, 'budget', 'digest'), $digest-before,
+        'a write that did not happen does not repaint the screen';
+};
+
+subtest 'the overspent badge is recounted on period navigation' => {
+    plan 4;
+    my %f = fixture();
+    my $store = %f<store>;
+
+    my $txn = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-10',
+            amount => -5000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -5000)],
+    );
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> { True });
+    is state-at($store, 'budget', 'overspent-count'), 1,
+        'one envelope in the red this period';
+
+    # Cash overspending is charged to the following period's Ready to
+    # Assign rather than carried in the envelope, so the next period is
+    # clean — and the badge has to follow the period the user is
+    # looking at, not the period something happened in.
+    dispatch-and-tick($store, 'app/period-next');
+    is state-at($store, 'app', 'period'), NEXT-PERIOD, 'moved forward';
+    is state-at($store, 'budget', 'overspent-count'), 0,
+        'the badge cleared without any fact changing';
+
+    dispatch-and-tick($store, 'app/period-prev');
+    is state-at($store, 'budget', 'overspent-count'), 1,
+        'and came back on the way back';
+
+    $ws.transactions.delete($txn.id);
+};

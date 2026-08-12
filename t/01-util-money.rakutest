@@ -1,0 +1,113 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::Util::Money;
+
+plan 9;
+
+subtest 'format-pence: the ordinary cases' => {
+    plan 8;
+    is format-pence(1234),   '£12.34', 'pounds and pence';
+    is format-pence(0),      '£0.00',  'zero';
+    is format-pence(99),     '£0.99',  'under a pound';
+    is format-pence(100),    '£1.00',  'exactly a pound';
+    is format-pence(5),      '£0.05',  'single pence pad to two digits';
+    is format-pence(50),     '£0.50',  'ten pence';
+    is format-pence(100000), '£1,000.00', 'thousands separator';
+    is format-pence(123456789), '£1,234,567.89', 'millions';
+};
+
+subtest 'format-pence: negatives put the sign outside the symbol' => {
+    plan 5;
+    is format-pence(-1234), '-£12.34', 'negative pounds and pence';
+    is format-pence(-1),    '-£0.01',  'negative single penny';
+    is format-pence(-99),   '-£0.99',  'negative under a pound';
+    is format-pence(-100),  '-£1.00',  'negative pound';
+    is format-pence(-123456789), '-£1,234,567.89', 'negative millions';
+};
+
+subtest 'format-pence: options' => {
+    plan 6;
+    is format-pence(2500, :!symbol),      '25.00',   'no currency symbol';
+    is format-pence(-2500, :!symbol),     '-25.00',  'no symbol, negative';
+    is format-pence(100000, :!separators), '£1000.00', 'no separators';
+    is format-pence(2500, :plus),         '+£25.00', 'explicit plus';
+    is format-pence(-2500, :plus),        '-£25.00', ':plus does not flip a negative';
+    is format-pence(0, :plus),            '£0.00',   ':plus never signs zero';
+};
+
+subtest 'parse-pence: the shapes humans type' => {
+    plan 12;
+    is parse-pence('12.34'),    1234,  'bare decimal';
+    is parse-pence('£12.34'),   1234,  'currency symbol';
+    is parse-pence('  £12.34 '), 1234, 'surrounding whitespace';
+    is parse-pence('12'),       1200,  'no decimal part';
+    is parse-pence('12.3'),     1230,  'one decimal digit means tenths of a pound';
+    is parse-pence('0.05'),     5,     'five pence';
+    is parse-pence('0'),        0,     'zero';
+    is parse-pence('1,234.56'), 123456, 'comma separators';
+    is parse-pence('1_234.56'), 123456, 'underscore separators';
+    is parse-pence('+12.34'),   1234,  'explicit plus';
+    is parse-pence('$12.34'),   1234,  'dollar symbol is accepted and ignored';
+    is parse-pence('€12.34'),   1234,  'euro symbol is accepted and ignored';
+};
+
+subtest 'parse-pence: negatives' => {
+    plan 5;
+    is parse-pence('-12.34'),   -1234, 'leading minus';
+    is parse-pence('-£12.34'),  -1234, 'minus before the symbol';
+    is parse-pence('(12.34)'),  -1234, 'accounting parentheses';
+    is parse-pence('(£4.20)'),  -420,  'parentheses with symbol';
+    is parse-pence('-0.01'),    -1,    'negative penny';
+};
+
+subtest 'parse-pence: malformed input fails rather than guessing' => {
+    plan 9;
+    my @bad = (
+        ''            => 'empty string',
+        '   '         => 'whitespace only',
+        'twelve'      => 'words',
+        '12.345'      => 'three decimal digits (precision would be silently lost)',
+        '12.34.56'    => 'two decimal points',
+        '.'           => 'a bare point',
+        '12,34,'      => 'trailing separator',
+        '(12.34'      => 'unbalanced parenthesis',
+        '-(12.34)'    => 'both a minus and parentheses',
+    );
+    for @bad -> $case {
+        my $r = parse-pence($case.key);
+        ok $r ~~ Failure, "rejects { $case.value }";
+        $r.so;
+    }
+};
+
+subtest 'round trips' => {
+    plan 2;
+    my @pence = (0, 1, -1, 99, -99, 100, -100, 1234, -1234,
+                 100000, -100000, 123456789, -123456789, 5, -5);
+    my @broken = @pence.grep(-> $p { parse-pence(format-pence($p)) != $p });
+    is-deeply @broken, [], 'parse(format(p)) == p for every sample';
+
+    my @strings = <12.34 -12.34 0.05 1,234.56 (4.20) £7 +0.99>;
+    my @stable = @strings.map(-> $s {
+        my $once  = format-pence(parse-pence($s));
+        my $twice = format-pence(parse-pence($once));
+        $once eq $twice;
+    });
+    ok @stable.all.so, 'format(parse(s)) is idempotent for every sample';
+};
+
+subtest 'boundaries' => {
+    plan 4;
+    is format-pence(999999999999), '£9,999,999,999.99', 'very large amount';
+    is parse-pence('9999999999.99'), 999999999999, 'very large parse';
+    is format-pence(-999999999999), '-£9,999,999,999.99', 'very large negative';
+    is parse-pence('0.00'), 0, 'explicit zero pence';
+};
+
+subtest 'pence-symbol' => {
+    plan 2;
+    is pence-symbol(), '£', 'GBP only in v0.1';
+    ok format-pence(100).starts-with(pence-symbol()),
+        'format-pence uses the advertised symbol';
+};

@@ -1,0 +1,358 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Border;
+use Selkie::Widget::Button;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::HintBar;
+use App::Moneymoor::Screen::Budget;
+use App::Moneymoor::Screen::Main::Modals;
+
+# `d` on the envelope grid, end to end and without a terminal: the
+# keypress, the confirm it opens, the button the user presses, the
+# gateway call that follows, and the toast that carries a refusal back.
+#
+# The row the cursor is on decides what `d` means — an envelope, a
+# group, or nothing — the same dispatch `e` uses, which is why the
+# not-a-row cases are here too: they are the ones that would otherwise
+# take the app down inside a keybind closure.
+#
+# The store, the workspace and the derivation are real; only
+# Screen::Main is faked (t/71's stand-in plus the modal seam t/76 and
+# t/78 use).
+
+plan 7;
+
+my constant PERIOD = '2026-03-01';
+
+my $db-path = $*TMPDIR.add("moneymoor-budget-delete-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $rta = $ws.categories.rta-category;
+
+$ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => '2026-03-01', amount => 200000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 200000)],
+);
+
+# --- The stand-in screen ---------------------------------------------
+
+my class FakeApp {
+    has @.toasts;
+    method toast(Str:D $message --> Nil) { @!toasts.push($message); Nil }
+}
+
+my class FakeMain {
+    has $.app is required;
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.content-host is required;
+    has $.view is rw;
+    has $.budget-tab is rw;
+    has %.categories-by-id;
+    has %.groups-by-id;
+    has @.mounted;
+    has @.modals;               # what with-modal was handed
+    has Int $.rebuilds is rw = 0;
+
+    method icons() { icons() }
+    method current-tab(--> Str) { 'budget' }
+    method viewed-period(--> Str) {
+        ($!store.get-in('app', 'period') // PERIOD).Str;
+    }
+    method category(Int $id) { $id.defined ?? %!categories-by-id{$id} !! Nil }
+    method group(Int $id)    { $id.defined ?? %!groups-by-id{$id}     !! Nil }
+    method categories(--> List) { %!categories-by-id.values.List }
+    method groups(--> List)     { %!groups-by-id.values.List }
+    method rebuild-content(--> Nil) { $!rebuilds++; Nil }
+
+    method set-view($view --> Nil) {
+        $!view = $view;
+        %!categories-by-id = $!workspace.categories.find-all(:include-hidden)
+                                .map({ .id => $_ }).Hash;
+        %!groups-by-id = $!workspace.categories.find-groups(:include-hidden)
+                             .map({ .id => $_ }).Hash;
+        Nil
+    }
+
+    method pane-border(Str:D $title, $sizing --> Selkie::Widget::Border) {
+        Selkie::Widget::Border.new(:$sizing, :$title, padding => 1);
+    }
+
+    method mount-pane($parent, Selkie::Widget::Border $border,
+                      $pane, Str:D $context --> Nil) {
+        $border.set-content($pane);
+        $parent.add($border);
+        $border.set-store($!store);
+        @!mounted.push($pane => $context);
+        Nil
+    }
+
+    #| Record the modal and wire its result the way the real one does,
+    #| so a test can press Yes and watch the write happen.
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { body($emitted) };
+    }
+}
+
+# A built, subscribed, keybound budget tab over a fresh store.
+sub mounted-tab(--> Hash) {
+    my $host  = Selkie::Layout::VBox.new(sizing => Sizing.flex);
+    my $store = mock-store;
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+    $host.set-theme($theme.to-selkie);
+    my $app   = FakeApp.new;
+    my $main  = FakeMain.new(
+        :$app, :$store, workspace => $ws, content-host => $host, :$theme,
+    );
+    my @toasts;
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        on-view   => -> $v { $main.set-view($v) },
+        toast     => -> Str $m { @toasts.push($m) },
+    ).register($store);
+    $host.set-store($store);
+
+    my $tab = App::Moneymoor::Screen::Budget.new(main => $main);
+    $tab.build($host);
+    $tab.install-subscriptions;
+    $tab.install-keybinds;
+    $main.budget-tab = $tab;
+
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PERIOD);
+    { :$tab, :$main, :$store, :$app, :@toasts };
+}
+
+#| Every Button in a widget tree, in order — a ConfirmModal's Yes is
+#| the first of two.
+sub buttons($widget --> List) {
+    my @found;
+    my @queue = $widget;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @found.push($w) if $w ~~ Selkie::Widget::Button;
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @found.List;
+}
+
+sub press-button($button --> Nil) {
+    $button.set-focused(True);
+    press-key($button, 'enter');
+    Nil
+}
+
+#| Put the grid's cursor on a row and let the selection subscription run.
+sub cursor-onto(%m, &matching --> Bool) {
+    my $idx = %m<tab>.table.rows.first(&matching, :k);
+    return False without $idx;
+    %m<tab>.table.select-index($idx.UInt);
+    %m<store>.tick;
+    True;
+}
+
+#| Confirm the modal `d` just opened. Returns the message it asked with.
+sub confirm(%m --> Str) {
+    my $modal = %m<main>.modals.tail;
+    my @texts;
+    my @queue = $modal.content;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @texts.push($w.text) if $w.can('text');
+        # ConfirmModal's message is a RichText span, not a Text: long
+        # prompts have to wrap to the modal rather than clip.
+        @texts.append($w.spans.map(*.text)) if $w.can('spans');
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    press-button(buttons($modal).head);
+    %m<store>.tick;
+    @texts.join(' ');
+}
+
+sub category-named(Str $name) {
+    $ws.categories.find-all(:include-hidden).first({ .name eq $name });
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'd deletes an envelope with nothing against it' => {
+    plan 5;
+    my $doomed = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Bin Bags', group-id => $bills.id, sort-order => 1));
+    my %m = mounted-tab();
+    ok cursor-onto(%m, { $_<kind> eq 'category' && $_<id> == $doomed.id }),
+        'the cursor is on the envelope';
+
+    press-key(%m<tab>.table, 'd');
+    is %m<main>.modals.elems, 1, 'd asks first';
+    my Str $copy = confirm(%m);
+    ok $copy.contains('Bin Bags') && $copy.contains('hide it instead'),
+        'the confirm names the envelope and points at hide';
+
+    nok category-named('Bin Bags').defined, 'and Yes deletes it';
+    is %m<toasts>.grep({ $_.contains('Cannot delete') }).elems, 0,
+        'with nothing for the engine to object to';
+};
+
+subtest 'an envelope that has been zeroed out can be deleted' => {
+    plan 3;
+    # The bug behind the engine half of this change: `assignments.set`
+    # writes a row for every period you touch, so an envelope funded once
+    # and then emptied still had rows — and the old row-counting refusal
+    # made it undeletable for good.
+    my $emptied = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Was Funded', group-id => $bills.id, sort-order => 2));
+    $ws.set-assigned(PERIOD, $emptied.id, 5000);
+    $ws.set-assigned(PERIOD, $emptied.id, 0);
+
+    my %m = mounted-tab();
+    ok cursor-onto(%m, { $_<kind> eq 'category' && $_<id> == $emptied.id }),
+        'the cursor is on it';
+    press-key(%m<tab>.table, 'd');
+    confirm(%m);
+    nok category-named('Was Funded').defined, 'it deletes';
+    is $db.query-one('SELECT count(*) AS n FROM assignments
+                      WHERE category_id = ?', $emptied.id)<n>.Int, 0,
+        'and its zeroed periods went with it';
+};
+
+subtest 'an envelope with history refuses, and says why' => {
+    plan 3;
+    my $spent = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Groceries', group-id => $bills.id, sort-order => 3));
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-04', amount => -3000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $spent.id, amount => -3000)],
+    );
+
+    my %m = mounted-tab();
+    ok cursor-onto(%m, { $_<kind> eq 'category' && $_<id> == $spent.id }),
+        'the cursor is on it';
+    press-key(%m<tab>.table, 'd');
+    confirm(%m);
+
+    ok category-named('Groceries').defined, 'the envelope survives';
+    # The refusal is the engine's, reaching the user through ws/mutate's
+    # toast — the dialog deliberately does not pre-check the rule.
+    ok %m<toasts>.grep({ $_.contains('hide it instead') }).elems > 0,
+        'and the engine\'s own message is what the user is told';
+};
+
+subtest 'd on a group header deletes the group, not its envelopes' => {
+    plan 4;
+    my $doomed-group = $ws.categories.create-group(
+        App::Moneymoor::Model::CategoryGroup.new(name => 'Seasonal',
+                                                 sort-order => 9));
+    my $inside = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Fireworks', group-id => $doomed-group.id));
+
+    my %m = mounted-tab();
+    ok cursor-onto(%m, { $_<kind> eq 'group' && $_<id> == $doomed-group.id }),
+        'the cursor is on the header';
+    press-key(%m<tab>.table, 'd');
+    my Str $copy = confirm(%m);
+    ok $copy.contains('Seasonal') && $copy.contains('Ungrouped'),
+        'the confirm says the envelopes are kept';
+
+    nok $ws.categories.find-group-by-name('Seasonal').defined,
+        'the group is gone';
+    my $survivor = $ws.categories.find-by-id($inside.id);
+    ok $survivor.defined && !$survivor.group-id.defined,
+        'and its envelope survives, ungrouped';
+};
+
+subtest 'the rows that are not deletable say so instead' => {
+    plan 6;
+    # The Ungrouped bucket has no row behind it, and the payment
+    # envelope and its group belong to the engine. None of the three
+    # should open a confirm the user could only be refused on.
+    my $card = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Visa', type => 'credit'));
+    my $payment = $ws.accounts.payment-category-for($card.id);
+    my $loose = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Odds and Ends'));
+
+    my %m = mounted-tab();
+    ok cursor-onto(%m, { $_<kind> eq 'category' && $_<id> == $payment.id }),
+        'onto the card\'s payment envelope';
+    press-key(%m<tab>.table, 'd');
+    is %m<main>.modals.elems, 0, 'no confirm for a system envelope';
+    ok %m<app>.toasts.tail.contains('belongs to the engine'),
+        'it is told, not asked';
+
+    ok cursor-onto(%m, { $_<kind> eq 'group'
+                         && $_<category>.contains('Ungrouped') }),
+        'onto the Ungrouped bucket';
+    press-key(%m<tab>.table, 'd');
+    is %m<main>.modals.elems, 0, 'no confirm for a bucket that is not a group';
+    ok %m<app>.toasts.tail.contains('not a real group'),
+        'and the toast says what it is';
+
+    $ws.categories.delete($loose.id);
+};
+
+subtest 'd on the empty state is a no-op with a toast' => {
+    plan 3;
+    my %m = mounted-tab();
+    # The empty-state row is a row like any other, so `d` reaches it;
+    # `kind => 'empty'` is what keeps every action off it.
+    %m<main>.categories-by-id = %();
+    %m<main>.groups-by-id = %();
+    %m<tab>.refresh-rows;
+    is %m<tab>.table.rows.head<kind>, 'empty', 'the grid is on its empty state';
+
+    press-key(%m<tab>.table, 'd');
+    is %m<main>.modals.elems, 0, 'nothing opens';
+    ok %m<app>.toasts.tail.contains('Nothing to delete'),
+        'and the user is told why';
+};
+
+subtest 'the footer advertises d, and only where it is bound' => {
+    plan 2;
+    my @budget = hint-groups('budget');
+    is @budget.first({ $_.key eq 'd' }).value, 'delete',
+        'the budget footer carries d';
+    # t/69 reconciles the whole table against the binds; this is the one
+    # pair that has to stay true for the key added here.
+    ok 'lib/App/Moneymoor/Screen/Budget.rakumod'.IO.slurp
+        .contains("on-key: 'd'"),
+        'and the grid binds it';
+};

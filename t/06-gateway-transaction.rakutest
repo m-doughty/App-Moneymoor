@@ -1,0 +1,380 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Gateway::Account;
+use App::Moneymoor::Gateway::Category;
+use App::Moneymoor::Gateway::Payee;
+use App::Moneymoor::Gateway::Transaction;
+
+plan 13;
+
+my $db-path = $*TMPDIR.add("moneymoor-gw-txn-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $accounts   = App::Moneymoor::Gateway::Account.new(:$db);
+my $categories = App::Moneymoor::Gateway::Category.new(:$db);
+my $payees     = App::Moneymoor::Gateway::Payee.new(:$db);
+my $gw         = App::Moneymoor::Gateway::Transaction.new(:$db);
+
+my $current = $accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $savings = $accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Savings', type => 'cash'));
+my $visa = $accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Visa', type => 'credit'));
+my $isa = $accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Stocks ISA', type => 'tracking'));
+
+my $groceries = $categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', sort-order => 1));
+my $household = $categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Household', sort-order => 2));
+my $investing = $categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Investing', sort-order => 3));
+my $rta = $categories.rta-category;
+my $visa-pay = $accounts.payment-category-for($visa.id);
+my $tesco = $payees.find-or-create('Tesco');
+
+sub split-of(Int $category, Int $amount) {
+    App::Moneymoor::Model::Split.new(category-id => $category, amount => $amount);
+}
+
+subtest 'create a categorized transaction with one split' => {
+    plan 5;
+    my $txn = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-14',
+            payee-id => $tesco.id, memo => 'weekly shop', amount => -4250),
+        splits => [split-of($groceries.id, -4250)],
+    );
+    ok $txn.id.defined, 'create returns the stored row';
+    is $txn.amount, -4250, 'amount preserved';
+    is $txn.memo, 'weekly shop', 'memo preserved';
+    is $txn.cleared, 'uncleared', 'default cleared state';
+
+    my @splits = $gw.find-splits($txn.id);
+    is @splits.elems, 1, 'the split landed with it';
+};
+
+subtest 'create a split transaction' => {
+    plan 3;
+    my $txn = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-15', amount => -6000),
+        splits => [split-of($groceries.id, -4500), split-of($household.id, -1500)],
+    );
+    my @splits = $gw.find-splits($txn.id);
+    is @splits.elems, 2, 'both splits landed';
+    is @splits.map(*.amount).sum, -6000, 'and they sum to the transaction';
+    is @splits[0].transaction-id, $txn.id,
+        'the gateway filled in transaction_id';
+};
+
+subtest 'splits must sum to the transaction, atomically' => {
+    plan 4;
+    my $before = $gw.find-all.elems;
+
+    my $mismatch = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-16', amount => -1000),
+        splits => [split-of($groceries.id, -900)],
+    );
+    ok $mismatch ~~ Failure, 'a split set that does not sum is refused';
+    like $mismatch.exception.message, /'sum to'/, 'with a specific message';
+    $mismatch.so;
+
+    my $uncategorized = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-16', amount => -1000),
+    );
+    ok $uncategorized ~~ Failure,
+        'an uncategorized on-budget transaction is refused';
+    $uncategorized.so;
+
+    is $gw.find-all.elems, $before,
+        'and neither attempt left a transaction behind';
+};
+
+subtest 'tracking accounts cannot be categorized' => {
+    plan 2;
+    my $r = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $isa.id, date => '2026-03-17', amount => 5000),
+        splits => [split-of($investing.id, 5000)],
+    );
+    ok $r ~~ Failure, 'a categorized tracking transaction is refused';
+    $r.so;
+
+    my $ok = $gw.create(App::Moneymoor::Model::Transaction.new(
+        account-id => $isa.id, date => '2026-03-17', amount => 5000));
+    ok $ok.id.defined, 'an uncategorized one is fine — it is off budget';
+};
+
+subtest 'create validation' => {
+    plan 5;
+    my @bad = (
+        App::Moneymoor::Model::Transaction.new(
+            account-id => 99999, date => '2026-03-01', amount => -100)
+            => 'unknown account',
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-13-01', amount => -100)
+            => 'impossible month',
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-02-30', amount => -100)
+            => 'impossible day',
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-01', amount => -100,
+            cleared => 'probably')
+            => 'unknown cleared state',
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-01', amount => -100,
+            payee-id => 99999)
+            => 'unknown payee',
+    );
+    for @bad -> $case {
+        my $r = $gw.create($case.key, splits => [split-of($groceries.id, -100)]);
+        ok $r ~~ Failure, "create refuses: { $case.value }";
+        $r.so;
+    }
+};
+
+subtest 'transfers between on-budget accounts' => {
+    plan 7;
+    my ($out, $in) = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $savings.id,
+        date => '2026-03-18', amount => 20000, memo => 'topping up',
+    );
+    is $out.amount, -20000, 'the from leg is negative';
+    is $in.amount, 20000, 'the to leg is positive';
+    is $out.transfer-peer-id, $in.id, 'the from leg points at the to leg';
+    is $in.transfer-peer-id, $out.id, 'and back again';
+    is $out.date, $in.date, 'both legs share a date';
+    is $gw.find-splits($out.id).elems, 0, 'no splits on either leg';
+
+    my $categorized = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $savings.id,
+        date => '2026-03-18', amount => 10000,
+        splits => [split-of($groceries.id, -10000)],
+    );
+    ok $categorized ~~ Failure,
+        'a transfer inside the budget cannot be categorized';
+    $categorized.so;
+};
+
+subtest 'transfers to a tracking account are categorized spending' => {
+    plan 4;
+    my $missing-splits = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $isa.id,
+        date => '2026-03-19', amount => 15000,
+    );
+    ok $missing-splits ~~ Failure,
+        'crossing the budget boundary without a category is refused';
+    like $missing-splits.exception.message, /'categorized'/,
+        'and the message explains why';
+    $missing-splits.so;
+
+    my ($out, $in) = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $isa.id,
+        date => '2026-03-19', amount => 15000,
+        splits => [split-of($investing.id, -15000)],
+    );
+    is $gw.find-splits($out.id).elems, 1,
+        'the on-budget leg carries the split';
+    is $gw.find-splits($in.id).elems, 0,
+        'and the tracking leg does not';
+};
+
+subtest 'transfer validation' => {
+    plan 3;
+    my $same = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $current.id,
+        date => '2026-03-20', amount => 1000);
+    ok $same ~~ Failure, 'a transfer needs two different accounts';
+    $same.so;
+
+    my $negative = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $savings.id,
+        date => '2026-03-20', amount => -1000);
+    ok $negative ~~ Failure, 'the amount is a positive magnitude';
+    $negative.so;
+
+    my $missing = $gw.create-transfer(
+        from-account-id => 99999, to-account-id => $savings.id,
+        date => '2026-03-20', amount => 1000);
+    ok $missing ~~ Failure, 'both accounts must exist';
+    $missing.so;
+};
+
+subtest 'update' => {
+    plan 7;
+    my $txn = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-21', amount => -3000),
+        splits => [split-of($groceries.id, -3000)],
+    );
+
+    ok $gw.update(App::Moneymoor::Model::Transaction.new(
+        id => $txn.id, account-id => $current.id, date => '2026-03-22',
+        amount => -3000, memo => 'fixed the memo')),
+        'an edit that leaves the amount alone keeps the existing splits';
+    my $reloaded = $gw.find-by-id($txn.id);
+    is $reloaded.memo, 'fixed the memo', 'the memo changed';
+    is $reloaded.date, '2026-03-22', 'the date changed';
+    is $gw.find-splits($txn.id).elems, 1, 'the split survived untouched';
+
+    my $stale = $gw.update(App::Moneymoor::Model::Transaction.new(
+        id => $txn.id, account-id => $current.id, date => '2026-03-22',
+        amount => -5000));
+    ok $stale ~~ Failure,
+        'changing the amount without new splits is refused';
+    $stale.so;
+
+    ok $gw.update(
+        App::Moneymoor::Model::Transaction.new(
+            id => $txn.id, account-id => $current.id, date => '2026-03-22',
+            amount => -5000),
+        splits => [split-of($groceries.id, -2000), split-of($household.id, -3000)],
+    ), 'changing the amount with matching splits succeeds';
+    is $gw.find-splits($txn.id).map(*.amount).sum, -5000,
+        'and the split set was replaced wholesale';
+};
+
+subtest 'editing one leg of a transfer keeps the pair consistent' => {
+    plan 4;
+    my ($out, $in) = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $savings.id,
+        date => '2026-03-23', amount => 5000);
+
+    $gw.update(App::Moneymoor::Model::Transaction.new(
+        id => $out.id, account-id => $current.id, date => '2026-03-24',
+        amount => -7500, transfer-peer-id => $in.id));
+
+    my $peer = $gw.find-by-id($in.id);
+    is $peer.amount, 7500, 'the peer amount is negated to match';
+    is $peer.date, '2026-03-24', 'the peer date follows';
+
+    my $moved = $gw.update(App::Moneymoor::Model::Transaction.new(
+        id => $out.id, account-id => $savings.id, date => '2026-03-24',
+        amount => -7500, transfer-peer-id => $in.id));
+    ok $moved ~~ Failure, 'a transfer leg cannot be moved to another account';
+    $moved.so;
+
+    ok $gw.set-cleared($out.id, 'reconciled'), 'set-cleared works';
+};
+
+subtest 'editing a transfer that crosses the budget boundary' => {
+    plan 4;
+    my ($out, $in) = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $isa.id,
+        date => '2026-04-01', amount => 20000,
+        splits => [split-of($investing.id, -20000)],
+    );
+
+    # Raising the amount on the on-budget leg needs matching splits,
+    # exactly like any other categorized transaction.
+    my $stale = $gw.update(App::Moneymoor::Model::Transaction.new(
+        id => $out.id, account-id => $current.id, date => '2026-04-01',
+        amount => -25000, transfer-peer-id => $in.id));
+    ok $stale ~~ Failure, 'a bare amount change is refused';
+    $stale.so;
+
+    ok $gw.update(
+        App::Moneymoor::Model::Transaction.new(
+            id => $out.id, account-id => $current.id, date => '2026-04-01',
+            amount => -25000, transfer-peer-id => $in.id),
+        splits => [split-of($investing.id, -25000)],
+    ), 'with matching splits it succeeds';
+    is $gw.find-by-id($in.id).amount, 25000, 'and the tracking leg follows';
+
+    # The tracking leg may never be categorized, edit or no edit.
+    my $categorized-tracking = $gw.update(
+        App::Moneymoor::Model::Transaction.new(
+            id => $in.id, account-id => $isa.id, date => '2026-04-01',
+            amount => 25000, transfer-peer-id => $out.id),
+        splits => [split-of($investing.id, 25000)],
+    );
+    ok $categorized-tracking ~~ Failure,
+        'categorizing the tracking leg is refused';
+    $categorized-tracking.so;
+};
+
+subtest 'reads: ordering, per-account, per-period' => {
+    plan 8;
+    my @all = $gw.find-all;
+    my @keys = @all.map({ "{ .date }|{ .id.fmt('%08d') }" });
+    is-deeply @keys.Array, @keys.sort.Array,
+        'find-all is ordered by (date, id) — the order the engine needs';
+
+    my @on-visa = $gw.find-by-account($visa.id);
+    ok @on-visa.grep({ .account-id != $visa.id }).elems == 0,
+        'find-by-account is scoped to one account';
+
+    my $march = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-31', amount => -100),
+        splits => [split-of($groceries.id, -100)]);
+    my $april = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-04-01', amount => -200),
+        splits => [split-of($groceries.id, -200)]);
+
+    my @in-march = $gw.find-by-period('2026-03-01');
+    ok @in-march.first({ .id == $march.id }).defined,
+        'find-by-period includes the last day of the period';
+    nok @in-march.first({ .id == $april.id }).defined,
+        'and excludes the first day of the next one';
+    ok $gw.find-by-period('2026-04-01').first({ .id == $april.id }).defined,
+        'which is where it turns up instead';
+
+    my $bad-shape = $gw.find-by-period('2026-3');
+    ok $bad-shape ~~ Failure, 'a malformed period is refused';
+    $bad-shape.so;
+
+    # The unmigrated month shape is the specific thing that must not
+    # quietly work: it names no window this gateway can honour.
+    my $old-shape = $gw.find-by-period('2026-03');
+    ok $old-shape ~~ Failure, 'and so is a pre-period YYYY-MM key';
+    $old-shape.so;
+
+    # Well-formed, a real date, and not a period start under the
+    # calendar month: reading "the period beginning mid-March" would
+    # answer a question the caller did not ask.
+    my $not-start = $gw.find-by-period('2026-03-15');
+    ok $not-start ~~ Failure,
+        'a date that is not a period start is refused too';
+    $not-start.so;
+};
+
+subtest 'delete' => {
+    plan 5;
+    my $txn = $gw.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-25', amount => -1200),
+        splits => [split-of($groceries.id, -1200)],
+    );
+    ok $gw.delete($txn.id), 'delete succeeds';
+    nok $gw.find-by-id($txn.id).defined, 'the transaction is gone';
+    is $gw.find-splits($txn.id).elems, 0, 'and its splits with it';
+
+    my ($out, $in) = $gw.create-transfer(
+        from-account-id => $current.id, to-account-id => $savings.id,
+        date => '2026-03-26', amount => 3000);
+    $gw.delete($in.id);
+    nok $gw.find-by-id($out.id).defined,
+        'deleting one leg of a transfer deletes the other';
+
+    my $missing = $gw.delete(99999);
+    ok $missing ~~ Failure, 'deleting a missing transaction is refused';
+    $missing.so;
+};

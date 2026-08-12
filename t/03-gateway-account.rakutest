@@ -1,0 +1,223 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Gateway::Account;
+use App::Moneymoor::Gateway::Assignment;
+use App::Moneymoor::Gateway::Category;
+use App::Moneymoor::Gateway::Transaction;
+
+plan 10;
+
+my $db-path = $*TMPDIR.add("moneymoor-gw-account-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $gw = App::Moneymoor::Gateway::Account.new(:$db);
+my $categories = App::Moneymoor::Gateway::Category.new(:$db);
+my $transactions = App::Moneymoor::Gateway::Transaction.new(:$db);
+my $assignments = App::Moneymoor::Gateway::Assignment.new(:$db);
+
+subtest 'create and read back a cash account' => {
+    plan 6;
+    my $created = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Current Account', type => 'cash', note => 'the main one',
+        sort-order => 1,
+    ));
+    ok $created.id.defined, 'create returns the stored row, with its id';
+    is $created.name, 'Current Account', 'name preserved';
+    is $created.type, 'cash', 'type preserved';
+    is $created.note, 'the main one', 'note preserved';
+    nok $created.closed, 'new accounts are open';
+    ok $created.created-at.defined, 'created_at is filled in by the DB';
+};
+
+subtest 'a credit account gets its payment envelope, atomically' => {
+    plan 6;
+    my $visa = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Visa', type => 'credit', sort-order => 5,
+    ));
+    my $envelope = $gw.payment-category-for($visa.id);
+    ok $envelope.defined, 'the payment category exists';
+    is $envelope.kind, 'payment', 'and it is a payment category';
+    is $envelope.name, 'Visa', 'named after its account';
+    is $envelope.payment-account-id, $visa.id, 'linked back to the account';
+    is $envelope.sort-order, 5, 'inheriting the account sort order';
+
+    my $group = $categories.find-group-by-id($envelope.group-id);
+    is $group.name, 'Credit Card Payments',
+        'and living in the system payment group';
+};
+
+subtest 'cash and tracking accounts get no payment envelope' => {
+    plan 3;
+    my $isa = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Stocks ISA', type => 'tracking',
+    ));
+    is $isa.type, 'tracking', 'tracking accounts can be created';
+    nok $gw.payment-category-for($isa.id).defined,
+        'a tracking account has no payment envelope';
+    nok $gw.payment-category-for($gw.find-by-name('Current Account').id).defined,
+        'nor does a cash account';
+};
+
+subtest 'validation' => {
+    plan 4;
+    my @cases = (
+        App::Moneymoor::Model::Account.new(name => 'Visa')
+            => 'duplicate name',
+        App::Moneymoor::Model::Account.new(name => '   ')
+            => 'empty name',
+        App::Moneymoor::Model::Account.new(name => 'Weird', type => 'crypto')
+            => 'unknown type',
+        App::Moneymoor::Model::Account.new(name => 'visa ')
+            => 'duplicate after trimming would still be a new name',
+    );
+    for @cases.head(3) -> $case {
+        my $r = $gw.create($case.key);
+        ok $r ~~ Failure, "create refuses: { $case.value }";
+        $r.so;
+    }
+    # 'visa ' trims to 'visa', which is a *different* name to 'Visa'
+    # (SQLite's default collation is case-sensitive), so it succeeds.
+    my $lower = $gw.create(App::Moneymoor::Model::Account.new(name => 'visa '));
+    ok $lower.defined && $lower.name eq 'visa',
+        'names are trimmed but not case-folded';
+};
+
+subtest 'find-all, closing and reopening' => {
+    plan 5;
+    my $savings = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Savings', type => 'cash', sort-order => 2,
+    ));
+    my @open-before = $gw.find-all;
+    ok @open-before.first({ .name eq 'Savings' }).defined,
+        'a new account shows up in find-all';
+
+    $gw.close($savings.id);
+    my @open-after = $gw.find-all;
+    nok @open-after.first({ .name eq 'Savings' }).defined,
+        'a closed account drops out of find-all';
+    ok $gw.find-all(:include-closed).first({ .name eq 'Savings' }).defined,
+        'but is still there with :include-closed';
+    ok $gw.find-by-id($savings.id).closed, 'and reads back as closed';
+
+    $gw.reopen($savings.id);
+    ok $gw.find-all.first({ .name eq 'Savings' }).defined, 'reopen restores it';
+};
+
+subtest 'find-by-id / find-by-name on a missing row' => {
+    plan 2;
+    nok $gw.find-by-id(99999).defined,
+        'find-by-id gives a type object for a missing id';
+    nok $gw.find-by-name('No Such Account').defined,
+        'find-by-name gives a type object for a missing name';
+};
+
+subtest 'update' => {
+    plan 5;
+    my $account = $gw.find-by-name('Savings');
+    my $edited = App::Moneymoor::Model::Account.new(
+        id => $account.id, name => 'Savings Pot', type => 'cash',
+        note => 'emergency fund', sort-order => 9,
+    );
+    ok $gw.update($edited), 'update succeeds';
+    my $reloaded = $gw.find-by-id($account.id);
+    is $reloaded.name, 'Savings Pot', 'name changed';
+    is $reloaded.note, 'emergency fund', 'note changed';
+
+    my $type-change = App::Moneymoor::Model::Account.new(
+        id => $account.id, name => 'Savings Pot', type => 'credit');
+    my $r = $gw.update($type-change);
+    ok $r ~~ Failure, 'changing the account type is refused';
+    $r.so;
+
+    # Renaming a credit account renames its envelope: a budget screen
+    # showing 'Visa' next to an account called 'Barclaycard' is lying.
+    my $visa = $gw.find-by-name('Visa');
+    $gw.update(App::Moneymoor::Model::Account.new(
+        id => $visa.id, name => 'Barclaycard', type => 'credit', sort-order => 5));
+    is $gw.payment-category-for($visa.id).name, 'Barclaycard',
+        'the payment envelope follows the account name';
+};
+
+subtest 'delete takes the history and the envelope with it' => {
+    plan 4;
+    my $card = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Doomed Card', type => 'credit'));
+    my $envelope = $gw.payment-category-for($card.id);
+    my $groceries = $categories.create(
+        App::Moneymoor::Model::Category.new(name => 'Groceries'));
+
+    $transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $card.id, date => '2026-03-14', amount => -2500),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -2500)],
+    );
+
+    ok $gw.delete($card.id), 'delete succeeds';
+    nok $gw.find-by-id($card.id).defined, 'the account is gone';
+    nok $categories.find-by-id($envelope.id).defined,
+        'so is its payment envelope';
+    is $transactions.find-by-account($card.id).elems, 0,
+        'and its transactions';
+};
+
+subtest 'delete is not blocked by its envelope’s assignments' => {
+    plan 3;
+    # Account deletion CASCADEs where category deletion RESTRICTs, so
+    # the "zeroed periods are not history" relaxation in
+    # Gateway::Category has no counterpart here: this gateway never
+    # counts assignment rows, and assignments.category_id is
+    # ON DELETE CASCADE, so budgeting to a card's payment envelope
+    # cannot wedge the account. Pinned because the two deletes read
+    # like they should be symmetrical and are deliberately not.
+    my $card = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Budgeted Card', type => 'credit'));
+    my $envelope = $gw.payment-category-for($card.id);
+    $assignments.set('2026-03-01', $envelope.id, 0);
+    $assignments.set('2026-04-01', $envelope.id, 5000);
+
+    ok $gw.delete($card.id),
+        'the account deletes with money budgeted to its payment envelope';
+    nok $categories.find-by-id($envelope.id).defined, 'the envelope is gone';
+    is ($db.query-one('SELECT count(*) AS n FROM assignments
+                       WHERE category_id = ?', $envelope.id)<n> // 0).Int,
+        0, 'and its assignment rows cascaded away';
+};
+
+subtest 'delete refuses to rewrite other accounts’ history' => {
+    plan 3;
+    my $card = $gw.create(App::Moneymoor::Model::Account.new(
+        name => 'Shared Card', type => 'credit'));
+    my $envelope = $gw.payment-category-for($card.id);
+    my $current = $gw.find-by-name('Current Account');
+
+    # Paying the card off from the current account, recorded as a
+    # categorized transaction against the payment envelope rather than
+    # as a transfer — legal, and it means the envelope now has history
+    # that does not belong to the card.
+    $transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-20', amount => -10000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $envelope.id, amount => -10000)],
+    );
+
+    my $r = $gw.delete($card.id);
+    ok $r ~~ Failure, 'delete is refused';
+    like $r.exception.message, /'recategorize'/,
+        'with a message telling you what to do about it';
+    $r.so;
+    ok $gw.find-by-id($card.id).defined, 'and the account is still there';
+};

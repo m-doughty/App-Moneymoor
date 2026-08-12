@@ -1,0 +1,229 @@
+use Test;
+use lib 'lib';
+
+use JSON::Fast;
+
+use App::Moneymoor::Config;
+
+# App::Moneymoor::Config decides where every byte the app owns lives:
+# the budget files the login screen lists, the plaintext settings, and
+# the error log Selkie redirects stderr into. Getting a path wrong here
+# is the one class of bug that can make a user's budget invisible
+# (listed from the wrong directory) or unreachable (derived to a
+# different filename than it was created at), so the derivations are
+# pinned rather than trusted.
+#
+# Everything runs against a scratch MONEYMOOR_HOME. A test that touched
+# the real ~/.moneymoor could add junk to a user's budget picker.
+
+plan 9;
+
+my $scratch = $*TMPDIR.add("moneymoor-config-{$*PID}").Str;
+%*ENV<MONEYMOOR_HOME> = $scratch;
+
+LEAVE {
+    if $scratch.IO.d {
+        for $scratch.IO.dir -> $entry {
+            if $entry.d {
+                for $entry.dir -> $f { unlink $f }
+                rmdir $entry;
+            } else {
+                unlink $entry;
+            }
+        }
+        rmdir $scratch;
+    }
+    %*ENV<MONEYMOOR_HOME>:delete;
+}
+
+subtest "the data home is the env override, and everything hangs off it" => {
+    plan 5;
+    my $cfg = App::Moneymoor::Config.new;
+
+    is $cfg.moneymoor-home, $scratch,
+        "moneymoor-home honours MONEYMOOR_HOME";
+    is $cfg.budget-name, 'budget', "the default budget name is 'budget'";
+    is $cfg.budget-path, "$scratch/budget.db",
+        "budget-path is <home>/<name>.db — a flat file, not a profile dir";
+    is $cfg.budget-path-for('household'), "$scratch/household.db",
+        "budget-path-for derives any name the same way";
+    is $cfg.error-log-path, "$scratch/logs/error.log",
+        "the error log lives under the home, not beside a budget";
+};
+
+subtest "defaults are the ones the rest of the app assumes" => {
+    plan 5;
+    my $cfg = App::Moneymoor::Config.new;
+    is $cfg.theme, 'gruvbox', "theme defaults to gruvbox";
+    is $cfg.icons, 'unicode', "icons default to the unicode tier";
+    is $cfg.currency, '£', "currency defaults to sterling";
+    is $cfg.decimal-mark, '.', "and the decimal mark to a point";
+    nok $cfg.budget-exists, "and no budget exists in a fresh home";
+};
+
+subtest "ensure-directories creates the home and nothing else" => {
+    plan 2;
+    my $cfg = App::Moneymoor::Config.new;
+    $cfg.ensure-directories;
+    ok $scratch.IO.d, "the data home exists";
+    # Budgets are flat files: a per-budget directory would be a
+    # directory containing exactly one file.
+    nok "$scratch/budget".IO.d, "no per-budget subdirectory was created";
+};
+
+subtest "the budget list is *.db basenames, newest first" => {
+    plan 5;
+
+    is-deeply App::Moneymoor::Config.new.available-budget-names, (),
+        "an empty home lists no budgets";
+
+    # Three budgets written in a known order. The sleep is only there
+    # to make a tie unlikely; the assertion below doesn't depend on it,
+    # because it compares the returned order against the mtimes the
+    # filesystem actually recorded rather than against the order the
+    # test wrote them in. That keeps the test honest on a filesystem
+    # with coarser timestamps than we expect, on any platform, instead
+    # of failing for a reason that has nothing to do with Config.
+    for <alpha beta gamma> -> $name {
+        spurt "$scratch/$name.db", '';
+        sleep 0.05;
+    }
+
+    my @listed = App::Moneymoor::Config.new.available-budget-names;
+    is-deeply @listed.sort.List, ('alpha', 'beta', 'gamma'),
+        "every *.db in the home is listed, once";
+
+    my @mtimes = @listed.map({ "$scratch/$_.db".IO.modified });
+    # Parenthesised: an unparenthesised reduce would swallow the
+    # description into the list it is reducing over.
+    ok ([>=] @mtimes),
+        "listed most-recently-modified first — the picker opens where "
+            ~ "the user left off";
+
+    # Non-budget files in the home must not become phantom entries.
+    spurt "$scratch/config.json", '{}';
+    spurt "$scratch/notes.txt", 'hello';
+    is App::Moneymoor::Config.new.available-budget-names.elems, 3,
+        "files that aren't *.db are ignored";
+
+    # A name the path derivation could not round-trip would list a
+    # budget the app can never reopen.
+    spurt "$scratch/has space.db", '';
+    is App::Moneymoor::Config.new.available-budget-names.elems, 3,
+        "a name that fails the name rule is skipped, not listed";
+
+    unlink "$scratch/has space.db";
+    unlink "$scratch/notes.txt";
+    unlink "$scratch/$_.db" for <alpha beta gamma>;
+};
+
+subtest "the budget-name rule rejects anything path-shaped" => {
+    plan 8;
+    my $cfg = App::Moneymoor::Config.new;
+    ok  $cfg.valid-budget-name('household'),   "plain word";
+    ok  $cfg.valid-budget-name('2026-budget'), "digits and a dash";
+    ok  $cfg.valid-budget-name('my_budget.v2'), "underscore and a dot";
+    nok $cfg.valid-budget-name(''),            "empty string";
+    nok $cfg.valid-budget-name(Str),           "type object";
+    nok $cfg.valid-budget-name('a/b'),         "a path separator";
+    nok $cfg.valid-budget-name('../escape'),   "a traversal";
+    nok $cfg.valid-budget-name('has space'),   "a space";
+};
+
+subtest "save / load round-trips all five fields" => {
+    plan 7;
+    my $cfg = App::Moneymoor::Config.new.load;
+    $cfg.budget-name  = 'household';
+    $cfg.theme        = 'nord';
+    $cfg.icons        = 'nerd';
+    $cfg.currency     = '€';
+    $cfg.decimal-mark = ',';
+    $cfg.save;
+
+    my $cfg2 = App::Moneymoor::Config.new.load;
+    is $cfg2.budget-name,  'household', "budget-name round-trips";
+    is $cfg2.theme,        'nord',      "theme round-trips";
+    is $cfg2.icons,        'nerd',      "icons round-trips";
+    is $cfg2.currency,     '€',         "currency round-trips";
+    is $cfg2.decimal-mark, ',',         "the decimal mark round-trips";
+    is $cfg2.config-path, "$scratch/config.json",
+        "and it went to <home>/config.json";
+
+    # The JSON key is snake_case like its neighbours, and the attribute
+    # is kebab-case like every other Raku identifier here. A test that
+    # only round-tripped through the accessor would not notice the two
+    # drifting apart, and a user's hand-edited `decimal_mark` would
+    # silently stop working.
+    my %raw = from-json(slurp "$scratch/config.json");
+    is-deeply %raw<currency decimal_mark>.List, ('€', ','),
+        "written under the keys the file format advertises";
+};
+
+subtest "a config written by an older build still loads" => {
+    plan 5;
+    # Keys the current build doesn't know about must be ignored, and
+    # keys it does know about but that are absent must fall back to the
+    # defaults rather than to a type object.
+    spurt "$scratch/config.json",
+        to-json({ budget_name => 'household', some_future_key => 42 },
+                :sorted-keys, :pretty);
+
+    my $cfg = App::Moneymoor::Config.new.load;
+    is $cfg.budget-name, 'household', "the key it recognises is read";
+    is $cfg.theme, 'gruvbox', "an absent theme falls back to the default";
+    is $cfg.icons, 'unicode', "an absent icons tier falls back too";
+    is $cfg.currency, '£',
+        "a config from before the money settings gets the default symbol";
+    is $cfg.decimal-mark, '.', "and the default decimal mark";
+};
+
+subtest "a hand-edited money setting falls back instead of breaking" => {
+    plan 8;
+    # These two are the only settings Config validates, and the reason
+    # is that they are handed straight to `set-money-locale`, which
+    # throws on a value it does not know. A typo in a plaintext file
+    # the user is invited to edit must open the app in £ / . — not fail
+    # to open it.
+    my @cases =
+        'an unsupported currency code' =>
+            { currency => 'CAD', decimal_mark => ',' },
+        'a decimal mark that is not one of the two' =>
+            { currency => '€', decimal_mark => ';' },
+        'a multi-character decimal mark' =>
+            { currency => '€', decimal_mark => '.,' },
+        'values of the wrong JSON type entirely' =>
+            { currency => 42, decimal_mark => True },
+    ;
+
+    for @cases -> $case {
+        spurt "$scratch/config.json",
+            to-json($case.value, :sorted-keys, :pretty);
+        my $bad = App::Moneymoor::Config.new.load;
+
+        # Whichever of the two was legal in the case is still honoured:
+        # one bad key must not discard the other.
+        my $want-currency = $case.value<currency> eq any('£', '$', '€')
+            ?? $case.value<currency> !! '£';
+        my $want-mark = $case.value<decimal_mark> eq any('.', ',')
+            ?? $case.value<decimal_mark> !! '.';
+
+        is $bad.currency, $want-currency,
+            "{ $case.key }: currency";
+        is $bad.decimal-mark, $want-mark,
+            "{ $case.key }: decimal mark";
+    }
+};
+
+subtest "save works on a Config that was never loaded" => {
+    plan 2;
+    # The create-a-budget flow builds a Config from defaults and saves
+    # it without a prior load; without the fallback in `save` that
+    # would spurt to an undefined path.
+    unlink "$scratch/config.json";
+    my $cfg = App::Moneymoor::Config.new;
+    $cfg.budget-name = 'fresh';
+    $cfg.save;
+    ok "$scratch/config.json".IO.e, "the file was written";
+    is App::Moneymoor::Config.new.load.budget-name, 'fresh',
+        "and it round-trips";
+};

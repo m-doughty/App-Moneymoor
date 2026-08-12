@@ -1,0 +1,615 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Util::Period;
+use App::Moneymoor::View::BudgetRow;
+
+# The envelope grid is the screen people look at, and every awkward
+# thing about it lives in `budget-rows`: two tables joined by a
+# nullable foreign key, a synthetic bucket for the rows whose key is
+# null, injected header rows the Table has no concept of, a collapse
+# set, a hidden filter, and money cells that have to be zero-filled
+# from a derivation that deliberately omits all-zero rows.
+#
+# None of that needs a terminal, so none of it is tested through one.
+# The facts come from BudgetFixtures (pure, no DB, no clock) through
+# the engine's real `compute`, so the flags being asserted here are the
+# flags the engine actually sets rather than ones this test invented.
+#
+# PERIOD is pinned. Every expectation below is a literal, which is only
+# safe because no expression in the module under test reads the clock.
+
+plan 18;
+
+my constant PERIOD = '2026-03-01';
+
+# The calendar month, which is what every literal below is written
+# against. The grid needs a scheme now that the Target column can hold
+# a by-period milestone, and a milestone is arithmetic on periods.
+my $scheme = App::Moneymoor::Util::Period.default-scheme;
+
+# Groups the fixture's categories are filed under. BudgetFixtures does
+# not model groups (compute never sees them), so they are built here.
+my constant BILLS-GROUP = 10;
+my constant FUN-GROUP   = 20;
+my constant CARDS-GROUP = 30;
+
+sub group(Int $id, Str $name, Int $sort-order, Bool :$system = False,
+          Bool :$hidden = False) {
+    App::Moneymoor::Model::CategoryGroup.new(
+        :$id, :$name, :$sort-order, :$system, :$hidden);
+}
+
+sub category(Int $id, Str $name, Int :$group-id, Int :$sort-order = 0,
+             Str :$kind = 'standard', Bool :$hidden = False,
+             Bool :$carry-overspend = False,
+             Int :$payment-account-id, Int :$target-pence = 0,
+             Str :$target-kind = 'refill', Str :$target-period,
+             Str :$target-start, Int :$target-repeat = 0) {
+    App::Moneymoor::Model::Category.new(
+        :$id, :$name, :$group-id, :$sort-order, :$kind, :$hidden,
+        :$carry-overspend, :$payment-account-id, :$target-pence,
+        :$target-kind, :$target-period, :$target-start, :$target-repeat);
+}
+
+# The fixture's four categories, as the rows the gateway would return.
+sub standard-categories(--> List) {
+    (
+        category(RTA,       'Ready to Assign', kind => 'rta', sort-order => -1),
+        category(GROCERIES, 'Groceries',  group-id => BILLS-GROUP, sort-order => 1),
+        category(DINING,    'Dining Out', group-id => FUN-GROUP,   sort-order => 2),
+        category(VISA-PAY,  'Visa', kind => 'payment', group-id => CARDS-GROUP,
+                 payment-account-id => VISA, sort-order => 1000),
+    );
+}
+
+sub standard-groups(--> List) {
+    (
+        group(BILLS-GROUP, 'Monthly Bills', 1),
+        group(FUN-GROUP,   'Fun Money',     2),
+        group(CARDS-GROUP, 'Credit Card Payments', 3, :system),
+    );
+}
+
+# £1,800 in, £400 to Groceries, £72.50 spent from the current account.
+sub funded-view() {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign(PERIOD, GROCERIES, 40000);
+    $f.spend(account => CURRENT, date => '2026-03-14',
+             amount => 7250, category => GROCERIES);
+    $f.compute(through-period => PERIOD);
+}
+
+sub rows-for($view, :@categories = standard-categories(),
+             :@groups = standard-groups(), :%collapsed = %(),
+             Bool :$show-hidden = False, :$icons = icons() --> List) {
+    budget-rows(:@groups, :@categories, :$view, :$scheme, period => PERIOD,
+                :%collapsed, :$show-hidden, :$icons);
+}
+
+sub names(@rows --> List) { @rows.map(*.<category>).List }
+
+# A named lookup rather than an inline `.first(...)<severity>` chain:
+# a postfix subscript on a line-broken method chain parses as a new
+# term, which is a compile error three lines later.
+sub row-for(@rows, Int $id) {
+    @rows.first({ $_<kind> eq 'category' && $_<id> == $id });
+}
+
+sub severity-of(@rows, Int $id --> Str) {
+    my $row = row-for(@rows, $id);
+    $row.defined ?? $row<severity>.Str !! '(no row)';
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'money cells are right-aligned with a one-cell gutter' => {
+    plan 6;
+    # Table lays columns out edge to edge and pads every cell to the
+    # column width, so a figure aligned into the full width would touch
+    # the column next door.
+    is money-cell(41250, 12), '    £412.50 ', 'positive';
+    is money-cell(-750, 11),  '    -£7.50 ',  'negative — sign outside the £';
+    is money-cell(0, 11),     '     £0.00 ',  'zero';
+    is money-cell(41250, 12).chars, 12, 'exactly the column width';
+
+    # The header has to sit over its own digits, not over the column to
+    # its left: Table renders labels left-aligned.
+    is money-header('Available', 12), '  Available ', 'label, same shape';
+
+    # Table truncates cells from the right, so a figure that will not
+    # fit sheds its separators and then its gutter — never its pence.
+    ok money-cell(123456789, 11).starts-with('£1234567.89'),
+        'a figure too wide for the column loses its commas, not its pence';
+};
+
+subtest 'rows are grouped, ordered and indented' => {
+    plan 6;
+    my @rows = rows-for(funded-view());
+
+    is-deeply names(@rows), (
+        '▾ Monthly Bills', '  Groceries',
+        '▾ Fun Money',     '  Dining Out',
+        '▾ Credit Card Payments', '  Visa',
+    ), 'group headers in (sort_order, id) order, each followed by its own';
+
+    is @rows[0]<kind>, 'group',    'header rows are marked as such';
+    is @rows[1]<kind>, 'category', 'and category rows as such';
+    is @rows[1]<id>, GROCERIES,    'a category row carries its own id';
+    is @rows[1]<group-id>, BILLS-GROUP, 'and its owning group';
+    is @rows[0]<id>, BILLS-GROUP,  'a header row carries the group id';
+};
+
+subtest 'Ready to Assign is never a row' => {
+    plan 2;
+    my @rows = rows-for(funded-view());
+    nok @rows.first({ $_<kind> eq 'category' && $_<id> == RTA }).defined,
+        'the rta category has no row — it is the pill above the table';
+    # And not merely filtered by name: it is filtered by kind, so a
+    # renamed rta row is still excluded.
+    my @renamed = standard-categories().map({
+        $_.id == RTA
+            ?? category(RTA, 'Income', kind => 'rta', sort-order => -1)
+            !! $_
+    });
+    nok rows-for(funded-view(), categories => @renamed)
+            .first({ $_<kind> eq 'category' && $_<id> == RTA }).defined,
+        'still excluded when it is called something else';
+};
+
+subtest 'the ungrouped bucket comes last, and only when it has members' => {
+    plan 3;
+    my @rows = rows-for(funded-view());
+    nok names(@rows).first({ $_.contains('Ungrouped') }).defined,
+        'no bucket when every envelope has a group';
+
+    my @with-orphan = (|standard-categories(),
+                       category(77, 'Petrol', sort-order => 5));
+    my @orphaned = rows-for(funded-view(), categories => @with-orphan);
+    is names(@orphaned)[*-2], '▾ Ungrouped',
+        'the bucket is the last header';
+    is names(@orphaned)[*-1], '  Petrol',
+        'with the group-less envelopes under it';
+};
+
+subtest 'an empty group keeps its header — unless the engine owns it' => {
+    plan 3;
+    # A group the user made and has not filled yet must stay visible:
+    # it is the only way to see it exists, and the only row `e` edits
+    # it from.
+    my @groups = (|standard-groups(), group(40, 'Holidays', 4));
+    ok names(rows-for(funded-view(), groups => @groups))
+        .first({ $_ eq '▾ Holidays' }).defined,
+        'an empty group the user made is still shown';
+
+    # "Credit Card Payments" is seeded by the migrations whether or not
+    # the user owns a card, so on a cash-only budget it would be a
+    # permanent empty section for a feature that is not in use.
+    my @no-cards = standard-categories().grep({ !.is-payment });
+    my @rows = rows-for(funded-view(), categories => @no-cards);
+    nok names(@rows).first({ $_.contains('Credit Card') }).defined,
+        'an empty system group is not shown at all';
+    ok names(rows-for(funded-view())).first({ $_.contains('Credit Card') })
+        .defined,
+        'and is shown again the moment a card exists';
+};
+
+subtest 'collapsing a group drops its rows but keeps its total' => {
+    plan 4;
+    my @open = rows-for(funded-view());
+    my @shut = rows-for(funded-view(),
+                        collapsed => %( BILLS-GROUP.Str => True ));
+
+    is names(@shut)[0], '▸ Monthly Bills',
+        'the chevron flips to the collapsed glyph';
+    is @shut.elems, @open.elems - 1, 'and the one category under it is gone';
+    nok @shut.first({ $_<kind> eq 'category' && $_<id> == GROCERIES }).defined,
+        'specifically that one';
+    is @shut[0]<available>, @open[0]<available>,
+        'a folded group still owns its money — the header total is unchanged';
+};
+
+subtest 'group headers total the rows underneath them' => {
+    plan 3;
+    # £400 assigned, £72.50 spent.
+    my @rows = rows-for(funded-view());
+    is @rows[0]<available>, money-cell(32750, AVAILABLE-COLS),
+        'Monthly Bills = its one envelope';
+    is @rows[0]<assigned>, '', 'headers have no assigned cell';
+    is @rows[0]<activity>, '', 'nor an activity cell';
+};
+
+subtest 'the Target column: the figure, or nothing at all' => {
+    plan 8;
+    # Zero is the "no target" sentinel, so the cell has to be BLANK and
+    # not '£0.00' — a column of noughts claims every envelope wants
+    # nothing, which is a much louder statement than "these have not
+    # been given targets".
+    is target-cell(40000), money-cell(40000, TARGET-COLS),
+        'a target renders exactly as any other money cell';
+    is target-cell(0), ' ' x TARGET-COLS, 'no target renders blank';
+    is target-cell(0).chars, TARGET-COLS,
+        'and still fills the column, so the row keeps its shape';
+
+    my @cats = standard-categories().map({
+        $_.id == GROCERIES
+            ?? category(GROCERIES, 'Groceries', group-id => BILLS-GROUP,
+                        sort-order => 1, target-pence => 40000)
+            !! $_
+    });
+    my @rows = rows-for(funded-view(), categories => @cats);
+
+    is row-for(@rows, GROCERIES)<target>, money-cell(40000, TARGET-COLS),
+        'a targeted envelope shows it';
+    is row-for(@rows, DINING)<target>, ' ' x TARGET-COLS,
+        'an untargeted one shows nothing';
+
+    # A header sums exactly the rows underneath it, on the same rule its
+    # available total follows.
+    is @rows[0]<target>, money-cell(40000, TARGET-COLS),
+        'a group header totals its envelopes\' targets';
+    is @rows.first({ $_<kind> eq 'group' && $_<id> == FUN-GROUP })<target>,
+        ' ' x TARGET-COLS,
+        'a group whose envelopes want nothing shows nothing';
+
+    # Two in one group, to prove it is a sum and not the first one it
+    # found.
+    my @two = standard-categories().map({
+        when $_.id == GROCERIES {
+            category(GROCERIES, 'Groceries', group-id => BILLS-GROUP,
+                     sort-order => 1, target-pence => 40000);
+        }
+        when $_.id == DINING {
+            category(DINING, 'Dining Out', group-id => BILLS-GROUP,
+                     sort-order => 2, target-pence => 8000);
+        }
+        default { $_ }
+    });
+    is rows-for(funded-view(), categories => @two)[0]<target>,
+        money-cell(48000, TARGET-COLS), 'and adds them up';
+};
+
+subtest 'the Target column shows what the kind is asking for by now' => {
+    plan 9;
+    # The settled ruling: refill and set-aside show their own amount,
+    # because that IS their per-period figure, and a by-period goal
+    # shows its CURRENT MILESTONE. A column of £50,000 goals would not
+    # add up to anything anybody is being asked for this period, and the
+    # group header underneath it would be worse.
+    #
+    # £5,000 over five periods from January, viewed in the third: the
+    # line says £3,000 by now. Written as a fraction of the goal rather
+    # than as a literal ramp step, so the expectation is the ruling and
+    # not this test's own arithmetic.
+    my constant GOAL  = 500000;
+    my constant START = '2026-01-01';
+    my constant END   = '2026-05-31';       # a date inside the May period
+
+    my $view = funded-view();
+    my $goal-cat = category(50, 'Tax', group-id => BILLS-GROUP,
+                            sort-order => 3, target-pence => GOAL,
+                            target-kind => 'by_period', target-period => END,
+                            target-start => START);
+
+    is target-figure($view, $scheme, $goal-cat, PERIOD), GOAL * 3 div 5,
+        'three periods into a five-period plan, the figure is three fifths';
+
+    my $set-aside = category(51, 'Christmas', group-id => BILLS-GROUP,
+                             sort-order => 4, target-pence => 10000,
+                             target-kind => 'set_aside');
+    is target-figure($view, $scheme, $set-aside, PERIOD), 10000,
+        'a set-aside shows its own per-period amount';
+
+    my $refill = category(GROCERIES, 'Groceries', group-id => BILLS-GROUP,
+                          sort-order => 1, target-pence => 40000);
+    is target-figure($view, $scheme, $refill, PERIOD), 40000,
+        'and a refill shows its level, exactly as v0.1 did';
+
+    is target-figure($view, $scheme,
+        category(52, 'Nothing', group-id => BILLS-GROUP), PERIOD), 0,
+        'no target is no figure';
+
+    # A plan the viewed period is before has no milestone yet — 0, which
+    # the column renders blank rather than as a promise of £0.00.
+    my $future = category(53, 'Next Year', group-id => BILLS-GROUP,
+                          sort-order => 5, target-pence => GOAL,
+                          target-kind => 'by_period',
+                          target-period => '2027-05-31',
+                          target-start => '2027-01-01');
+    is target-figure($view, $scheme, $future, PERIOD), 0,
+        'a plan that has not started asks for nothing and shows nothing';
+
+    my @cats = (|standard-categories().grep({ .id != GROCERIES }),
+                $refill, $set-aside, $goal-cat, $future);
+    my @rows = rows-for($view, categories => @cats);
+
+    is row-for(@rows, 50)<target>, money-cell(GOAL * 3 div 5, TARGET-COLS),
+        'the cell carries the milestone, not the £5,000 goal';
+    is row-for(@rows, 51)<target>, money-cell(10000, TARGET-COLS),
+        'the set-aside cell carries its contribution';
+    is row-for(@rows, 53)<target>, ' ' x TARGET-COLS,
+        'and an unstarted plan\'s cell is blank';
+
+    # The header total: milestones, summed. £400 + £100 + £3,000, with
+    # the goal contributing what it wants BY NOW.
+    is @rows[0]<target>,
+        money-cell(40000 + 10000 + GOAL * 3 div 5, TARGET-COLS),
+        'the group header sums the figures on screen, milestones and all';
+};
+
+subtest 'hidden envelopes are filtered, suffixed and dimmed' => {
+    plan 5;
+    my @cats = standard-categories().map({
+        $_.id == DINING
+            ?? category(DINING, 'Dining Out', group-id => FUN-GROUP,
+                        sort-order => 2, hidden => True)
+            !! $_
+    });
+    my $view = funded-view();
+
+    my @off = rows-for($view, categories => @cats);
+    nok names(@off).first({ $_.contains('Dining') }).defined,
+        'hidden by default';
+    ok names(@off).first({ $_ eq '▾ Fun Money' }).defined,
+        'but its group header stays — the group still exists';
+
+    my @on = rows-for($view, categories => @cats, :show-hidden);
+    my $row = @on.first({ $_<kind> eq 'category' && $_<id> == DINING });
+    is $row<category>, '  Dining Out (hidden)',
+        'shown with the suffix, so a screenshot says so too';
+    is $row<severity>, 'hidden', 'and the dim severity';
+    ok $row<hidden>, 'the row carries the flag for anything else that asks';
+};
+
+subtest 'a group total covers exactly the rows on screen' => {
+    plan 2;
+    # A hidden envelope holding money: while it is off the list its
+    # money must be off the total too, or the column visibly fails to
+    # add up.
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign(PERIOD, GROCERIES, 40000);
+    $f.assign(PERIOD, DINING, 10000);
+    my $view = $f.compute(through-period => PERIOD);
+
+    my @cats = standard-categories().map({
+        $_.id == DINING
+            ?? category(DINING, 'Dining Out', group-id => BILLS-GROUP,
+                        sort-order => 2, hidden => True)
+            !! category($_.id, $_.name, group-id => ($_.id == GROCERIES
+                    ?? BILLS-GROUP !! $_.group-id),
+                sort-order => $_.sort-order, kind => $_.kind,
+                payment-account-id => $_.payment-account-id)
+    });
+
+    is rows-for($view, categories => @cats)[0]<available>,
+        money-cell(40000, AVAILABLE-COLS),
+        'the hidden envelope is out of the total while it is out of the list';
+    is rows-for($view, categories => @cats, :show-hidden)[0]<available>,
+        money-cell(50000, AVAILABLE-COLS),
+        'and back in it when it is shown';
+};
+
+subtest 'a category the period has never heard of is zero-filled' => {
+    plan 4;
+    # `compute` omits all-zero rows from BudgetPeriod.category-periods —
+    # iterating those is the bug this row builder exists to avoid.
+    my $view = funded-view();
+    nok $view.period(PERIOD).has-category(99),
+        'the derivation has no row for a brand-new envelope';
+
+    my @cats = (|standard-categories(),
+                category(99, 'Car Tax', group-id => BILLS-GROUP, sort-order => 9));
+    my @rows = rows-for($view, categories => @cats);
+    my $row = row-for(@rows, 99);
+
+    is $row<assigned>,  money-cell(0, ASSIGNED-COLS),  'assigned reads £0.00';
+    is $row<activity>,  money-cell(0, ACTIVITY-COLS),  'activity reads £0.00';
+    is $row<available>, money-cell(0, AVAILABLE-COLS), 'available reads £0.00';
+};
+
+subtest 'every §2 state gets its own severity' => {
+    plan 12;
+
+    # Positive: funded, partly spent.
+    my @funded = rows-for(funded-view());
+    is severity-of(@funded, GROCERIES), 'positive',
+        'money left in the envelope';
+
+    # Zero: nothing has ever happened to it.
+    is severity-of(@funded, DINING), 'zero',
+        'an envelope with nothing in it';
+
+    # Cash overspend: spent from a cash account with nothing assigned.
+    my $cash = standard-facts();
+    $cash.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $cash.spend(account => CURRENT, date => '2026-03-09',
+                amount => 5000, category => DINING);
+    my $cash-view = $cash.compute(through-period => PERIOD);
+    ok $cash-view.category(PERIOD, DINING).has-flag('cash-overspend'),
+        'the engine calls this cash overspending';
+    is severity-of(rows-for($cash-view), DINING), 'cash-overspend',
+        'and the row is red';
+
+    # Credit overspend: £50 on the card against £10 of funding. The
+    # envelope's own balance stays positive — this is the case that
+    # proves the two overspends are told apart by flag, not by sign.
+    my $credit = standard-facts();
+    $credit.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $credit.assign(PERIOD, GROCERIES, 1000);
+    $credit.spend(account => VISA, date => '2026-03-09',
+                  amount => 5000, category => GROCERIES);
+    my $credit-view = $credit.compute(through-period => PERIOD);
+    ok $credit-view.category(PERIOD, GROCERIES).has-flag('credit-overspend'),
+        'the engine calls this credit overspending';
+    nok $credit-view.category(PERIOD, GROCERIES).has-flag('cash-overspend'),
+        'and specifically not the other kind';
+    is severity-of(rows-for($credit-view), GROCERIES), 'credit-overspend',
+        'so the row is amber, not red — the §2 ruling, in one assertion';
+
+    # Payment envelope in the red: money pulled back out of it.
+    my $pay = standard-facts();
+    $pay.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $pay.assign(PERIOD, VISA-PAY, -5000);
+    my $pay-view = $pay.compute(through-period => PERIOD);
+    is severity-of(rows-for($pay-view), VISA-PAY), 'payment-negative',
+        'a payment envelope in the red is purple';
+
+    # Carried negative: the same spending as the cash-overspend case
+    # above, on an envelope that has been told it may run negative. Same
+    # facts, same sign, different rule — and it must not read as the
+    # red one, because nothing is being charged to Ready to Assign.
+    my $carry = standard-facts();
+    $carry.add-category(7, 'Expenses', sort-order => 3,
+                        carry-overspend => True);
+    $carry.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $carry.spend(account => CURRENT, date => '2026-03-09',
+                 amount => 5000, category => 7);
+    my $carry-view = $carry.compute(through-period => PERIOD);
+    ok $carry-view.category(PERIOD, 7).has-flag('carried-negative'),
+        'the engine calls this a carried negative';
+    nok $carry-view.category(PERIOD, 7).has-flag('cash-overspend'),
+        'and specifically not cash overspending';
+    my @carry-categories = (|standard-categories(),
+        category(7, 'Expenses', group-id => FUN-GROUP, sort-order => 3,
+                 carry-overspend => True));
+    is severity-of(rows-for($carry-view, categories => @carry-categories), 7),
+        'carried-negative',
+        'so the row is purple rather than red — the §2 ruling for the '
+        ~ 'third state';
+
+    # Precedence: credit overspending outranks it, because the amber
+    # says something the purple does not (there is debt on a card).
+    my $both = standard-facts();
+    $both.add-category(7, 'Expenses', sort-order => 3,
+                       carry-overspend => True);
+    $both.spend(account => VISA, date => '2026-03-09', amount => 5000,
+                category => 7);
+    my $both-view = $both.compute(through-period => PERIOD);
+    is severity-of(rows-for($both-view, categories => @carry-categories), 7),
+        'credit-overspend',
+        'credit overspending outranks a carried negative on the same row';
+};
+
+subtest 'severity resolves to distinct styles, and headers to their own' => {
+    plan 8;
+    my $theme = App::Moneymoor::Themes::load('gruvbox');
+    my $cash   = severity-style('cash-overspend',   :$theme);
+    my $credit = severity-style('credit-overspend', :$theme);
+
+    isnt $cash.fg, $credit.fg,
+        'the two overspend kinds are different colours — the engine ruling';
+    is $cash.fg,   $theme.fg-red,   'cash overspend is red';
+    is $credit.fg, $theme.fg-amber, 'credit overspend is amber';
+    is severity-style('payment-negative', :$theme).fg, $theme.fg-purple,
+        'a negative payment envelope is purple';
+    # One hue, two keys: the arithmetic is identical (it carries, and
+    # nothing is charged), and the rail is where they are told apart.
+    is severity-style('carried-negative', :$theme).fg, $theme.fg-purple,
+        'and so is a carried negative';
+    isnt severity-style('carried-negative', :$theme).fg, $cash.fg,
+        'which is emphatically not the red one';
+
+    my $header = severity-style('header', :$theme);
+    ok $header.bold, 'group headers are bold';
+    is $header.bg, $theme.bg-surface, 'on the surface colour';
+};
+
+subtest 'the Ready-to-Assign pill says the three things it can say' => {
+    plan 7;
+
+    # Positive: £1,800 in, £400 out to an envelope.
+    my %funded = rta-summary(funded-view(), PERIOD);
+    is %funded<text>, 'Ready to Assign  £1,400.00', 'the figure, in words';
+    is %funded<severity>, 'rta-positive', 'green and bold';
+
+    # Zero is not "£0.00": a budget with every penny given a job is the
+    # goal state and the pill says so.
+    my $spent = standard-facts();
+    $spent.inflow(account => CURRENT, date => '2026-03-01', amount => 40000);
+    $spent.assign(PERIOD, GROCERIES, 40000);
+    my %zero = rta-summary($spent.compute(through-period => PERIOD), PERIOD);
+    is %zero<text>, 'All money assigned ✓', 'the goal state, in words';
+    is %zero<severity>, 'rta-zero', 'and dim rather than green';
+
+    # Negative: assigned more than exists.
+    my $over = standard-facts();
+    $over.inflow(account => CURRENT, date => '2026-03-01', amount => 10000);
+    $over.assign(PERIOD, GROCERIES, 25000);
+    my %neg = rta-summary($over.compute(through-period => PERIOD), PERIOD);
+    is %neg<text>, '‼ Ready to Assign  -£150.00',
+        'the warning glyph leads, and the sign is outside the £';
+    is %neg<severity>, 'rta-negative', 'red and bold';
+
+    # The future-assignment note only appears when there is one.
+    my $ahead = standard-facts();
+    $ahead.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $ahead.assign('2026-05-01', GROCERIES, 30000);
+    my %future = rta-summary(
+        $ahead.compute(through-period => '2026-05-01'), PERIOD);
+    is %future<note>, '£300.00 assigned in future periods',
+        'money committed to a period the user is not looking at';
+};
+
+subtest 'the pill tolerates a period (and a view) that does not exist' => {
+    plan 4;
+    # Navigating back before the first fact is an ordinary thing to do,
+    # and the window between building the screen and the first
+    # recompute is a real one.
+    my %early = rta-summary(funded-view(), '2020-01-01');
+    is %early<rta>, 0, 'a period outside the derived range has no RTA';
+    is %early<note>, '', 'and no future note';
+
+    my %none = rta-summary(Any, PERIOD);
+    is %none<severity>, 'rta-zero', 'nor does an uncomputed view';
+    is %none<text>, 'All money assigned ✓', 'which reads honestly enough';
+};
+
+subtest 'the envelope picker excludes rta and self, keeps payment' => {
+    plan 6;
+    my @options = envelope-options(
+        categories => standard-categories(), groups => standard-groups(),
+        exclude-id => GROCERIES,
+    );
+
+    is-deeply @options.map(*.key).List,
+        ('Fun Money · Dining Out', 'Credit Card Payments · Visa'),
+        'grouped labels, grid order, the source envelope dropped';
+    is-deeply @options.map(*.value).List, (DINING, VISA-PAY),
+        'and the ids that go with them';
+    nok @options.map(*.value).first({ $_ == RTA }).defined,
+        'Ready to Assign is never a target — it is the pool, not an envelope';
+    ok @options.map(*.value).first({ $_ == VISA-PAY }).defined,
+        'a card payment envelope is — funding it from Groceries is ordinary';
+
+    # Hidden envelopes follow the same switch the grid does.
+    my @cats = standard-categories().map({
+        $_.id == DINING
+            ?? category(DINING, 'Dining Out', group-id => FUN-GROUP,
+                        sort-order => 2, hidden => True)
+            !! $_
+    });
+    is envelope-options(categories => @cats, groups => standard-groups())
+        .elems, 2, 'a hidden envelope is off the list by default';
+    is envelope-options(categories => @cats, groups => standard-groups(),
+                        :include-hidden).elems, 3, 'and on it when asked for';
+};
+
+subtest 'the header glyph follows the icon tier' => {
+    plan 4;
+    my $nerd = icons('nerd');
+    is group-label('Bills', :!collapsed), '▾ Bills', 'unicode, expanded';
+    is group-label('Bills', :collapsed),  '▸ Bills', 'unicode, collapsed';
+    is group-label('Bills', :!collapsed, icons => $nerd),
+        $nerd.group-expanded ~ ' Bills', 'nerd, expanded';
+    is group-label('Bills', :collapsed, icons => $nerd),
+        $nerd.group-collapsed ~ ' Bills', 'nerd, collapsed';
+};

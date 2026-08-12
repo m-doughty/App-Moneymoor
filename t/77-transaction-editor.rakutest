@@ -1,0 +1,676 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Checkbox;
+use Selkie::Widget::ListView;
+use Selkie::Widget::RadioGroup;
+use Selkie::Widget::Select;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The transaction editor, filled in and saved, against a real
+# SQLCipher file.
+#
+# t/73 pins the rules the form restates; this drives the form itself —
+# type into the fields, press the keys, watch the row land in the
+# database. It is the only test that exercises the whole chain the user
+# actually walks: keypress → validation → submit supply → the mutation
+# effect → the gateway → the recompute.
+#
+# The splits editor gets the same treatment, including its nested
+# dialog: Selkie stacks modals, so the entries list is a second modal
+# opened on top of a live editor, and the thing worth proving is that
+# the editor underneath still has everything the user typed.
+#
+# Nothing here reads the clock except the date field's own default,
+# which is asserted against Date.today deliberately — it is what the
+# field is documented to do.
+
+plan 13;
+
+my constant DAY = '2026-03-11';
+
+my $db-path = $*TMPDIR.add("moneymoor-txn-editor-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash', sort-order => 1));
+my $house = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'House', type => 'tracking', sort-order => 2));
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+my $fuel = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Fuel', group-id => $bills.id, sort-order => 2));
+my $rta = $ws.categories.rta-category;
+
+# --- The stand-ins ----------------------------------------------------
+
+#| The register, as much of it as a dialog ever touches.
+my class FakeTab {
+    has Int $.register-account-id = 0;
+    has $.selected-transaction;
+}
+
+my class FakeMain {
+    has $.app;                     # Nil — every toast is guarded
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.accounts-tab is rw;
+    has @.modals;
+    has @.bodies;
+
+    method icons() { icons() }
+    method account(Int $id) {
+        $id.defined ?? $!workspace.accounts.find-by-id($id) !! Nil;
+    }
+    method category(Int $id) {
+        $id.defined
+            ?? $!workspace.categories.find-all(:include-hidden)
+                   .first({ .id == $id })
+            !! Nil;
+    }
+    method payee(Int $id) {
+        $id.defined ?? $!workspace.payees.find-all.first({ .id == $id }) !! Nil;
+    }
+    method accounts(--> List) {
+        $!workspace.accounts.find-all(:include-closed).List;
+    }
+    method categories(--> List) {
+        $!workspace.categories.find-all(:include-hidden).List;
+    }
+    method groups(--> List) {
+        $!workspace.categories.find-groups(:include-hidden).List;
+    }
+    method payees(--> List) { $!workspace.payees.find-all.List }
+    method view() { Nil }
+
+    #| The real one closes the modal and then runs the body. Here the
+    #| modal is only recorded — there is no screen to close it off —
+    #| but the tap is the same, so a submit really does reach the
+    #| gateway.
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { @!bodies.push($emitted); body($emitted) };
+    }
+}
+
+sub fixture(Int :$account-id = 0, :$selected --> Hash) {
+    my $store = mock-store;
+    my @toasts;
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws, toast => -> Str $m { @toasts.push($m) },
+    ).register($store);
+    my $main = FakeMain.new(
+        :$store, workspace => $ws,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    $main.accounts-tab = FakeTab.new(register-account-id => $account-id,
+                                     selected-transaction => $selected);
+    dispatch-and-tick($store, 'app/init');
+    { :$store, :$main, :@toasts };
+}
+
+# --- Reaching into a built dialog -------------------------------------
+
+#| Every labelled field, keyed by its caption. The editor's rows are
+#| two-child VBoxes — a Text caption over its control — so the caption
+#| is the only stable handle a test has on a widget built inside a sub.
+sub fields($modal --> Hash) {
+    my %out;
+    for $modal.content.children -> $child {
+        next unless $child.can('children');
+        my @kids = $child.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %out{ @kids[0].text } = @kids[1];
+    }
+    %out;
+}
+
+sub widget-of($modal, $type) {
+    $modal.content.children.first({ $_ ~~ $type });
+}
+
+#| The status line: the last flex child, which is where every refusal
+#| the dialog makes ends up.
+sub status($modal --> Str) {
+    my @texts = $modal.content.children.grep({ $_ ~~ Selkie::Widget::Text });
+    (@texts.tail andthen .text) // '';
+}
+
+sub remainder-line($modal --> Str) {
+    my @texts = $modal.content.children.grep({ $_ ~~ Selkie::Widget::Text });
+    (@texts[*-2] andthen .text) // '';
+}
+
+sub category-index($select, Str $name --> Int) {
+    ($select.items.first({ $_.contains($name) }, :k) // 0).Int;
+}
+
+sub txn-count(--> Int) { $ws.transactions.find-all.elems }
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'a new transaction, typed and saved' => {
+    plan 7;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    is $modal.frame-title, 'New transaction', 'the dialog knows what it is';
+    is %field<Date>.text, Date.today.Str, 'the date field defaults to today';
+
+    %field<Date>.set-text(DAY);
+    %field<Payee>.set-text('Tesco');
+    %field<Amount>.set-text('42.10');
+    %field<Memo>.set-text('weekly shop');
+    %field<Category>.select-index(
+        category-index(%field<Category>, 'Groceries').UInt);
+
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $saved = $ws.transactions.find-all.first({ .memo eq 'weekly shop' });
+    ok $saved.defined, 'the row reached the database';
+    is $saved.amount, -4210,
+        'as an outflow, which is the direction the form defaults to';
+    is $saved.date, DAY, 'on the date that was typed';
+
+    my $payee = $ws.payees.find-by-name('Tesco');
+    ok $payee.defined && $saved.payee-id == $payee.id,
+        'and the payee was created on the way past';
+
+    my @splits = $ws.transactions.find-splits($saved.id);
+    ok @splits.elems == 1 && @splits[0].category-id == $groceries.id,
+        'a single-category transaction is stored as exactly one split';
+};
+
+subtest 'the Inflow choice flips the sign' => {
+    plan 4;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my $direction = widget-of($modal, Selkie::Widget::RadioGroup);
+
+    is-deeply $direction.items.List, ('Outflow', 'Inflow'),
+        'the two directions, in register order';
+    # The exact string, not a .contains probe: `RTA-LABEL => ...` once
+    # autoquoted the bareword and the picker printed "RTA-LABEL". The
+    # category-index helper's `// 0` fallback happens to be the RTA
+    # row's index, so only a literal comparison catches that regression.
+    is %field<Category>.items[0], 'Inflow: Ready to Assign',
+        'the picker leads with Ready to Assign, spelled for humans';
+    $direction.select-index(1);
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('2,000');
+    %field<Memo>.set-text('payday');
+    %field<Category>.select-index(
+        category-index(%field<Category>, 'Ready to Assign').UInt);
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $saved = $ws.transactions.find-all.first({ .memo eq 'payday' });
+    is $saved.amount, 200000, 'money in is positive in the account';
+    is $ws.transactions.find-splits($saved.id)[0].category-id, $rta.id,
+        'and lands in Ready to Assign, where a payday belongs';
+};
+
+subtest 'the splits editor, through its own nested dialog' => {
+    plan 8;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    my Int $before = txn-count();
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my $splits = widget-of($modal, Selkie::Widget::ListView);
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('30.00');
+    %field<Memo>.set-text('split shop');
+    ok $splits.items[0].contains('press a to split'),
+        'the list says how to start one';
+
+    # `a` opens the entry dialog on top of the editor. The editor stays
+    # on the stack with everything typed into it so far — which is the
+    # whole reason the splits are an entries list.
+    press-key($splits, 'a');
+    is $main.modals.elems, 2, 'the entry dialog opened over the editor';
+    my $entry = $main.modals[1];
+    my %entry-field = fields($entry);
+    %entry-field<Category>.select-index(
+        category-index(%entry-field<Category>, 'Groceries').UInt);
+    %entry-field<Amount>.set-text('12.00');
+    %entry-field<Memo>.set-text('food');
+    press-key($entry, 'ctrl+s');
+
+    ok $splits.items[0].contains('Groceries'), 'the entry joined the list';
+    ok remainder-line($modal).contains('£18.00 unallocated'),
+        'and the remainder says what is left';
+
+    # Saving is refused while the remainder is non-zero. There is no
+    # Save button to grey out, so the refusal *is* the greying.
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    is txn-count(), $before, 'ctrl+s writes nothing while it does not add up';
+    ok status($modal).contains('do not add up'), 'and says so';
+
+    press-key($splits, 'a');
+    my $second = $main.modals[2];
+    my %second-field = fields($second);
+    %second-field<Category>.select-index(
+        category-index(%second-field<Category>, 'Fuel').UInt);
+    %second-field<Amount>.set-text('18.00');
+    press-key($second, 'ctrl+s');
+    ok remainder-line($modal).contains('All £30.00 allocated'),
+        'the second entry closes the gap';
+
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    my $saved = $ws.transactions.find-all.first({ .memo eq 'split shop' });
+    my @splits = $ws.transactions.find-splits($saved.id).sort({ .amount });
+    is-deeply @splits.map({ ($_.category-id, $_.amount) }).List,
+        (($fuel.id, -1800), ($groceries.id, -1200)),
+        'and both lines are stored, signed by the transaction\'s direction';
+};
+
+subtest 'a split can run against the transaction\'s direction' => {
+    plan 2;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my $splits = widget-of($modal, Selkie::Widget::ListView);
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('10.00');
+    %field<Memo>.set-text('shop with a refund');
+
+    # £12.50 of shopping and a £2.50 refund on the same receipt, in an
+    # outflow. Accountant parentheses are how the line that runs the
+    # other way is typed — the same notation the Assign field uses.
+    press-key($splits, 'a');
+    my %one = fields($main.modals[1]);
+    %one<Category>.select-index(
+        category-index(%one<Category>, 'Groceries').UInt);
+    %one<Amount>.set-text('12.50');
+    press-key($main.modals[1], 'ctrl+s');
+
+    press-key($splits, 'a');
+    my %two = fields($main.modals[2]);
+    %two<Category>.select-index(category-index(%two<Category>, 'Fuel').UInt);
+    %two<Amount>.set-text('(2.50)');
+    press-key($main.modals[2], 'ctrl+s');
+
+    ok remainder-line($modal).contains('All £10.00 allocated'),
+        'the refund counts against the total';
+
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    my $saved = $ws.transactions.find-all.first({
+        .memo eq 'shop with a refund' });
+    is-deeply $ws.transactions.find-splits($saved.id)
+                  .map({ $_.amount }).sort.List,
+        (-1250, 250),
+        'and the refund line is positive inside a negative transaction';
+};
+
+subtest 'a tracking account is never categorised' => {
+    plan 5;
+    my %f = fixture(account-id => $house.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    is %field<Category>.items.elems, 1, 'there is nothing to pick';
+    ok %field<Category>.items[0].contains('tracking account'),
+        'and the picker says why';
+    # The splits list is mounted either way — its content changes, not
+    # its presence — so its placeholder has to be honest about the fact
+    # that the split keys are not bound here.
+    ok widget-of($modal, Selkie::Widget::ListView).items[0]
+           .contains('tracking account'),
+        'and so does the splits list, whose keys are not bound';
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('1,500');
+    %field<Memo>.set-text('house revaluation');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $saved = $ws.transactions.find-all.first({
+        .memo eq 'house revaluation' });
+    ok $saved.defined, 'the row saved anyway';
+    is $ws.transactions.find-splits($saved.id).elems, 0,
+        'with no splits at all, which is what the engine demands';
+};
+
+subtest 'editing keeps what was not edited' => {
+    plan 5;
+    my $txn = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => DAY, amount => -999,
+            memo => 'before'),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -999)],
+    );
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor(
+        $main, transaction-id => $txn.id);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    is $modal.frame-title, 'Edit transaction', 'the dialog knows what it is';
+    is %field<Amount>.text, '9.99',
+        'the amount opens as a magnitude, not a signed figure';
+    # The account is static text on an edit: the engine refuses to move
+    # a transfer leg, and moving an ordinary transaction between
+    # accounts is not something to offer beside a memo field.
+    ok %field<Account> ~~ Selkie::Widget::Text, 'the account is read-only';
+
+    %field<Memo>.set-text('after');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $after = $ws.transactions.find-by-id($txn.id);
+    is $after.memo, 'after', 'the memo changed';
+    is-deeply $ws.transactions.find-splits($txn.id)
+                  .map({ ($_.category-id, $_.amount) }).List,
+        (($groceries.id, -999),),
+        'and the split it already had is still the split it has';
+};
+
+subtest 'a malformed field is refused without closing the dialog' => {
+    plan 4;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    my Int $before = txn-count();
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    %field<Date>.set-text('the eleventh');
+    %field<Amount>.set-text('42.10');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    ok status($modal).contains('Malformed date'), 'the date is checked';
+    is txn-count(), $before, 'and nothing was written';
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('-5');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    ok status($modal).contains('positive'),
+        'a negative amount is refused — the direction is the radio\'s job';
+    is txn-count(), $before, 'and still nothing was written';
+};
+
+subtest 'a reconciled transaction is asked about first' => {
+    plan 3;
+    my $txn = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => DAY, amount => -100,
+            memo => 'locked', cleared => 'reconciled'),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -100)],
+    );
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor(
+        $main, transaction-id => $txn.id);
+
+    is $main.modals.elems, 1, 'one dialog opened';
+    nok $main.modals[0].content.children.first({
+        $_.can('children') && $_.children.first({
+            $_ ~~ Selkie::Widget::TextInput }).defined }).defined,
+        'and it is the confirm, not the editor — nothing is editable on it';
+
+    # The editor is reachable, but only through the answered warning.
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor(
+        $main, transaction-id => $txn.id, confirmed => True);
+    is $main.modals[1].frame-title, 'Edit transaction',
+        'saying yes comes back through the same door';
+};
+
+subtest 'the cleared checkbox does not demote a reconciled row' => {
+    plan 3;
+    my $txn = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => DAY, amount => -250,
+            memo => 'stays reconciled', cleared => 'reconciled'),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -250)],
+    );
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor(
+        $main, transaction-id => $txn.id, confirmed => True);
+    my $modal = $main.modals[0];
+    my $cleared = widget-of($modal, Selkie::Widget::Checkbox);
+
+    ok $cleared.checked, 'a reconciled row opens with the box ticked';
+
+    # The box has two states and the engine has three, so leaving it
+    # alone has to mean "leave it alone" — otherwise every memo edit on
+    # a reconciled row would quietly un-reconcile it.
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    is $ws.transactions.find-by-id($txn.id).cleared, 'reconciled',
+        'and saving without touching it keeps the row reconciled';
+
+    $cleared.set-checked(False);
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    is $ws.transactions.find-by-id($txn.id).cleared, 'uncleared',
+        'while clearing it deliberately does what it says';
+};
+
+subtest 'the splits list hands the picker back when it empties' => {
+    plan 6;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my $splits = widget-of($modal, Selkie::Widget::ListView);
+
+    %field<Amount>.set-text('20.00');
+    %field<Category>.select-index(
+        category-index(%field<Category>, 'Fuel').UInt);
+    my Str $chosen = %field<Category>.selected-value;
+
+    press-key($splits, 'a');
+    my %entry = fields($main.modals[1]);
+    %entry<Category>.select-index(
+        category-index(%entry<Category>, 'Groceries').UInt);
+    %entry<Amount>.set-text('5.00');
+    press-key($main.modals[1], 'ctrl+s');
+
+    is %field<Category>.items.elems, 1,
+        'the picker steps aside while the splits are in charge';
+    ok %field<Category>.items[0].contains('split across 1'),
+        'and says what took it over';
+
+    # `e` edits the line under the cursor, in the same dialog `a` used.
+    press-key($splits, 'e');
+    my %again = fields($main.modals[2]);
+    is $main.modals[2].frame-title, 'Edit split',
+        'e opens the entry it is on, not a new one';
+    %again<Amount>.set-text('6.00');
+    press-key($main.modals[2], 'ctrl+s');
+    ok $splits.items[0].contains('£6.00'), 'and the edit lands in the list';
+
+    # `d` takes it away again, and the picker comes back — on the
+    # envelope the user had chosen, not on the one the dialog opened on.
+    press-key($splits, 'd');
+    ok $splits.items[0].contains('press a to split'),
+        'the list is empty again';
+    is %field<Category>.selected-value, $chosen,
+        'and the picker is back where the user left it';
+};
+
+subtest 'n from the All-Accounts register still has to pick a ledger' => {
+    plan 5;
+    # The register's default view is All Accounts, which is not an
+    # account — the editor opens on the first one in the picker rather
+    # than refusing, and the user can change it before saving.
+    my %f = fixture(account-id => 0);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    ok %field<Account> ~~ Selkie::Widget::Select,
+        'a new transaction chooses its account';
+    is %field<Account>.selected-value, 'Current',
+        'opening on the first ledger rather than on nothing';
+
+    # Switching to a tracking account has to take the category picker
+    # away with it — otherwise the form would build a split the engine
+    # then refuses, and the user would be stuck on a dialog that will
+    # not save for a reason it is no longer showing.
+    %field<Account>.select-index(
+        category-index(%field<Account>, 'House').UInt);
+    ok %field<Category>.items[0].contains('tracking account'),
+        'switching to a tracking account takes the picker away';
+    ok widget-of($modal, Selkie::Widget::ListView).items[0]
+           .contains('tracking account'),
+        'and the splits with it';
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('1.00');
+    %field<Memo>.set-text('picked a ledger');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    is $ws.transactions.find-all.first({ .memo eq 'picked a ledger' })
+           .account-id,
+       $house.id, 'and the one that was chosen is the one it lands on';
+};
+
+subtest 'Enter in a text field saves; Enter on a control does not' => {
+    plan 8;
+    # Every field in this dialog is single-line, so Enter has nothing
+    # else to mean in one — and it is wired per field rather than as a
+    # modal keybind because Selkie hands a key to the FOCUSED widget
+    # first: a modal-level `enter` would never see it, and the pickers
+    # that already own Enter would keep it anyway.
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    my Int $before = txn-count();
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my $splits = widget-of($modal, Selkie::Widget::ListView);
+    my $cleared = widget-of($modal, Selkie::Widget::Checkbox);
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('7.50');
+    %field<Memo>.set-text('enter saved me');
+    %field<Category>.select-index(
+        category-index(%field<Category>, 'Groceries').UInt);
+
+    # Enter on the category picker opens its dropdown. Nothing is saved
+    # and the editor is still up.
+    %field<Category>.set-focused(True);
+    press-key(%field<Category>, 'enter');
+    is txn-count(), $before, 'Enter on a Select writes nothing';
+    ok %field<Category>.is-open, 'it opens the dropdown instead';
+    press-key(%field<Category>, 'esc');
+    %field<Category>.set-focused(False);
+
+    # Enter on the cleared checkbox toggles it.
+    my Bool $was = $cleared.checked;
+    $cleared.set-focused(True);
+    press-key($cleared, 'enter');
+    isnt $cleared.checked, $was, 'Enter on a Checkbox toggles it';
+    is txn-count(), $before, 'and still writes nothing';
+    $cleared.set-focused(False);
+
+    # Enter on the splits list edits the split under the cursor — here
+    # there are none, so it is the placeholder row and nothing opens.
+    # ListView takes keys without a focus flag of its own.
+    press-key($splits, 'enter');
+    is txn-count(), $before, 'Enter on the splits list writes nothing';
+
+    # Enter in a text field is the save.
+    %field<Memo>.set-focused(True);
+    press-key(%field<Memo>, 'enter');
+    %f<store>.tick;
+    is txn-count(), $before + 1, 'Enter in a text field saves';
+    my $saved = $ws.transactions.find-all.first({ .memo eq 'enter saved me' });
+    ok $saved.defined && $saved.amount == -750,
+        'with everything the form had in it';
+    ok $modal.frame-bottom-title.contains('enter/^s save'),
+        'and the footer says so';
+};
+
+subtest 'Enter obeys the same gating ctrl+s does' => {
+    plan 4;
+    # The splits-remainder refusal is the gate with real money behind
+    # it: Enter must not be a way around it.
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    my Int $before = txn-count();
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+    my $splits = widget-of($modal, Selkie::Widget::ListView);
+
+    %field<Date>.set-text(DAY);
+    %field<Amount>.set-text('30.00');
+    %field<Memo>.set-text('enter cannot skip the remainder');
+
+    press-key($splits, 'a');
+    my %entry = fields($main.modals[1]);
+    %entry<Category>.select-index(
+        category-index(%entry<Category>, 'Groceries').UInt);
+    %entry<Amount>.set-text('12.00');
+    press-key($main.modals[1], 'ctrl+s');
+
+    %field<Memo>.set-focused(True);
+    press-key(%field<Memo>, 'enter');
+    %f<store>.tick;
+    is txn-count(), $before, 'Enter writes nothing while the splits do not add up';
+    ok status($modal).contains('do not add up'), 'and says so, as ctrl+s does';
+
+    # A malformed field is the other refusal, and it must keep the
+    # dialog open rather than closing on a typo.
+    %field<Amount>.set-text('twelve quid');
+    press-key(%field<Amount>, 'enter');
+    %f<store>.tick;
+    is txn-count(), $before, 'nor with an amount that will not parse';
+    ok status($modal).chars > 0, 'the error line is still saying why';
+};

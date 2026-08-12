@@ -1,0 +1,48 @@
+[app]
+name = "App::Moneymoor"      # dist name
+exec = "moneymoor"           # launcher/binary name
+display = "Moneymoor"
+
+[bundle]
+platforms = ["macos-arm64", "linux-x86_64-glibc", "windows-x86_64"]
+native = ["notcurses", "sqlcipher"]
+
+# Commands `ariza smoke` runs against a freshly built bundle, each with a
+# replaced (env -i style) environment. Every entry is argv, verbatim --
+# nothing goes through a shell, so there is no quoting layer to get wrong.
+#
+# The first proves the launcher starts the app at all. The second proves
+# the part a --version flag never touches: that the bundled SQLCipher
+# actually loads, and that an encrypted database can be created, written
+# and reopened from inside the bundle. That is the failure worth catching
+# -- a bundle whose TUI paints perfectly and cannot open a budget.
+smoke = [
+    ["{exec}", "--version"],
+    ["{raku}", "-e", '''
+use App::Moneymoor::DB;
+
+my $path = @*ARGS[0].IO.add('ariza-smoke.sqlcipher');
+$path.unlink if $path.e;
+
+my $db = App::Moneymoor::DB.new(:db-path($path.absolute));
+my $opened = $db.connect('ariza-smoke-passphrase');
+die "connect failed: " ~ $opened.exception.message if $opened ~~ Failure;
+$db.execute('CREATE TABLE ariza_smoke (id INTEGER PRIMARY KEY, note TEXT)');
+$db.execute('INSERT INTO ariza_smoke (note) VALUES (?)', 'round-trip');
+$db.disconnect;
+
+my $again = App::Moneymoor::DB.new(:db-path($path.absolute));
+my $reopened = $again.connect('ariza-smoke-passphrase');
+die "reopen failed: " ~ $reopened.exception.message if $reopened ~~ Failure;
+my $row = $again.query-one('SELECT note FROM ariza_smoke WHERE id = 1');
+die "row did not survive the round trip" unless ($row // {})<note> eq 'round-trip';
+$again.disconnect;
+
+say "ok: encrypted database created, written and reopened";
+''', "{tmp}"],
+]
+
+# Where the generated install.sh / install.ps1 fetch releases from, and
+# the repository whose raw files the `curl … | sh` one-liner names.
+[installer]
+repo = "m-doughty/App-Moneymoor"

@@ -1,0 +1,263 @@
+use Test;
+use lib 'lib';
+
+use Selkie::Style;
+use Selkie::Widget::RichText;
+use Selkie::Widget::RichText::Span;
+
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::HintBar;
+
+# The keybind hint bar. Pure: a context key, a width and a palette in,
+# a list of Spans out — no store, no widget, no terminal.
+#
+# Three things are worth pinning here and nowhere else:
+#
+#   1. Every context in %HINTS resolves to a well-formed, non-empty
+#      group list — the table is the contract other modules build
+#      against.
+#   2. Whole-group truncation. Half a keybind is worse than no
+#      keybind, so the renderer must never cut inside a group — and
+#      must keep as many groups as actually fit, or the bar silently
+#      under-fills a wide terminal.
+#   3. The styling roles (accent-bold key, dim label, dimmer
+#      separator). They are what make the bar readable at a glance;
+#      a regression to one flat colour would look "fine" in a
+#      screenshot diff and lose the entire point of the item.
+
+my $THEME = App::Moneymoor::Themes::load('gruvbox');
+
+my constant TAIL = '… ^h';
+my constant SEP  = ' · ';
+
+sub rendered(@spans --> Str) { @spans.map(*.text).join }
+
+sub group-text($group --> Str) { $group.key ~ ' ' ~ $group.value }
+
+# Columns a whole-group prefix of $n groups occupies.
+sub prefix-cols(@groups, Int $n --> Int) {
+    return 0 if $n <= 0;
+    @groups[^$n].map({ group-text($_).chars }).sum + SEP.chars * ($n - 1);
+}
+
+plan 9;
+
+subtest "every context resolves to a non-empty, well-formed group list" => {
+    my @contexts = hint-contexts();
+    plan 1 + @contexts.elems * 3;
+
+    is-deeply hint-contexts(),
+        <budget generic login reconcile register reports sidebar>.List,
+        "the shipped context keys";
+
+    for @contexts -> $ctx {
+        my @groups = hint-groups($ctx);
+        ok @groups.elems > 0, "$ctx: has hints";
+        ok @groups.all ~~ Pair, "$ctx: every entry is a key => label pair";
+        ok @groups.grep({ .key.chars == 0 || .value.chars == 0 }).elems == 0,
+            "$ctx: no blank key or label";
+    }
+};
+
+subtest "an unknown or empty context falls back to generic" => {
+    plan 4;
+    is-deeply hint-groups('made-up-context'), hint-groups('generic'),
+        "an unrecognised name";
+    is-deeply hint-groups(''), hint-groups('generic'), "the empty string";
+    is-deeply hint-groups(Str), hint-groups('generic'), "an undefined Str";
+    is rendered(hint-spans('made-up-context', 200, theme => $THEME)),
+       rendered(hint-spans('generic', 200, theme => $THEME)),
+       "…and the same holds through the renderer";
+};
+
+subtest "a generous width renders every group, in order, with no tail" => {
+    my @contexts = hint-contexts();
+    plan @contexts.elems * 3;
+
+    for @contexts -> $ctx {
+        my @groups = hint-groups($ctx);
+        my $text = rendered(hint-spans($ctx, 500, theme => $THEME));
+        is $text, @groups.map(&group-text).join(SEP),
+            "$ctx: every group, separator-joined, in table order";
+        nok $text.contains(TAIL), "$ctx: no truncation tail";
+        is $text.chars, prefix-cols(@groups, @groups.elems),
+            "$ctx: rendered width matches the computed group widths";
+    }
+};
+
+subtest "narrow widths drop whole groups and say so" => {
+    my @contexts = hint-contexts();
+    plan @contexts.elems;
+
+    # Sweep every context across every width a terminal could
+    # plausibly hand the footer and assert the invariants hold at all
+    # of them, rather than pinning a handful of magic numbers (those
+    # are the next subtest).
+    for @contexts -> $ctx {
+        my @groups = hint-groups($ctx);
+        my @broken;
+        for 1 .. 200 -> $w {
+            my @spans = hint-spans($ctx, $w, theme => $THEME);
+            my $text  = rendered(@spans);
+
+            # Tail-only is the documented floor: it may exceed a
+            # very narrow width because there is nothing shorter to
+            # show. Everything else must fit.
+            if $text ne TAIL && $text.chars > $w {
+                @broken.push("w=$w: {$text.chars} chars > $w");
+                next;
+            }
+
+            if !$text.contains(TAIL) {
+                # Untruncated ⇒ the whole line.
+                @broken.push("w=$w: no tail but not the full line")
+                    unless $text eq @groups.map(&group-text).join(SEP);
+                next;
+            }
+
+            # Truncated: a whole-group prefix, then the tail…
+            # Strip the ' ' ~ TAIL suffix the renderer appends.
+            my $kept-text = $text eq TAIL
+                ?? ''
+                !! $text.substr(0, $text.chars - 1 - TAIL.chars);
+            my $kept = $kept-text.chars == 0
+                ?? 0 !! $kept-text.split(SEP).elems;
+            @broken.push("w=$w: '$kept-text' is not a group prefix")
+                unless $kept-text eq @groups.map(&group-text)
+                                            .head($kept).join(SEP);
+
+            # …and one more group would not have fitted (maximality —
+            # without this, "always show the tail alone" would pass).
+            if $kept < @groups.elems {
+                my $needed = prefix-cols(@groups, $kept + 1)
+                           + 1 + TAIL.chars;
+                @broken.push("w=$w: kept $kept groups but $needed <= $w")
+                    unless $needed > $w;
+            }
+        }
+        is @broken.elems, 0,
+            "$ctx: whole-group truncation holds at widths 1..200"
+            ~ (@broken ?? " ({@broken.head(3).join('; ')})" !! '');
+    }
+};
+
+subtest "pinned truncation cases" => {
+    plan 2;
+
+    is rendered(hint-spans('generic', 15, theme => $THEME)),
+       "Tab focus {TAIL}",
+       "generic at 15 columns keeps one group";
+
+    is rendered(hint-spans('budget', 30, theme => $THEME)),
+       "a assign · m move {TAIL}",
+       "budget at 30 columns keeps two groups";
+};
+
+subtest "degenerate widths never throw" => {
+    plan 8;
+
+    for 4, 3, 2, 1 -> $w {
+        is rendered(hint-spans('budget', $w, theme => $THEME)), TAIL,
+            "width $w: the tail alone";
+    }
+    is-deeply hint-spans('budget', 0, theme => $THEME), (),
+        "width 0: no spans at all";
+    is-deeply hint-spans('budget', -40, theme => $THEME), (),
+        "a negative width: no spans, no exception";
+    is-deeply hint-spans('budget', 100, theme => $THEME, reserve => 100),
+        (), "a reservation that eats the whole width";
+    is-deeply hint-spans('budget', 100, theme => $THEME, reserve => 400),
+        (), "…and one that over-eats it";
+};
+
+subtest "the styling contract" => {
+    my @spans = hint-spans('budget', 500, theme => $THEME);
+    plan 3 + @spans.elems;
+
+    # At a generous width every group has a label, so the spans run
+    # key, label, (separator, key, label) × n.
+    my @roles = flat 'key', 'label',
+        (('sep', 'key', 'label') xx (hint-groups('budget').elems - 1));
+    is @spans.elems, @roles.elems, "one span per key / label / separator";
+
+    for @spans.kv -> $i, $span {
+        my $style = $span.style;
+        given @roles[$i] {
+            when 'key' {
+                ok $style.fg == $THEME.accent && so $style.bold
+                   && !$span.text.starts-with(' '),
+                    "span $i ({$span.text}): key — accent, bold";
+            }
+            when 'label' {
+                ok $style.fg == $THEME.fg-dim && !$style.bold
+                   && $span.text.starts-with(' '),
+                    "span $i ({$span.text.trim}): label — fg-dim, not bold,"
+                    ~ " carries the key/label space";
+            }
+            when 'sep' {
+                ok $style.fg == $THEME.fg-dimmer && $span.text eq SEP,
+                    "span $i: separator — fg-dimmer";
+            }
+        }
+    }
+
+    my @truncated = hint-spans('budget', 20, theme => $THEME);
+    is @truncated.tail.text, " {TAIL}", "the tail is its own span";
+    ok @truncated.tail.style.fg == $THEME.fg-dimmer,
+        "…in fg-dimmer, like the separators";
+};
+
+subtest "the palette is the only source of colour" => {
+    my @palettes = App::Moneymoor::Themes::all-names();
+    plan @palettes.elems;
+
+    for @palettes -> $name {
+        my $theme = App::Moneymoor::Themes::load($name);
+        my @spans = hint-spans('register', 500, :$theme);
+        my $fgs = @spans.map({ .style.fg }).Set;
+        ok $fgs ⊆ set($theme.accent, $theme.fg-dim, $theme.fg-dimmer),
+            "$name: every span colour comes from this palette";
+    }
+};
+
+subtest ":reserve, :icons, and the one-line guarantee" => {
+    plan 5;
+
+    is rendered(hint-spans('budget', 100, theme => $THEME, reserve => 12)),
+       rendered(hint-spans('budget', 88, theme => $THEME)),
+       "reserving 12 of 100 columns renders what 88 columns would";
+
+    is rendered(hint-spans('budget', 100, theme => $THEME, reserve => -5)),
+       rendered(hint-spans('budget', 100, theme => $THEME)),
+       "a negative reservation is clamped to zero";
+
+    # No hint currently names a glyph, so the tier is inert. If a
+    # glyph-bearing hint is ever added this assertion is *meant* to
+    # fail — it is the reminder to give the new hint a tier-aware test.
+    is rendered(hint-spans('sidebar', 500, theme => $THEME,
+                           icons => icons('nerd'))),
+       rendered(hint-spans('sidebar', 500, theme => $THEME)),
+       "no hint currently reads from the icon tier";
+
+    # End-to-end against the real wrapper: the spans have to occupy
+    # exactly one line of the fixed(1) RichText they are painted into,
+    # at every width. This is what proves the width arithmetic above
+    # agrees with what Selkie actually renders.
+    my @overflowing;
+    for hint-contexts() -> $ctx {
+        for 5 .. 200 -> $w {
+            my @spans = hint-spans($ctx, $w, theme => $THEME);
+            next unless @spans;
+            my $lines = Selkie::Widget::RichText.wrap-spans(@spans, $w).elems;
+            @overflowing.push("$ctx\@$w: $lines lines") if $lines != 1;
+        }
+    }
+    is @overflowing.elems, 0,
+        "every context at every width wraps to exactly one line"
+        ~ (@overflowing ?? " ({@overflowing.head(3).join('; ')})" !! '');
+
+    my @tail-only = hint-spans('generic', 6, theme => $THEME);
+    is Selkie::Widget::RichText.wrap-spans(@tail-only, 6).elems, 1,
+        "…including the tail-only case at a width that just fits it";
+};

@@ -1,0 +1,268 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::App;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::HintBar;
+use App::Moneymoor::Screen::Main;
+use App::Moneymoor::Screen::Main::Subscriptions;
+
+# Where focus lands after the content host is rebuilt — the one thing
+# a tab switch does that nothing else in the suite can see.
+#
+# The bug this pins: `!refresh-content-layout` destroyed the departing
+# tab's panes and never moved focus, so Ctrl+2 left the keyboard
+# pointing at a freed widget and the footer showing the app-wide keys
+# until the user pressed Tab. `rebuild-content` (the theme swap, the
+# inspector toggle) re-focused and the ordinary tab switch did not,
+# because the re-focus lived at one of the two call sites instead of
+# inside the rebuild.
+#
+# `Selkie::App` cannot be constructed without a terminal — its
+# constructor calls notcurses_init — but everything the shell decides
+# about focus can still be driven: `Screen::Main` reaches the store
+# through `self.store` and the app through exactly one method,
+# `focus-content`. A subclass overriding both gives a real shell (real
+# panes, real subscriptions, a real store, a real budget underneath)
+# with a stand-in for the one collaborator that needs a tty. The
+# stand-in also does what a live `Selkie::App.focus` would: write
+# `ui/focused-widget`, which is what the hint footer resolves its
+# context from.
+
+plan 8;
+
+my constant PERIOD = '2026-03-01';
+
+# --- A real budget, so the tabs have something to mount ------------------
+
+my $db-path = $*TMPDIR.add("moneymoor-tab-focus-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+$ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+$ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Rent', group-id => $bills.id, sort-order => 1));
+
+# --- The shell, with the app stubbed out ---------------------------------
+
+#| A real C<Screen::Main> with two seams replaced: the store (the real
+#| one hangs off the app) and the focus call (the real one goes through
+#| the app). Everything else — the panes, the subscriptions, the
+#| keybinds, the hint footer — is the shipping code.
+my class TestMain is App::Moneymoor::Screen::Main {
+    has $.mock-store is required;
+    #| Every focus target the shell asked for, oldest first.
+    has @.focus-calls;
+
+    method store() { $!mock-store }
+
+    method focus-content(--> Nil) {
+        my $target = self.initial-focus-widget;
+        @!focus-calls.push($target);
+        # What Selkie::App.focus does that this test cares about: the
+        # `ui/focus` write the hint footer resolves against. Written
+        # rather than dispatched because the shell is mid-rebuild
+        # inside a store tick, and the footer re-resolve that follows
+        # reads the state, not the queue.
+        $!mock-store.assoc-in('ui', 'focused-widget', value => $target)
+            if $target.defined;
+        Nil
+    }
+}
+
+sub built-shell(--> Hash) {
+    my $store = mock-store;
+    my $main  = TestMain.new(
+        app        => Selkie::App,      # a type object: never called
+        db         => $db,
+        workspace  => $ws,
+        theme      => App::Moneymoor::Themes::load('gruvbox'),
+        mock-store => $store,
+    );
+    $main.build;
+    dispatch-and-tick($store, 'app/period-set', period => PERIOD);
+    { :$main, :$store };
+}
+
+sub switch-to($store, Str $name) {
+    dispatch-and-tick($store, 'app/tab-selected', :$name);
+}
+
+#| The context the tab's primary pane is registered under — the first
+#| entry in the pane map, which is also what `mount-pane` remembers as
+#| the focus target.
+sub primary-context($main --> Str) {
+    ($main.pane-contexts[0] andthen *.value) // '';
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the first mount leaves focus to the entry point' => {
+    plan 4;
+    my %s = built-shell();
+
+    is %s<main>.current-tab, 'budget', 'the shell opens on the budget tab';
+    ok %s<main>.initial-focus-widget.defined,
+        'and it has a focus target ready for whoever places focus';
+    is-deeply %s<main>.focus-calls, [],
+        'but the shell does not focus during build — switch-screen '
+            ~ 'would override it, so UI does it after the switch';
+    is %s<main>.hint-context, 'generic',
+        'and until something has focus the footer shows the app-wide keys';
+};
+
+subtest 'an ordinary tab switch focuses the new tab and moves the hints' => {
+    plan 9;
+    my %s = built-shell();
+    my $main = %s<main>;
+
+    # Ctrl+2 / a click on the strip: both end as this one dispatch.
+    switch-to(%s<store>, 'accounts');
+
+    is $main.current-tab, 'accounts', 'the store moved to the accounts tab';
+    is primary-context($main), 'sidebar',
+        'whose primary pane is the ledger sidebar';
+    is $main.focus-calls.elems, 1, 'the rebuild focused exactly once';
+    ok $main.focus-calls[0] === $main.initial-focus-widget,
+        'on the tab\'s own focus target';
+    ok $main.focus-calls[0] === $main.pane-contexts[0].key,
+        'which is the first pane the tab mounted';
+    is $main.hint-context, 'sidebar',
+        'and the footer followed it — the regression: this stayed '
+            ~ '"generic" until the user pressed Tab';
+
+    switch-to(%s<store>, 'reports');
+    is primary-context($main), 'reports', 'the reports tab mounts its chart';
+    ok $main.focus-calls[1] === $main.initial-focus-widget,
+        'and focus lands on it too';
+    is $main.hint-context, 'reports', 'with the reports keys under it';
+};
+
+subtest 'switching back re-focuses the rebuilt pane, not the dead one' => {
+    plan 4;
+    my %s = built-shell();
+    my $main = %s<main>;
+
+    my $first-budget-table = $main.initial-focus-widget;
+    switch-to(%s<store>, 'accounts');
+    switch-to(%s<store>, 'budget');
+
+    is $main.current-tab, 'budget', 'back on the budget tab';
+    is primary-context($main), 'budget', 'with the envelope table mounted';
+    nok $main.focus-calls[*-1] === $first-budget-table,
+        'the pane focused is the new table, not the destroyed one';
+    is $main.hint-context, 'budget', 'and the budget keys are showing';
+};
+
+subtest 'a switch to the tab already mounted does not touch focus' => {
+    plan 2;
+    my %s = built-shell();
+    my $main = %s<main>;
+
+    switch-to(%s<store>, 'accounts');
+    my $after-switch = $main.focus-calls.elems;
+    switch-to(%s<store>, 'accounts');
+
+    is $main.focus-calls.elems, $after-switch,
+        'the no-op rebuild is still a no-op — a spurious focus move '
+            ~ 'would yank the cursor out of wherever the user put it';
+    is $main.hint-context, 'sidebar', 'and the hints stay put';
+};
+
+subtest 'rebuild-content focuses through the same path' => {
+    plan 3;
+    # The theme swap and the inspector toggle come through here rather
+    # than through a tab change, and used to be the only callers that
+    # re-focused at all.
+    my %s = built-shell();
+    my $main = %s<main>;
+
+    switch-to(%s<store>, 'accounts');
+    my $before = $main.focus-calls.elems;
+    $main.rebuild-content;
+
+    is $main.focus-calls.elems, $before + 1,
+        'a forced rebuild re-focuses once';
+    ok $main.focus-calls[*-1] === $main.initial-focus-widget,
+        'on the freshly built pane';
+    is $main.hint-context, 'sidebar',
+        'and the context survives the rebuild';
+};
+
+subtest 'every tab focuses a pane the hint table knows' => {
+    plan 6;
+    my %s = built-shell();
+    my $main = %s<main>;
+    my $known = hint-contexts().Set;
+
+    for <accounts reports budget> -> $tab {
+        switch-to(%s<store>, $tab);
+        my Str $ctx = $main.hint-context;
+        isnt $ctx, 'generic',
+            "the $tab tab resolves to its own hints, not the fallback";
+        ok $ctx ∈ $known,
+            "and '$ctx' is a context the hint table actually has";
+    }
+};
+
+subtest 'the bare digits switch tabs, not just Ctrl+digit' => {
+    plan 5;
+    # Ctrl+<digit> has no legacy escape encoding — Terminal.app, an
+    # xterm.js front-end (ttyd, VHS) or plain xterm cannot transmit it,
+    # so the digits are bound bare as well. Pressed at the screen root,
+    # which is exactly where a bubbled-up keypress lands when a pane
+    # has focus and did not consume it.
+    my %s = built-shell();
+    my $main = %s<main>;
+    my $root = $main.root;
+
+    ok press-key($root, '2'), 'the root consumed a bare 2';
+    %s<store>.tick;
+    is $main.current-tab, 'accounts', 'and it switched to the accounts tab';
+
+    press-key($root, '3');
+    %s<store>.tick;
+    is $main.current-tab, 'reports', '3 reaches reports';
+
+    press-key($root, '1');
+    %s<store>.tick;
+    is $main.current-tab, 'budget', '1 comes back to budget';
+
+    ok press-key($root, 'ctrl+2'),
+        'ctrl+2 stays bound for kitty-protocol terminals';
+};
+
+subtest 'focus-content is safe without an app or without panes' => {
+    plan 2;
+    # The headless contexts: a shell constructed but never built has
+    # neither a live app nor a mounted pane, and the accessor the
+    # entry point calls must not blow up in either.
+    my $bare = App::Moneymoor::Screen::Main.new(
+        app       => Selkie::App,
+        db        => App::Moneymoor::DB,
+        workspace => App::Moneymoor::Service::Workspace,
+        theme     => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    nok $bare.initial-focus-widget.defined,
+        'nothing is mounted, so there is no focus target';
+    lives-ok { $bare.focus-content },
+        'and asking for focus anyway is a silent no-op';
+};

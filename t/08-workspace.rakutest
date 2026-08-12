@@ -1,0 +1,231 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::Util::Period;
+
+plan 10;
+
+my $db-path = $*TMPDIR.add("moneymoor-workspace-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash'));
+my $visa = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Visa', type => 'credit'));
+my $visa-pay = $ws.accounts.payment-category-for($visa.id);
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', sort-order => 1));
+my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Dining Out', sort-order => 2));
+my $rta = $ws.categories.rta-category;
+
+sub split-of(Int $category, Int $amount) {
+    App::Moneymoor::Model::Split.new(category-id => $category, amount => $amount);
+}
+
+subtest 'the gateways are wired to the same connection' => {
+    plan 5;
+    ok $ws.accounts.defined,     'accounts gateway';
+    ok $ws.categories.defined,   'categories gateway';
+    ok $ws.payees.defined,       'payees gateway';
+    ok $ws.transactions.defined, 'transactions gateway';
+    ok $ws.assignments.defined,  'assignments gateway';
+};
+
+subtest 'the workspace owns the period scheme' => {
+    plan 5;
+    is $ws.scheme.type, 'monthly', 'the default scheme is monthly';
+    is $ws.scheme.anchor-day, 1, 'anchored on the first — the calendar month';
+
+    # One scheme object, handed to every seam that needs one: two
+    # answers to "what is a period" inside one workspace is exactly the
+    # failure that produces a budget summed two ways.
+    ok $ws.assignments.scheme === $ws.scheme,
+        'the assignment gateway validates against that very object';
+    ok $ws.transactions.scheme === $ws.scheme,
+        'and so does the transaction gateway';
+
+    # The only clock read in the distribution. Computed from Date.today
+    # at runtime rather than pinned, so the suite does not rot.
+    is $ws.current-period,
+        App::Moneymoor::Util::Period.default-scheme.period-of(Date.today),
+        'current-period is the period containing today';
+};
+
+subtest 'an empty-ish budget still derives' => {
+    plan 3;
+    my $view = $ws.budget(through-period => '2026-03-01');
+    is $view.periods.Array, ['2026-03-01'],
+        'through-period sets the range when there are no facts';
+    is $view.rta('2026-03-01'), 0, 'nothing in, nothing to assign';
+    is $view.invariant-errors.join('; '), '', 'and the invariant holds trivially';
+};
+
+subtest 'facts in, budget out' => {
+    plan 6;
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-01', amount => 180000),
+        splits => [split-of($rta.id, 180000)],
+    );
+    $ws.set-assigned('2026-03-01', $groceries.id, 40000);
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-03-10', amount => -30000),
+        splits => [split-of($groceries.id, -30000)],
+    );
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $visa.id, date => '2026-03-14', amount => -7250),
+        splits => [split-of($groceries.id, -7250)],
+    );
+
+    my $view = $ws.budget(through-period => '2026-03-01');
+    is $view.rta('2026-03-01'), 140000, 'Ready to Assign is income less assigned';
+    is $view.category('2026-03-01', $groceries.id).available, 2750,
+        'the envelope is assigned less all its spending';
+    is $view.category('2026-03-01', $visa-pay.id).available, 7250,
+        'and the card spending is reserved in the payment envelope';
+    is $view.period('2026-03-01').cash-balance, 150000,
+        'cash counts the debit spending only';
+    is $view.invariant-errors.join('; '), '', 'the master invariant holds';
+    is $view.warnings.join('; '), '',
+        'gateway-written facts produce no warnings at all';
+};
+
+subtest 'the convenience readers agree with the view' => {
+    plan 3;
+    is $ws.ready-to-assign('2026-03-01'), 140000, 'ready-to-assign';
+    is $ws.available('2026-03-01', $groceries.id), 2750, 'available';
+    is $ws.available('2026-03-01', 99999), 0,
+        'available on an unknown category is zero, not a crash';
+};
+
+subtest 'set-assigned and move-money round-trip through the budget' => {
+    plan 4;
+    $ws.set-assigned('2026-03-01', $dining.id, 10000);
+    is $ws.available('2026-03-01', $dining.id), 10000, 'set-assigned funds it';
+    is $ws.ready-to-assign('2026-03-01'), 130000, 'and Ready to Assign drops';
+
+    $ws.move-money('2026-03-01', $dining.id, $groceries.id, 2500);
+    is $ws.available('2026-03-01', $dining.id), 7500, 'move-money takes from one';
+    is $ws.available('2026-03-01', $groceries.id), 5250, 'and gives to the other';
+};
+
+subtest 'set-target stamps the plan start, and normalises the rest' => {
+    plan 12;
+    # The front door's two jobs, both of which the gateway deliberately
+    # cannot do: it has no clock and no opinion about which fields a
+    # form left filled in.
+    my $pot = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Tax Pot', sort-order => 50));
+    my Str $today = $ws.current-period;
+
+    ok $ws.set-target($pot.id, kind => 'refill', pence => 40000),
+        'a refill target is set';
+    my $refill = $ws.categories.find-by-id($pot.id);
+    is $refill.target-kind, 'refill', 'with its kind';
+    nok ($refill.target-period.defined || $refill.target-start.defined),
+        'and no dates, because refill has none';
+
+    # A form carries every field whichever radio button is selected, so
+    # the ones the kind does not use are normalised away here rather
+    # than refused as the gateway would.
+    ok $ws.set-target($pot.id, kind => 'set_aside', pence => 10000,
+                      period => '2027-04-05', repeat => 3),
+        'set-aside accepts a form that still had the by-period fields';
+    my $aside = $ws.categories.find-by-id($pot.id);
+    nok ($aside.target-period.defined || $aside.target-start.defined
+         || $aside.target-repeat != 0),
+        'and they are cleared rather than stored';
+
+    # Becoming by_period stamps.
+    ok $ws.set-target($pot.id, kind => 'by_period', pence => 5_000_000,
+                      period => '2027-04-05'),
+        'a by-period goal is set';
+    is $ws.categories.find-by-id($pot.id).target-start, $today,
+        'and the plan start is stamped with the current period';
+
+    # A repeat-only change must not re-stamp: the cycle under way stays
+    # where it is.
+    $ws.categories.set-target($pot.id, kind => 'by_period',
+                              pence => 5_000_000, period => '2027-04-05',
+                              start => '2020-01-01', repeat => 0);
+    ok $ws.set-target($pot.id, kind => 'by_period', pence => 5_000_000,
+                      period => '2027-04-05', repeat => 3),
+        'turning it into a repeating goal is allowed';
+    is $ws.categories.find-by-id($pot.id).target-start, '2020-01-01',
+        'and does not re-stamp';
+
+    # Changing the amount is a different plan, and re-ramps from now.
+    ok $ws.set-target($pot.id, kind => 'by_period', pence => 6_000_000,
+                      period => '2027-04-05', repeat => 3),
+        'changing the amount is allowed';
+    is $ws.categories.find-by-id($pot.id).target-start, $today,
+        'and re-stamps, because the plan is a different plan';
+
+    $ws.categories.set-target($pot.id, kind => 'by_period',
+                              pence => 6_000_000, period => '2027-04-05',
+                              start => '2020-01-01', repeat => 3);
+    $ws.set-target($pot.id, kind => 'by_period', pence => 6_000_000,
+                   period => '2028-04-05', repeat => 3);
+    is $ws.categories.find-by-id($pot.id).target-start, $today,
+        'as does moving the goal period';
+};
+
+subtest 'set-target passes the gateway’s refusals straight back' => {
+    plan 4;
+    my $pot = $ws.categories.find-by-name('Tax Pot');
+    my $unknown = $ws.set-target($pot.id, kind => 'sideways', pence => 100);
+    ok $unknown ~~ Failure, 'an unknown kind is refused';
+    $unknown.so;
+
+    my $rta-target = $ws.set-target($rta.id, kind => 'refill', pence => 40000);
+    ok $rta-target ~~ Failure, 'and a system row refuses a target';
+    like $rta-target.exception.message, /'system category'/,
+        'with the gateway’s own wording';
+    $rta-target.so;
+
+    my $missing = $ws.set-target(999999, kind => 'refill', pence => 40000);
+    ok $missing ~~ Failure, 'as does a category that does not exist';
+    $missing.so;
+};
+
+subtest 'explain returns the derived moves for a category' => {
+    plan 3;
+    my @moves = $ws.explain('2026-03-01', $visa-pay.id);
+    is @moves.elems, 1, 'one move explains the payment envelope';
+    is @moves[0].amount, 7250, 'for the amount that was covered';
+    is @moves[0].cause, 'card-coverage', 'and it says why';
+};
+
+subtest 'hidden categories and closed accounts stay in the derivation' => {
+    plan 3;
+    $ws.categories.hide($dining.id);
+    $ws.accounts.close($visa.id);
+
+    my $view = $ws.budget(through-period => '2026-03-01');
+    is $view.category('2026-03-01', $dining.id).available, 7500,
+        'a hidden category still holds its money';
+    is $view.category('2026-03-01', $visa-pay.id).available, 7250,
+        'a closed account still has its payment envelope derived';
+    is $view.invariant-errors.join('; '), '',
+        'because leaving either out would break the invariant';
+
+    $ws.categories.unhide($dining.id);
+    $ws.accounts.reopen($visa.id);
+};

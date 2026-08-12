@@ -1,0 +1,150 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+use App::Moneymoor::Service::Budget;
+
+plan 9;
+
+subtest 'an empty fact set derives an empty budget' => {
+    plan 4;
+    my $view = Facts.new.compute;
+    is $view.periods.elems, 0, 'no periods';
+    is $view.moves.elems, 0, 'no moves';
+    is $view.warnings.elems, 0, 'no warnings';
+    is $view.invariant-errors.join('; '), '', 'and nothing to be wrong about';
+};
+
+subtest 'through-period derives a month with no facts in it' => {
+    plan 4;
+    my $view = Facts.new.compute(through-period => '2026-03-01');
+    is $view.periods.Array, ['2026-03-01'], 'the asked-for month is derived';
+    is $view.rta('2026-03-01'), 0, 'with nothing ready to assign';
+    is $view.period('2026-03-01').cash-balance, 0, 'and no cash';
+    is $view.period('2026-03-01').category-periods.elems, 0,
+        'and no category rows, because there is nothing to say';
+};
+
+subtest 'income lands in Ready to Assign, not in an envelope' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+
+    my $view = $f.compute;
+    is $view.rta('2026-03-01'), 180000, 'all of it is ready to assign';
+    is $view.period('2026-03-01').cash-balance, 180000, 'and all of it is cash';
+    is $view.period('2026-03-01').category-periods.elems, 0,
+        'no envelope has anything yet';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'assigning moves money out of Ready to Assign' => {
+    plan 6;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.assign('2026-03-01', DINING, 10000);
+
+    my $view = $f.compute;
+    is $view.rta('2026-03-01'), 130000, 'Ready to Assign is income less assigned';
+
+    my $groceries = $view.category('2026-03-01', GROCERIES);
+    is $groceries.assigned, 40000, 'the assignment is recorded';
+    is $groceries.activity, 0, 'with no activity yet';
+    is $groceries.available, 40000, 'and it is all available';
+    is $view.category('2026-03-01', DINING).available, 10000,
+        'the second envelope too';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'rule 1: available = carry-in + assigned + activity' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 180000);
+    $f.assign('2026-03-01', GROCERIES, 40000);
+    $f.spend(account => CURRENT, date => '2026-03-10', amount => 30000,
+             category => GROCERIES);
+    $f.spend(account => CURRENT, date => '2026-03-20', amount => 7250,
+             category => GROCERIES);
+
+    my $view = $f.compute;
+    my $groceries = $view.category('2026-03-01', GROCERIES);
+    is $groceries.activity, -37250, 'activity is the sum of the splits';
+    is $groceries.available, 2750, 'available is what is left';
+    is $view.period('2026-03-01').cash-balance, 142750, 'cash went down with it';
+    is $view.rta('2026-03-01'), 140000,
+        'spending an envelope does not change Ready to Assign';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a split transaction hits several envelopes' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $f.assign('2026-03-01', GROCERIES, 30000);
+    $f.assign('2026-03-01', DINING, 20000);
+    $f.txn(account => CURRENT, date => '2026-03-12', amount => -6000,
+           parts => [(GROCERIES) => -4500, (DINING) => -1500]);
+
+    my $view = $f.compute;
+    is $view.category('2026-03-01', GROCERIES).activity, -4500, 'first part';
+    is $view.category('2026-03-01', DINING).activity, -1500, 'second part';
+    is $view.period('2026-03-01').cash-balance, 94000, 'cash lost the whole';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'a month with nothing in it still carries' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 50000);
+    $f.assign('2026-03-01', GROCERIES, 20000);
+
+    my $view = $f.compute(through-period => '2026-05-01');
+    is $view.periods.Array, ['2026-03-01', '2026-04-01', '2026-05-01'],
+        'the range runs from the first fact to through-period';
+    is $view.category('2026-04-01', GROCERIES).available, 20000,
+        'an untouched envelope keeps its money';
+    is $view.category('2026-05-01', GROCERIES).carry-in, 20000,
+        'and carries it again';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds every month';
+};
+
+subtest 'tracking accounts are off budget' => {
+    plan 4;
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 50000);
+    # An investment gain recorded on the tracking account: real money,
+    # but not budgetable money.
+    $f.txn(account => ISA, date => '2026-03-15', amount => 25000);
+
+    my $view = $f.compute;
+    is $view.rta('2026-03-01'), 50000,
+        'a tracking-account inflow does not become assignable';
+    is $view.period('2026-03-01').cash-balance, 50000,
+        'nor does it count as cash';
+    is $view.account-balance(ISA).working, 25000,
+        'but the account balance knows about it';
+    is $view.invariant-errors.join('; '), '', 'the invariant holds';
+};
+
+subtest 'account balances split cleared from uncleared' => {
+    plan 5;
+    my $f = standard-facts();
+    $f.txn(account => CURRENT, date => '2026-03-01', amount => 100000,
+           parts => [(RTA) => 100000], cleared => 'cleared');
+    $f.txn(account => CURRENT, date => '2026-03-05', amount => -2500,
+           parts => [(GROCERIES) => -2500], cleared => 'uncleared');
+    $f.txn(account => CURRENT, date => '2026-03-06', amount => -1500,
+           parts => [(GROCERIES) => -1500], cleared => 'reconciled');
+
+    my $view = $f.compute;
+    my $balance = $view.account-balance(CURRENT);
+    is $balance.cleared, 98500, 'reconciled counts as cleared';
+    is $balance.uncleared, -2500, 'uncleared is separate';
+    is $balance.working, 96000, 'working is the sum of both';
+    is $view.period('2026-03-01').cash-balance, 96000,
+        'the budget uses the working balance — the money is spent either way';
+    is $view.account-balance(999).working, 0,
+        'an account with no transactions has a zero balance, not a crash';
+};

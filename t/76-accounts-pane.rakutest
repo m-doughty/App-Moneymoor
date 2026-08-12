@@ -1,0 +1,508 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Notcurses::Native::Types;
+
+use Selkie::Event;
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Store;
+use Selkie::Widget::Border;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::View::RegisterRow;
+use App::Moneymoor::Screen::Accounts;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The wiring, end to end, without a terminal.
+#
+# t/72 proves the row builders are right and t/73 the form's rules;
+# this proves the tab plugs them into a ListView, a Table and a store.
+# Everything between a dispatch and a repainted row is here: the two
+# subscriptions, the caption bounce, the cursor restore across a
+# rebuild, the column set that follows the width, and the editor the
+# register's Enter opens.
+#
+# Screen::Main cannot be constructed without a notcurses App, so the
+# tab is given a stand-in that answers the same accessors — which is
+# also the point: the tab reaches Main through a documented handful of
+# methods, and this test is what pins that list (t/75 checks the same
+# list against the real Screen::Main).
+#
+# The store, the workspace and the derivation are all real; only the
+# screen is faked.
+
+plan 12;
+
+my constant PERIOD = '2026-03-01';
+my constant DAY1   = PERIOD;
+my constant DAY2   = '2026-03-04';
+
+# --- A real budget ---------------------------------------------------
+
+my $db-path = $*TMPDIR.add("moneymoor-accounts-pane-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash', sort-order => 1));
+my $savings = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Savings', type => 'cash', sort-order => 2));
+my $house = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'House', type => 'tracking', sort-order => 3));
+my $shut = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Old ISA', type => 'cash', sort-order => 4));
+$ws.accounts.close($shut.id);
+
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+my $rta = $ws.categories.rta-category;
+
+my $pay = $ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => DAY1, amount => 200000),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $rta.id, amount => 200000)],
+);
+my $shop = $ws.transactions.create(
+    App::Moneymoor::Model::Transaction.new(
+        account-id => $current.id, date => DAY2, amount => -4210,
+        memo => 'weekly shop'),
+    splits => [App::Moneymoor::Model::Split.new(
+        category-id => $groceries.id, amount => -4210)],
+);
+my @legs = $ws.transactions.create-transfer(
+    from-account-id => $current.id, to-account-id => $savings.id,
+    date => DAY2, amount => 50000, memo => 'sweep');
+
+# --- The stand-in screen ---------------------------------------------
+
+#| Exactly the surface App::Moneymoor::Screen::Accounts reaches
+#| through, plus the two the dialogs it opens need.
+my class FakeMain {
+    has $.app;                  # Nil — the tab guards every toast
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.content-host is required;
+    has $.root is required;
+    has $.view is rw;
+    has %.accounts-by-id;
+    has %.categories-by-id;
+    has %.groups-by-id;
+    has %.payees-by-id;
+    has @.mounted;              # [ pane => context ]
+    has $.accounts-tab is rw;
+    has @.modals;               # what with-modal was handed
+
+    method icons() { icons() }
+    method account(Int $id)  { $id.defined ?? %!accounts-by-id{$id}   !! Nil }
+    method category(Int $id) { $id.defined ?? %!categories-by-id{$id} !! Nil }
+    method group(Int $id)    { $id.defined ?? %!groups-by-id{$id}     !! Nil }
+    method payee(Int $id)    { $id.defined ?? %!payees-by-id{$id}     !! Nil }
+    method accounts(--> List)   { %!accounts-by-id.values.List   }
+    method categories(--> List) { %!categories-by-id.values.List }
+    method groups(--> List)     { %!groups-by-id.values.List     }
+    method payees(--> List)     { %!payees-by-id.values.List     }
+
+    method set-view($view --> Nil) {
+        $!view = $view;
+        %!accounts-by-id = $!workspace.accounts.find-all(:include-closed)
+                               .map({ .id => $_ }).Hash;
+        %!categories-by-id = $!workspace.categories.find-all(:include-hidden)
+                                .map({ .id => $_ }).Hash;
+        %!groups-by-id = $!workspace.categories.find-groups(:include-hidden)
+                             .map({ .id => $_ }).Hash;
+        %!payees-by-id = $!workspace.payees.find-all.map({ .id => $_ }).Hash;
+        Nil
+    }
+
+    method pane-border(Str:D $title, $sizing --> Selkie::Widget::Border) {
+        Selkie::Widget::Border.new(:$sizing, :$title, padding => 1);
+    }
+
+    method mount-pane($parent, Selkie::Widget::Border $border,
+                      $pane, Str:D $context --> Nil) {
+        $border.set-content($pane);
+        $parent.add($border);
+        $border.set-store($!store);
+        @!mounted.push($pane => $context);
+        Nil
+    }
+
+    #| The one seam a dialog needs that a headless test cannot give it:
+    #| record the modal instead of showing it.
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+    }
+}
+
+# A built, subscribed, keybound accounts tab over a fresh store.
+sub mounted-tab(--> Hash) {
+    my $host  = Selkie::Layout::VBox.new(sizing => Sizing.flex);
+    my $store = mock-store;
+    my $main  = FakeMain.new(
+        :$store, workspace => $ws, content-host => $host, root => $host,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws, on-view => -> $v { $main.set-view($v) },
+    ).register($store);
+    $host.set-store($store);
+
+    my $tab = App::Moneymoor::Screen::Accounts.new(main => $main);
+    $main.accounts-tab = $tab;
+    $tab.build($host);
+    $tab.install-subscriptions;
+    $tab.install-keybinds;
+
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PERIOD);
+    { :$tab, :$main, :$store, :$host };
+}
+
+sub payees-of($tab --> List) { $tab.table.rows.map(*.<payee>).List }
+sub labels-of($tab --> List) { $tab.sidebar.items.List }
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the tab mounts the two panes the spec draws' => {
+    plan 6;
+    my %m = mounted-tab();
+    my @mounted = %m<main>.mounted;
+
+    is %m<host>.children.elems, 1, 'one row holding both panes';
+    is @mounted.elems, 2, 'two focusable panes';
+    is-deeply @mounted.map(*.value).List, ('sidebar', 'register'),
+        'registered under their own hint contexts, in that order';
+    ok @mounted[0].key === %m<tab>.sidebar, 'the sidebar is the list';
+    ok @mounted[1].key === %m<tab>.table, 'and the register is the table';
+    is %m<host>.children[0].children[0].sizing.value, SIDEBAR-COLS,
+        'the sidebar is 26 columns wide, frame included';
+};
+
+subtest 'the first tick paints every ledger and every transaction' => {
+    plan 10;
+    my %m = mounted-tab();
+    my @labels = labels-of(%m<tab>);
+    my $icons = icons();
+
+    is @labels.elems, 7,
+        'All Accounts, two captions, three open ledgers and the fold';
+    is @labels[0].trim, 'All Accounts', 'the pseudo-ledger leads';
+    is @labels[1].trim, 'BUDGET', 'then the on-budget caption';
+    ok @labels[2].starts-with($icons.account-cash ~ ' Current'),
+        'with its accounts under it, glyph first';
+    is @labels[4].trim, 'TRACKING', 'then the off-budget caption';
+    ok @labels[6].contains('CLOSED (1)'), 'and the closed bucket last';
+
+    # All Accounts by default: every transaction in the budget.
+    is %m<tab>.table.rows.elems, 4,
+        'the register shows every ledger\'s rows';
+    ok %m<tab>.table.rows.first({ $_<payee>.contains('Savings') }).defined,
+        'including a transfer leg, named for its other end';
+    is-deeply %m<tab>.table.columns.map(*.name).List,
+        ('date', 'payee', 'category', 'cleared', 'outflow', 'inflow',
+         'account'),
+        'and the All-Accounts column set, with the account column';
+    is %m<tab>.table.rows[0]<account>, 'Current',
+        'each row naming its own ledger';
+};
+
+subtest 'the sidebar\'s selection drives the register' => {
+    plan 5;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    is state-at($store, 'accounts', 'selected-account-id'), 0,
+        'it starts on All Accounts';
+
+    # Row 2 is Current (0 is All Accounts, 1 is the BUDGET caption).
+    %m<tab>.sidebar.select-index(2);
+    $store.tick;
+    is state-at($store, 'accounts', 'selected-account-id'), $current.id,
+        'arrowing onto an account announces it';
+    is %m<tab>.table.rows.elems, 3, 'and the register is only its rows';
+    nok %m<tab>.table.columns.grep({ .name eq 'account' }).elems,
+        'the account column goes when there is only one account on screen';
+
+    %m<tab>.sidebar.select-index(3);            # Savings
+    $store.tick;
+    is %m<tab>.table.rows.elems, 1,
+        'and picking another ledger repaints for that one';
+};
+
+subtest 'a caption is stepped over, in the direction of travel' => {
+    plan 4;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    # The rows are: 0 All Accounts, 1 BUDGET, 2 Current, 3 Savings,
+    # 4 TRACKING, 5 House, 6 CLOSED (1).
+    #
+    # Arriving at the BUDGET caption from above must land on the
+    # account below it, not bounce back to All Accounts, or the caption
+    # would be a wall the user could never arrow past.
+    %m<tab>.sidebar.select-index(1);
+    $store.tick;
+    is %m<tab>.sidebar.cursor, 2, 'downwards, the caption is skipped';
+    is state-at($store, 'accounts', 'selected-account-id'), $current.id,
+        'and the account below it is what got announced';
+
+    # The same caption, arrived at from a lower row, steps the same way.
+    %m<tab>.sidebar.select-index(4);            # TRACKING, from Current
+    $store.tick;
+    is %m<tab>.sidebar.cursor, 5, 'still downwards from a lower index';
+
+    # And from a higher one it steps back up, so a caption is passable
+    # in both directions.
+    %m<tab>.sidebar.select-index(4);            # TRACKING, from House
+    $store.tick;
+    is %m<tab>.sidebar.cursor, 3,
+        'upwards it lands on the account above the caption';
+};
+
+subtest 'Enter on the sidebar folds the closed bucket' => {
+    plan 3;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+    my $enter = Selkie::Event.new(
+        id => NCKEY_ENTER, event-type => KeyEvent, modifiers => Set.new,
+    );
+
+    %m<tab>.sidebar.select-index(6);            # ▸ CLOSED (1)
+    $store.tick;
+    ok %m<tab>.sidebar.handle-event($enter), 'the list consumed the key';
+    $store.tick;
+    ok state-at($store, 'accounts', 'closed-expanded'),
+        'the bucket unfolded through the store, not a direct call';
+    ok labels-of(%m<tab>).first({ $_.contains('Old ISA') }).defined,
+        'and the closed account is on screen';
+};
+
+subtest 'the register cursor survives a repaint that moves it' => {
+    plan 3;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    %m<tab>.sidebar.select-index(2);            # Current
+    $store.tick;
+    %m<tab>.table.select-index(2);              # its last row
+    my Int $want = %m<tab>.table.selected-row<id>.Int;
+    ok $want > 0, 'parked on a transaction';
+
+    # A new transaction dated before it shifts every index below by one.
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.transactions.create(
+            App::Moneymoor::Model::Transaction.new(
+                account-id => $current.id, date => '2026-03-02',
+                amount => -999, memo => 'inserted'),
+            splits => [App::Moneymoor::Model::Split.new(
+                category-id => $groceries.id, amount => -999)]);
+    });
+
+    is %m<tab>.table.selected-row<id>, $want,
+        'the cursor is still on the same transaction, not the same index';
+    is %m<tab>.table.rows.elems, 4, 'and the new row is on screen';
+};
+
+subtest 'a memo edit repaints the register' => {
+    plan 2;
+    # The whole reason ws/rev exists: neither the derivation digest nor
+    # the catalogue token can see a memo, so this repaint has nothing
+    # else to hang off.
+    my %m = mounted-tab();
+    my $store = %m<store>;
+    my $txn = $ws.transactions.find-by-id($shop.id);
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.payees.find-or-create('Tesco');
+    });
+    my $tesco = $ws.payees.find-by-name('Tesco');
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.transactions.update(App::Moneymoor::Model::Transaction.new(
+            id => $txn.id, account-id => $txn.account-id, date => $txn.date,
+            payee-id => $tesco.id, memo => 'now with a payee',
+            amount => $txn.amount, cleared => $txn.cleared));
+    });
+
+    ok payees-of(%m<tab>).first({ $_ eq 'Tesco' }).defined,
+        'the payee the edit added is on screen';
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.transactions.set-cleared($txn.id, 'reconciled');
+    });
+    my $row = %m<tab>.table.rows.first({ $_<id> == $txn.id });
+    is $row<severity>, 'reconciled',
+        'and a cleared change repaints the row that carries it';
+
+    dispatch-and-tick($store, 'ws/mutate-requested', action => -> {
+        $ws.transactions.set-cleared($txn.id, 'uncleared');
+    });
+};
+
+subtest 'the balance column follows the terminal width' => {
+    plan 4;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    %m<tab>.sidebar.select-index(2);            # a single ledger
+    $store.tick;
+    nok %m<tab>.table.columns.grep({ .name eq 'balance' }).elems,
+        'a headless tree reports no width, so the column stays off';
+
+    %m<tab>.handle-resize(BALANCE-MIN-COLS);
+    is %m<tab>.table.columns.map(*.name).tail, 'balance',
+        'a wide enough terminal gets the running balance';
+    ok %m<tab>.table.rows[0]<balance>.chars,
+        'and the rows are repainted with it filled in';
+
+    %m<tab>.handle-resize(BALANCE-MIN-COLS - 1);
+    nok %m<tab>.table.columns.grep({ .name eq 'balance' }).elems,
+        'one column narrower and it is dropped rather than truncated';
+};
+
+subtest 'an account with no transactions says so' => {
+    plan 2;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+
+    # House is a tracking account nothing has been recorded against.
+    dispatch-and-tick($store, 'accounts/select-account',
+                      account-id => $house.id);
+    is payees-of(%m<tab>), ('No transactions — n to add one',),
+        'the EmptyState copy, in the grid';
+    nok %m<tab>.selected-transaction-id.defined,
+        'and nothing on it is selectable';
+};
+
+subtest 'Enter on the register opens its editor' => {
+    plan 6;
+    my %m = mounted-tab();
+    my $store = %m<store>;
+    my $main = %m<main>;
+
+    %m<tab>.sidebar.select-index(2);            # Current
+    $store.tick;
+    %m<tab>.table.select-index(1);
+    my $enter = Selkie::Event.new(
+        id => NCKEY_ENTER, event-type => KeyEvent, modifiers => Set.new,
+    );
+    ok %m<tab>.table.handle-event($enter), 'the table consumed the key';
+    is $main.modals.elems, 1, 'and one dialog was opened';
+
+    # The row budget, hand-accounted in the editor's own comment: 22
+    # fixed rows and one flex status line. A field added without
+    # adjusting the height ratio would push the status line off a
+    # small terminal, and this is what notices.
+    my @children = $main.modals[0].content.children;
+    my @fixed = @children.grep({ $_.sizing.mode === SizeFixed });
+    is ([+] @fixed.map({ $_.sizing.value })), 22,
+        'the editor is 22 fixed rows deep';
+    is @children.elems - @fixed.elems, 1, 'plus exactly one flex child';
+    is $main.modals[0].frame-title, 'Edit transaction',
+        'opened on the row under the cursor';
+
+    # And a brand new one, from the same path the `n` key takes.
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    is $main.modals[1].frame-title, 'New transaction',
+        'while the new-transaction path builds its own';
+};
+
+subtest 'a budget with no accounts says so' => {
+    plan 2;
+    my %m = mounted-tab();
+    my $main = %m<main>;
+    # The empty state is rows rather than a swapped-in widget, so the
+    # list keeps one cursor and one scrollbar. Nothing on it is a
+    # ledger, so nothing can be selected.
+    $main.accounts-by-id = %();
+    %m<tab>.refresh-sidebar;
+
+    is labels-of(%m<tab>), ('No accounts yet', 'n to add your first account'),
+        'the EmptyState copy, in the list';
+    nok %m<tab>.selected-account-id.defined,
+        'and nothing on it names an account';
+};
+
+subtest 'every dialog the tab opens actually builds' => {
+    plan 8;
+    # These are only ever reached from a keybind closure, so a
+    # constructor that throws — a missing accessor, a widget handed a
+    # type object — is invisible until a user presses the key. Building
+    # each one headlessly is the cheapest way to find that out.
+    my %m = mounted-tab();
+    my $store = %m<store>;
+    my $main = %m<main>;
+    %m<tab>.sidebar.select-index(2);            # Current
+    $store.tick;
+
+    App::Moneymoor::Screen::Main::Modals::open-transfer($main);
+    is $main.modals.tail.frame-title, 'Transfer', 't builds the transfer';
+
+    App::Moneymoor::Screen::Main::Modals::open-account-editor($main);
+    is $main.modals.tail.frame-title, 'New account', 'n builds the editor';
+    App::Moneymoor::Screen::Main::Modals::open-account-editor(
+        $main, account-id => $current.id);
+    ok $main.modals.tail.frame-title.starts-with('Edit account'),
+        'and e the same one over an existing account';
+
+    App::Moneymoor::Screen::Main::Modals::toggle-account-closed($main);
+    is $main.modals.elems, 4, 'c asks before closing an open account';
+
+    # A transfer leg: the editor swaps the payee field for the
+    # transfer's own facts and the category picker for the reason there
+    # isn't one.
+    my $leg = $ws.transactions.find-by-account($current.id)
+        .first(*.is-transfer);
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor(
+        $main, transaction-id => $leg.id);
+    my @texts = $main.modals.tail.content.children.map({
+        $_.can('children') ?? $_.children.map({
+            $_.can('text') ?? $_.text !! '' }).join(' ') !! ''
+    });
+    ok @texts.first({ $_.contains('Transfer') }).defined,
+        'a transfer leg names its other end instead of a payee';
+    # The category picker is a Select, so its copy is in its items
+    # rather than in a Text child — the field stays mounted and its
+    # *content* changes, which is how the editor avoids adding and
+    # removing widgets from a live VBox.
+    my @picker-items = $main.modals.tail.content.children
+        .grep({ $_.can('children') })
+        .map({ $_.children.grep({ $_.can('items') }).Slip })
+        .map({ $_.items.Slip });
+    ok @picker-items.first({ $_.contains('transfer inside the budget') }).defined,
+        'and the category picker says why it has no envelope';
+
+    # The splits sub-dialog, which the editor opens on top of itself.
+    my @categories = ('Groceries' => $groceries.id,);
+    my %saved;
+    App::Moneymoor::Screen::Main::Modals::open-split-entry(
+        $main, @categories, Nil, -> %e { %saved = %e });
+    is $main.modals.tail.frame-title, 'Add split', 'a builds the split entry';
+
+    # And the delete confirm, whose copy depends on what is selected.
+    %m<tab>.table.select-index(0);
+    App::Moneymoor::Screen::Main::Modals::delete-transaction($main);
+    is $main.modals.elems, 7, 'd asks before deleting';
+};

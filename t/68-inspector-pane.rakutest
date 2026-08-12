@@ -1,0 +1,500 @@
+use Test;
+use lib 'lib';
+use lib $?FILE.IO.parent.add('lib').Str;
+
+use BudgetFixtures;
+
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Util::Money;
+use App::Moneymoor::Util::Period;
+use App::Moneymoor::View::InspectorPane;
+
+# The detail rail's whole job is to make one number auditable: it shows
+# the five terms of Rule 1 and the total they add up to. If the column
+# does not actually add up, the rail is worse than nothing — so that is
+# the first thing asserted here, by parsing the money back out of the
+# rendered lines rather than by re-reading the CategoryPeriod.
+#
+# The Explain dialog shares the same builders plus the derived move
+# log, which is the only place in the app that renders an engine
+# `cause` for a human. All three causes are exercised against a real
+# `compute`, so a fourth one appearing in the engine shows up here as a
+# raw identifier rather than in front of a user.
+#
+# Pure functions, pinned period, no terminal.
+
+plan 14;
+
+my constant PERIOD = '2026-03-01';
+my constant WIDTH = 26;          # RAIL-TEXT-COLS
+
+my $scheme = App::Moneymoor::Util::Period.default-scheme;
+
+sub category(Int $id, Str $name) {
+    App::Moneymoor::Model::Category.new(:$id, :$name);
+}
+
+#| An envelope with a target of some kind, for the block that is the
+#| only part of this module that has ever needed a model.
+sub targeted(Int $pence, Int :$id = GROCERIES, *%extra) {
+    App::Moneymoor::Model::Category.new(
+        :$id, name => 'Groceries', target-pence => $pence, |%extra);
+}
+
+#| The figures the rail renders, gathered the way Screen::Budget
+#| gathers them — through the real Service::Target, off a real view.
+sub figures($view, $category, Str $period = PERIOD --> Hash) {
+    target-figures($view, $scheme, $category, $period);
+}
+
+# id → model, the shape Screen::Main's cache hands the explain builder.
+sub name-map(--> Hash) {
+    (
+        category(RTA, 'Ready to Assign'),
+        category(GROCERIES, 'Groceries'),
+        category(DINING, 'Dining Out'),
+        category(VISA-PAY, 'Visa'),
+    ).map({ .id => $_ }).Hash;
+}
+
+# The card scenario from t/16, which produces all the interesting
+# numbers: coverage moves, a refund move, and an overspent envelope.
+sub card-view() {
+    my $f = standard-facts();
+    $f.inflow(account => CURRENT, date => '2026-03-01', amount => 200000);
+    $f.assign(PERIOD, GROCERIES, 40000);
+    $f.assign(PERIOD, DINING, 8000);
+    $f.spend(account => VISA, date => '2026-03-08', amount => 7250,
+             category => GROCERIES);
+    $f.spend(account => VISA, date => '2026-03-15', amount => 12000,
+             category => DINING);
+    $f.refund(account => VISA, date => '2026-03-22', amount => 1200,
+              category => GROCERIES);
+    $f.compute(through-period => PERIOD);
+}
+
+sub text-of(@lines --> List) { @lines.map(*.<text>).List }
+
+# The figure a rendered equation line ends with, in pence.
+sub pence-on(Str $line --> Int) {
+    my $value = parse-pence($line.words[*-1]);
+    $value ~~ Failure ?? do { $value.so; Int } !! $value;
+}
+
+sub line-starting(@lines, Str $prefix) {
+    @lines.first({ $_<text>.starts-with($prefix) });
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'the equation is Rule 1, and it adds up' => {
+    plan 4;
+    my $view = card-view();
+    my @lines = equation-lines($view, PERIOD, GROCERIES, width => WIDTH);
+
+    is-deeply @lines.map({ $_<text>.words[0] }).List,
+        ('Carry-in', 'Assigned', 'Activity', 'Moved', 'Moved', '─' x WIDTH,
+         'Available'),
+        'five terms, a rule, and the total';
+
+    my @terms = @lines[0..4].map({ pence-on($_<text>) });
+    is @terms.sum, pence-on(@lines[6]<text>),
+        'the five figures sum to the total printed under them';
+
+    # Specifically: moved-out is printed negated, because a column that
+    # needs mental sign-flipping to add up is a column nobody adds up.
+    my $cm = $view.category(PERIOD, GROCERIES);
+    is pence-on(@lines[4]<text>), -$cm.moved-out,
+        'moved out is rendered as a negative';
+    is pence-on(@lines[6]<text>), $cm.available,
+        'and the total is the derivation\'s own available';
+};
+
+subtest 'money is flush right, labels flush left' => {
+    plan 4;
+    my @lines = equation-lines(card-view(), PERIOD, GROCERIES, width => WIDTH);
+    is @lines[0..4].grep({ $_<text>.chars != WIDTH }).elems, 0,
+        'every money line fills the rail exactly';
+    ok @lines[1]<text>.starts-with('Assigned'), 'the label leads';
+    ok @lines[1]<text>.ends-with('£400.00'),    'the figure trails';
+
+    # A narrower rail than the content needs keeps the figure rather
+    # than truncating it.
+    is pad-line('Available', '£1,234.56', 4), 'Available £1,234.56',
+        'too narrow to align ⇒ one space, and the caller clips';
+};
+
+subtest 'the total carries the row\'s own severity' => {
+    plan 3;
+    my $view = card-view();
+    # Groceries ends positive, Dining is overspent on the card.
+    my @g = equation-lines($view, PERIOD, GROCERIES, width => WIDTH);
+    is @g[6]<severity>, 'positive', 'money left ⇒ green';
+
+    my @d = equation-lines($view, PERIOD, DINING, width => WIDTH);
+    is @d[6]<severity>, 'credit-overspend',
+        'overspent on the card ⇒ amber, not red';
+
+    my @flags = flag-lines($view.category(PERIOD, DINING), width => WIDTH);
+    is @flags.elems, 1, 'and one flag line to say so';
+};
+
+subtest 'flags render, with their amounts, in severity order' => {
+    plan 10;
+    my $view = card-view();
+
+    # Credit overspend: £120 of dinner against £80 of funding.
+    my @credit = flag-lines($view.category(PERIOD, DINING), width => WIDTH);
+    ok @credit[0]<text>.contains('Credit overspend'), 'named';
+    ok @credit[0]<text>.ends-with('£40.00'), 'with how much';
+    is @credit[0]<severity>, 'credit-overspend', 'and its own colour';
+
+    # Cash overspend: spent from the current account with nothing set
+    # aside.
+    my $cash = standard-facts();
+    $cash.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $cash.spend(account => CURRENT, date => '2026-03-09', amount => 5000,
+                category => DINING);
+    my @cash-flags = flag-lines(
+        $cash.compute(through-period => PERIOD).category(PERIOD, DINING),
+        width => WIDTH);
+    is @cash-flags[0]<severity>, 'cash-overspend',
+        'the other overspend is its own line and its own colour';
+
+    # A payment envelope in the red says so without a figure — the
+    # figure is the Available line two rows above it.
+    my $pay = standard-facts();
+    $pay.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $pay.assign(PERIOD, VISA-PAY, -5000);
+    my @pay-flags = flag-lines(
+        $pay.compute(through-period => PERIOD).category(PERIOD, VISA-PAY),
+        width => WIDTH);
+    is @pay-flags[0]<severity>, 'payment-negative', 'purple';
+    is @pay-flags[0]<text>, 'Payment envelope negative', 'and no repeated sum';
+
+    # The third state: an envelope the user has told the engine may run
+    # negative. Same colour as the payment one, different sentence —
+    # a purple row with no explanation reads as a bug in the budget
+    # rather than as the setting that produced it.
+    my $carry = standard-facts();
+    $carry.add-category(7, 'Expenses', sort-order => 3,
+                        carry-overspend => True);
+    $carry.inflow(account => CURRENT, date => '2026-03-01', amount => 100000);
+    $carry.spend(account => CURRENT, date => '2026-03-09', amount => 5000,
+                 category => 7);
+    my @carry-flags = flag-lines(
+        $carry.compute(through-period => PERIOD).category(PERIOD, 7),
+        width => WIDTH);
+    is @carry-flags.elems, 1, 'one flag line, not the cash-overspend one';
+    is @carry-flags[0]<severity>, 'carried-negative', 'purple as well';
+    is @carry-flags[0]<text>, 'Overspend carries forward',
+        'saying what the rule actually does';
+    ok @carry-flags[0]<text>.chars <= WIDTH,
+        'and fitting the rail it has to fit';
+};
+
+subtest 'the moves footer counts what the Explain dialog will show' => {
+    plan 4;
+    my $view = card-view();
+    # The payment envelope is on both coverage moves and the refund.
+    is moves-footer($view, PERIOD, VISA-PAY), '3 moves · x to explain',
+        'three moves, plural, with the key that shows them';
+
+    my @moves = $view.moves-for(PERIOD, category-id => VISA-PAY);
+    is @moves.elems, 3, 'and that is the set the dialog lists';
+
+    # Dining has exactly one: its coverage move. (Groceries has two —
+    # coverage out and the refund back in.)
+    is moves-footer($view, PERIOD, DINING), '1 move · x to explain',
+        'one move, singular';
+
+    # An envelope the derivation never moved anything through gets no
+    # footer at all rather than "0 moves".
+    nok moves-footer($view, PERIOD, 99).defined,
+        'nothing to explain ⇒ nothing offered';
+};
+
+subtest 'the rail stacks equation, flags and footer' => {
+    plan 4;
+    my $view = card-view();
+    my @lines = inspector-lines($view, PERIOD, DINING, width => WIDTH);
+    my @text = text-of(@lines);
+
+    ok @text[0].starts-with('Carry-in'), 'equation first';
+    ok @text.first({ $_.contains('Credit overspend') }).defined, 'then flags';
+    is @text[*-1], '1 move · x to explain', 'then the footer';
+    is @text.grep({ $_ eq '' }).elems, 2,
+        'one blank line between each block';
+};
+
+subtest 'the target block: what it wants, and what is still missing' => {
+    plan 12;
+    my $view = card-view();
+    # Groceries: £400 assigned, £72.50 out on the card, £12 back as a
+    # refund. Whatever the derivation makes of that, the block is
+    # target minus THAT, so it is read back off the view rather than
+    # written down here — a literal would pass while the module
+    # computed from the wrong figure.
+    my Int $available = $view.category(PERIOD, GROCERIES).available;
+
+    my @none = inspector-lines($view, PERIOD, GROCERIES, width => WIDTH);
+    nok @none.first({ $_<text>.starts-with('Target') }).defined,
+        'no target ⇒ no target line';
+    nok @none.first({ $_<text>.starts-with('To fund') }).defined,
+        'and nothing to fund either';
+
+    # Underfunded: £500 wanted against whatever is there.
+    my Int $want = $available + 7250;
+    my @short = inspector-lines($view, PERIOD, GROCERIES, width => WIDTH,
+                                target => figures($view, targeted($want)));
+    my $target-line = line-starting(@short, 'Target');
+    ok $target-line.defined, 'a target adds its own line';
+    is pence-on($target-line<text>), $want, 'carrying the figure';
+    is $target-line<severity>, 'label', 'as an ordinary caption line';
+
+    my $fund-line = line-starting(@short, 'To fund');
+    ok $fund-line.defined, 'and a "to fund" line under it';
+    is pence-on($fund-line<text>), 7250,
+        'the shortfall — target minus available, and nothing else';
+    ok $fund-line<text>.contains('+'),
+        'signed, because it is the figure that goes into the assign field';
+    is $fund-line<severity>, 'target-unfunded',
+        'amber: a plan not finished is not money lost';
+
+    # Exactly on target, and over it: both are "met", and specifically
+    # neither is a negative shortfall.
+    my @met = inspector-lines($view, PERIOD, GROCERIES, width => WIDTH,
+                              target => figures($view, targeted($available)));
+    is line-starting(@met, 'Target met')<severity>, 'positive',
+        'available == target ⇒ met';
+    nok line-starting(@met, 'To fund').defined,
+        'and no shortfall line at all';
+
+    my @over = inspector-lines(
+        $view, PERIOD, GROCERIES, width => WIDTH,
+        target => figures($view, targeted($available - 1000)));
+    ok line-starting(@over, 'Target met').defined,
+        'over target is met too — max(0, …), never a negative to fund';
+};
+
+subtest 'the target block sits below the total, and inside the rail' => {
+    plan 4;
+    my $view = card-view();
+    my @lines = inspector-lines(
+        $view, PERIOD, DINING, width => WIDTH,
+        target => figures($view, targeted(50000, id => DINING)));
+    my @text = text-of(@lines);
+
+    # Order matters: the equation has to keep adding up to the number
+    # under its rule, so the target — which is a plan, not a derived
+    # fact — goes below it and never inside it.
+    my Int $available-idx = @text.first({ $_.starts-with('Available') }, :k);
+    my Int $target-idx    = @text.first({ $_.starts-with('Target') }, :k);
+    ok $available-idx < $target-idx, 'the equation still ends at Available';
+
+    my Int $flag-idx = @text.first({ $_.contains('Credit overspend') }, :k);
+    ok $flag-idx < $target-idx, 'flags come before the target block';
+    is @text[*-1], '1 move · x to explain', 'and the moves footer is still last';
+
+    # Every money line still fills the rail exactly, target included.
+    is @lines.grep({ $_<text>.starts-with('Target ') || $_<text>.starts-with('To fund') })
+             .grep({ $_<text>.chars != WIDTH }).elems, 0,
+        'the new lines are padded like every other';
+};
+
+subtest 'a set-aside block says per-period, and never says "met"' => {
+    plan 8;
+    # Dining Out has £80 assigned this period in the card scenario, and
+    # a set-aside measures ASSIGNED — not available, which the card
+    # moves have taken somewhere else entirely. That is the whole point
+    # of the kind, so the block has to be built off the real figure.
+    my $view = card-view();
+    my @short = target-lines(
+        figures($view, targeted(10000, id => DINING,
+                                target-kind => 'set_aside')),
+        width => WIDTH);
+    my @text = text-of(@short);
+
+    is @text[0], pad-line('Target', '£100.00 /period', WIDTH),
+        'the amount is stated per period — a level would be the other kind';
+    is @short[0]<severity>, 'label', 'as an ordinary caption line';
+    is @short[0]<text>.chars, WIDTH, 'and it fills the rail like the rest';
+    is @text[1], pad-line('To fund', '+£20.00', WIDTH),
+        'and the shortfall is this period\'s contribution, not the pot';
+    is @short[1]<severity>, 'target-unfunded', 'amber, as for every kind';
+
+    # Fully contributed. NOT "Target met": £900 already saved does not
+    # mean this period's £100 is done, and this kind must never claim
+    # it does.
+    my @done = target-lines(
+        figures($view, targeted(8000, id => DINING,
+                                target-kind => 'set_aside')),
+        width => WIDTH);
+    is text-of(@done)[1], 'Funded this period',
+        'a fully contributed period says so in those words';
+    is @done[1]<severity>, 'positive', 'in green';
+    nok text-of(@done).first({ $_.contains('Target met') }).defined,
+        'and specifically never "Target met"';
+};
+
+subtest 'a goal block carries the goal, the schedule and the gap' => {
+    plan 12;
+    # £5,000 by the May period, stamped in January, viewed in March:
+    # period 3 of 5, so the line says £3,000 by now. £1,000 is in the
+    # pot, which leaves £2,000 to find — and the block has to say the
+    # goal (£5,000) while asking for the milestone's gap.
+    my constant GOAL = 500000;
+    my sub goal-view(Int:D $assigned) {
+        my $f = standard-facts();
+        $f.inflow(account => CURRENT, date => '2026-01-05', amount => 1000000);
+        $f.assign(PERIOD, GROCERIES, $assigned);
+        $f.compute(through-period => PERIOD);
+    }
+    my sub plan-of(Int:D $assigned, *%extra) {
+        my $view = goal-view($assigned);
+        target-lines(
+            figures($view, targeted(GOAL, target-kind => 'by_period',
+                                    target-start => '2026-01-01',
+                                    target-period => '2026-05-31', |%extra)),
+            width => WIDTH);
+    }
+
+    my @behind = plan-of(100000);
+    my @text = text-of(@behind);
+    is @text[0], pad-line('Target', '£5,000.00', WIDTH),
+        'the first line is the GOAL, not the milestone — the grid has that';
+    is @text[1], 'by May 2026 · 3 of 5',
+        'then where the plan ends and where this period sits in it';
+    is @behind[1]<severity>, 'label', 'dim, as a caption';
+    is @text[2], pad-line('To fund', '+£2,000.00', WIDTH),
+        'then the milestone\'s gap: three fifths of £5,000, less the £1,000';
+    is @behind[2]<severity>, 'target-unfunded', 'amber';
+    is @behind.grep({ $_<text>.chars > WIDTH }).elems, 0,
+        'and every line of the block fits the rail';
+
+    # On the line, but not there yet: the plan asks for nothing this
+    # period and the goal is still ahead.
+    my @on-track = plan-of(300000);
+    is text-of(@on-track)[2], 'On track',
+        'a period whose milestone is met, with the goal still ahead';
+    is @on-track[2]<severity>, 'positive', 'in green';
+
+    # Arrived. "Target met" is about the GOAL, so it outranks "on
+    # track" whatever period it is.
+    my @arrived = plan-of(GOAL);
+    is text-of(@arrived)[2], 'Target met',
+        'and reaching the goal itself says so instead';
+
+    # A repeat is a clause on the schedule, phrased exactly as
+    # describe-target phrases it.
+    my @quarterly = plan-of(100000, target-repeat => 3);
+    ok text-of(@quarterly).first({ $_.contains('every 3 periods') }).defined,
+        'a repeating goal says how often it comes round';
+    nok text-of(@quarterly).first({ $_ eq 'every period' }).defined,
+        'and not in the singular when it is not';
+    is @quarterly.grep({ $_<text>.chars > WIDTH }).elems, 0,
+        'with the extra clause still inside the rail';
+};
+
+subtest 'the schedule packs itself into the rail, and never truncates' => {
+    plan 5;
+    # A monthly/14 budget's period label is "14 Aug – 13 Sep 2026" —
+    # twenty of the rail's twenty-six columns. With a position and a
+    # repeat after it the sentence is nearly forty, so the clauses have
+    # to break onto their own lines rather than be cut off the end.
+    my sub block(*%extra) {
+        target-lines(%( kind => 'by_period', pence => 5000000, ask => 100,
+                        milestone => 100, available => 0, repeat => 0,
+                        index => 3, of => 9, goal-label => 'April 2027',
+                        |%extra ),
+                     width => WIDTH);
+    }
+
+    is text-of(block())[1], 'by April 2027 · 3 of 9',
+        'clauses that fit share a line';
+
+    my @wide = block(goal-label => '14 Aug – 13 Sep 2026', repeat => 3);
+    my @text = text-of(@wide);
+    is @wide.grep({ $_<text>.chars > WIDTH }).elems, 0,
+        'a label that will not share one still fits the rail';
+    is @text[1], 'by 14 Aug – 13 Sep 2026', 'because the clause got its own line';
+    is @text.grep({ $_.contains('3 of 9') }).elems, 1,
+        'and nothing was dropped to make room';
+    ok @text.first({ $_.contains('every 3 periods') }).defined,
+        'the repeat clause included';
+};
+
+subtest 'the rail survives an uncomputed view and an unknown period' => {
+    plan 3;
+    # The window between building the screen and the first recompute is
+    # real, and so is navigating back before the first fact.
+    my @early = inspector-lines(Any, PERIOD, GROCERIES, width => WIDTH);
+    is @early.elems, 7, 'a zero-filled equation, and nothing else';
+    is pence-on(@early[6]<text>), 0, 'all noughts';
+
+    my @gone = inspector-lines(card-view(), '2019-01-01', GROCERIES,
+                               width => WIDTH);
+    is pence-on(@gone[6]<text>), 0, 'and a period outside the range too';
+};
+
+subtest 'causes are rendered as English' => {
+    plan 5;
+    is cause-label('card-coverage'),      'card coverage';
+    is cause-label('card-refund'),        'card refund';
+    is cause-label('card-inflow-to-rta'), 'card inflow → RTA';
+    # A cause the engine grows before this module hears about it should
+    # degrade to something readable, not to a wire identifier.
+    is cause-label('some-future-cause'),  'some future cause';
+    is cause-label(Str), '', 'and nothing at all is not an exception';
+};
+
+subtest 'Explain names both sides of every move' => {
+    plan 8;
+    my %names = name-map();
+
+    # Coverage and refund, from the card scenario.
+    my @lines = explain-lines(card-view(), PERIOD, VISA-PAY,
+                              names => %names, width => WIDTH);
+    my @text = text-of(@lines);
+    ok @text.first({ $_ eq 'Derived moves (3)' }).defined,
+        'the moves are counted in a heading';
+    ok @text.first({
+        $_.starts-with('card coverage') && $_.contains('Groceries → Visa')
+    }).defined, 'coverage: named, arrowed, in that direction';
+    ok @text.first({
+        $_.starts-with('card coverage') && $_.contains('Dining Out → Visa')
+    }).defined, 'both coverage moves are listed';
+    ok @text.first({
+        $_.starts-with('card refund') && $_.contains('Visa → Groceries')
+    }).defined, 'the refund runs the other way';
+    ok @text.first({ $_.ends-with('£12.00') }).defined,
+        'with the amount on the end';
+
+    # An inflow banked on the card: the third cause.
+    my $inflow = standard-facts();
+    $inflow.inflow(account => VISA, date => '2026-03-03', amount => 5000);
+    my @rta-lines = explain-lines($inflow.compute(through-period => PERIOD),
+                                  PERIOD, VISA-PAY, names => %names,
+                                  width => WIDTH);
+    ok text-of(@rta-lines).first({
+        $_.starts-with('card inflow → RTA')
+            && $_.contains('Visa → Ready to Assign')
+    }).defined, 'an inflow recorded on the card is explained too';
+
+    # A category with no derived moves says so rather than showing an
+    # empty heading.
+    my @quiet = explain-lines(card-view(), PERIOD, 99, names => %names,
+                              width => WIDTH);
+    is text-of(@quiet)[*-1], 'No derived moves this period',
+        'nothing to explain, said out loud';
+
+    # A move whose other side has been deleted is exactly the case
+    # someone opens this dialog to understand, so it must not render
+    # blank.
+    my @orphan = explain-lines(card-view(), PERIOD, VISA-PAY,
+                               names => %(), width => WIDTH);
+    ok text-of(@orphan).first({ $_.contains('category ') }).defined,
+        'an unresolvable id renders as "category N", never as nothing';
+};

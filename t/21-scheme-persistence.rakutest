@@ -1,0 +1,459 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use JSON::Fast;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::Util::Period;
+
+# The period scheme is a property of the budget FILE. This covers the
+# two halves of that:
+#
+#   1. loading — budget_meta's `period_scheme` is read at construction,
+#      absent means the calendar month, and a value that is present but
+#      unreadable refuses to open rather than bucketing somebody's money
+#      by a scheme they never chose;
+#   2. changing — `change-scheme` re-buckets every assignment onto the
+#      new scheme (each row to whichever new period contains its old
+#      period's start date, collisions summed), in one transaction, with
+#      per-category totals preserved to the penny.
+
+plan 12;
+
+constant SCHEME-KEY = 'period_scheme';
+
+my Str @paths;
+my @dbs;
+LEAVE {
+    .disconnect for @dbs.grep(*.is-connected);
+    unlink $_ for @paths.grep(*.IO.e);
+}
+
+my Int $file-counter = 0;
+
+#| A freshly created, connected budget file of its own, so no subtest
+#| can see another's rows or another's stored scheme.
+sub fresh-db(--> App::Moneymoor::DB) {
+    my Str $path = $*TMPDIR.add(
+        "moneymoor-scheme-{ $*PID }-{ $file-counter++ }.db").Str;
+    @paths.push($path);
+    my $db = App::Moneymoor::DB.new(db-path => $path);
+    $db.connect('testpass');
+    @dbs.push($db);
+    $db;
+}
+
+#| The JSON a scheme is stored as: one line, keys sorted, which is what
+#| `change-scheme` writes and what this file pins.
+sub scheme-json(App::Moneymoor::Util::Period:D $scheme --> Str) {
+    to-json($scheme.to-hash, :!pretty, :sorted-keys);
+}
+
+sub assignment-rows($db --> Array) {
+    $db.query-all('SELECT period_start, category_id, amount FROM assignments
+                   ORDER BY period_start, category_id').Array;
+}
+
+sub totals-by-category($db --> Hash) {
+    my %t;
+    for $db.query-all('SELECT category_id, sum(amount) AS total
+                       FROM assignments GROUP BY category_id') -> $row {
+        %t{ $row<category_id>.Int } = $row<total>.Int;
+    }
+    %t;
+}
+
+sub total-assigned($db --> Int) {
+    ($db.query-one('SELECT sum(amount) AS total FROM assignments')<total>
+        // 0).Int;
+}
+
+#| A budget under the default calendar-month scheme: one cash account
+#| with an inflow, two spending categories, and five assignments spread
+#| over four months. Returns the workspace and the two category ids.
+sub seeded-budget() {
+    my $db = fresh-db;
+    my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+    my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Current', type => 'cash'));
+    my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Groceries', sort-order => 1));
+    my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Dining Out', sort-order => 2));
+    my $rta = $ws.categories.rta-category;
+
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-01-05', amount => 200000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $rta.id, amount => 200000)],
+    );
+
+    $ws.set-assigned('2026-01-01', $groceries.id, 40000);
+    $ws.set-assigned('2026-01-01', $dining.id,    15000);
+    $ws.set-assigned('2026-02-01', $groceries.id, 42500);
+    $ws.set-assigned('2026-03-01', $groceries.id, 10000);
+    $ws.set-assigned('2026-04-01', $dining.id,     5000);
+
+    ($ws, $groceries.id, $dining.id);
+}
+
+# Five-week windows, not four. A four-week window is SHORTER than every
+# calendar month (28 days against 28–31), so no two calendar-month
+# starts can ever fall inside one of them: monthly/1 → weekly/4 is
+# always a pure re-labelling, and cannot exercise the merge at all.
+# Thirty-five days can hold two, and the anchor below is picked so it
+# does — asserted rather than assumed in the merge subtest.
+constant MERGING = App::Moneymoor::Util::Period.weekly(
+    weeks => 5, anchor => '2026-01-01');
+
+# --- loading --------------------------------------------------------
+
+subtest 'a file that has never chosen a scheme is on the calendar month'
+=> {
+    plan 5;
+    my $db = fresh-db;
+    nok $db.get-meta(SCHEME-KEY).defined,
+        'a fresh file stores no period scheme at all';
+
+    my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+    is $ws.scheme.type, 'monthly', 'so the workspace is monthly';
+    is $ws.scheme.anchor-day, 1, 'anchored on the first — the calendar month';
+    ok $ws.assignments.scheme === $ws.scheme,
+        'and the assignment gateway validates against that very object';
+
+    nok $db.get-meta(SCHEME-KEY).defined,
+        'reading the default writes nothing back — absence stays absence';
+};
+
+subtest 'a stored scheme is what the workspace opens on' => {
+    plan 8;
+    my $db = fresh-db;
+
+    $db.set-meta(SCHEME-KEY, scheme-json(
+        App::Moneymoor::Util::Period.monthly(anchor-day => 14)));
+    my $pay = App::Moneymoor::Service::Workspace.new(:$db);
+    is $pay.scheme.type, 'monthly', 'monthly/14 loads as monthly';
+    is $pay.scheme.anchor-day, 14, 'on the anchor day it was stored with';
+    is-deeply $pay.scheme.to-hash,
+        %( type => 'monthly', anchor_day => 14 ),
+        'and round-trips through to-hash unchanged';
+
+    $db.set-meta(SCHEME-KEY, scheme-json(
+        App::Moneymoor::Util::Period.weekly(weeks => 4,
+                                            anchor => '2026-08-14')));
+    my $four = App::Moneymoor::Service::Workspace.new(:$db);
+    is-deeply $four.scheme.to-hash,
+        %( type => 'weekly', weeks => 4, anchor => '2026-08-14' ),
+        'a weekly scheme round-trips too';
+
+    # The point of loading it before the gateways exist: they validate
+    # keys, and a gateway born on the default would reject every key the
+    # file can legally hold.
+    ok $four.assignments.scheme === $four.scheme,
+        'the assignment gateway carries the loaded scheme, not the default';
+    ok $four.transactions.scheme === $four.scheme,
+        'and so does the transaction gateway';
+    is $four.assignments.scheme.anchor.Str, '2026-08-14',
+        'the very object, anchor and all';
+
+    is $four.current-period,
+        $four.scheme.period-of(Date.today),
+        'and the clock read follows the loaded scheme';
+};
+
+subtest 'an unreadable stored scheme refuses to open the budget' => {
+    plan 5;
+    my $db = fresh-db;
+
+    # Every case is a value JSON::Fast or Period.from-hash refuses.
+    # (A value that is not JSON at all — 'monthly/14', say — is refused
+    # by the same path, but JSON::Fast's message for it calls the
+    # deprecated .perl and prints a notice at exit, so the malformed
+    # cases below stop short of position zero instead.)
+    for ('{"type":"monthly", "anchor_day"'    => 'truncated JSON',
+         '{'                                  => 'JSON that stops dead',
+         '{"type":"fortnightly","weeks":2}'   => 'an unknown scheme type',
+         '{"type":"monthly","anchor_day":99}' => 'an out-of-range anchor day',
+         '[1,2,3]'                            => 'JSON that is not an object')
+    -> $case {
+        $db.set-meta(SCHEME-KEY, $case.key);
+        throws-like { App::Moneymoor::Service::Workspace.new(:$db) },
+            Exception,
+            message => all(/'period_scheme'/, / $($case.key) /),
+            "{ $case.value } refuses to open, naming the key and the value";
+    }
+};
+
+subtest 'the scheme is not a constructor argument' => {
+    plan 2;
+    my $db = fresh-db;
+    # Silently ignoring it is the same failure as silently loading the
+    # wrong one: a caller that believes it chose the bucketing.
+    throws-like {
+            App::Moneymoor::Service::Workspace.new(
+                :$db, scheme => App::Moneymoor::Util::Period.monthly(
+                    anchor-day => 14))
+        },
+        Exception,
+        message => /'change-scheme'/,
+        'passing a scheme to .new throws, pointing at change-scheme';
+
+    is App::Moneymoor::Service::Workspace.new(:$db).scheme.anchor-day, 1,
+        'and the file, which chose nothing, is still on the calendar month';
+};
+
+# --- the re-bucket --------------------------------------------------
+
+subtest 'the merge case is a real merge' => {
+    plan 3;
+    # Assumed by every count in the next subtest, so it is asserted
+    # rather than believed.
+    is MERGING.period-of('2026-01-01'), '2026-01-01',
+        'January and February both fall in one five-week window...';
+    is MERGING.period-of('2026-02-01'), '2026-01-01',
+        '...which is the merge these tests turn on';
+    isnt MERGING.period-of('2026-03-01'), '2026-01-01',
+        'while March does not, so the merge is not a collapse of everything';
+};
+
+subtest 're-bucket-preview counts the change without making it' => {
+    plan 8;
+    my ($ws, $groceries, $dining) = seeded-budget();
+    my $db = $ws.db;
+
+    my @before = assignment-rows($db);
+    my %preview = $ws.re-bucket-preview(MERGING);
+
+    is %preview<rows>, 5, 'five assignment rows today';
+    is %preview<periods-before>, 4, 'across four period keys';
+    is %preview<rows-after>, 4, 'four rows after, because two merge';
+    is %preview<periods-after>, 3, 'in three period keys';
+    is %preview<merged>, 1, 'one row lands on another and is summed into it';
+
+    is-deeply assignment-rows($db), @before,
+        'and not a row was touched';
+    nok $db.get-meta(SCHEME-KEY).defined,
+        'nor was a scheme written';
+    is $ws.scheme.anchor-day, 1,
+        'the workspace is still on the scheme it opened with';
+};
+
+subtest 'change-scheme re-buckets, merges and preserves every total' => {
+    plan 12;
+    my ($ws, $groceries, $dining) = seeded-budget();
+    my $db = $ws.db;
+
+    my %before-totals = totals-by-category($db);
+    my Int $before-assigned = total-assigned($db);
+    my %preview = $ws.re-bucket-preview(MERGING);
+
+    my %summary = $ws.change-scheme(MERGING);
+    is-deeply %summary, %preview,
+        'the summary is exactly what the preview promised';
+
+    my @rows = assignment-rows($db);
+    is @rows.elems, %summary<rows-after>,
+        'the table holds as many rows as the summary said';
+    is @rows.map({ .<period_start> }).unique.elems, 3,
+        'in three period keys';
+
+    is-deeply totals-by-category($db), %before-totals,
+        'every category is assigned exactly what it was, to the penny';
+    is total-assigned($db), $before-assigned,
+        'and so is the budget as a whole';
+
+    # The merge itself: January's and February's Groceries are now one
+    # row holding both.
+    my %by-cell;
+    %by-cell{ "{ .<period_start> }|{ .<category_id> }" } = .<amount> for @rows;
+    is-deeply %by-cell,
+        %( "2026-01-01|$groceries" => 82500,     # 40000 + 42500, merged
+           "2026-01-01|$dining"    => 15000,
+           "2026-02-05|$groceries" => 10000,
+           "2026-03-12|$dining"    =>  5000 ),
+        'and every penny is in the period that now contains its old start';
+
+    nok @rows.first({ .<period_start> ne MERGING.period-of(.<period_start>) }),
+        'every key is a period start under the new scheme';
+
+    is $db.get-meta(SCHEME-KEY), '{"anchor":"2026-01-01","type":"weekly","weeks":5}',
+        'the file stores the new scheme, one line, keys sorted';
+    is-deeply $ws.scheme.to-hash, MERGING.to-hash,
+        'and the workspace is on it';
+
+    # The boundary moves with it, which is the whole reason the gateway
+    # holds a scheme at all.
+    ok $ws.assignments.set('2026-02-05', $groceries, 12000) ~~
+        App::Moneymoor::Model::Assignment:D,
+        'the assignment gateway accepts a start under the new scheme';
+
+    my $refused = $ws.assignments.set('2026-03-01', $groceries, 12000);
+    ok $refused ~~ Failure, 'and refuses a bare month start, which is not one';
+    like $refused.exception.message, /'weekly/5'/,
+        'saying which scheme it is not a start under';
+    $refused.so;
+};
+
+subtest 'the derivation still balances either side of the change' => {
+    plan 6;
+    my ($ws, $groceries, $dining) = seeded-budget();
+    my $db = $ws.db;
+
+    my $before = $ws.budget(through-period => '2026-04-01');
+    is $before.invariant-errors.join('; '), '',
+        'the master invariant holds under the old scheme';
+    is $before.warnings.join('; '), '', 'and nothing is warned about';
+    my Int $rta-before = $before.rta('2026-04-01');
+
+    $ws.change-scheme(MERGING);
+
+    my Str $through = $ws.scheme.period-of('2026-05-01');
+    my $after = $ws.budget(through-period => $through);
+    is $after.invariant-errors.join('; '), '',
+        'and it holds under the new one';
+    is $after.warnings.join('; '), '',
+        'with no key the derivation cannot place';
+
+    # Total assigned is preserved, so what is left over must be too.
+    is $after.rta($through), $rta-before,
+        'Ready to Assign in the last period is untouched by the re-bucket';
+    is total-assigned($db), 112500,
+        'because the same money is assigned, only in different windows';
+};
+
+subtest 'a scheme round trip preserves totals, not buckets' => {
+    plan 7;
+    my ($ws, $groceries, $dining) = seeded-budget();
+    my $db = $ws.db;
+
+    my %original-totals = totals-by-category($db);
+    my @original-rows = assignment-rows($db);
+
+    my $fortnightly = App::Moneymoor::Util::Period.weekly(
+        weeks => 2, anchor => '2026-01-08');
+    $ws.change-scheme($fortnightly);
+    is-deeply totals-by-category($db), %original-totals,
+        'monthly/1 → weekly/2 keeps every category total';
+    nok assignment-rows($db).first({
+            .<period_start> ne $fortnightly.period-of(.<period_start>) }),
+        'and every key is a start under the fortnightly scheme';
+
+    $ws.change-scheme(App::Moneymoor::Util::Period.default-scheme);
+    is-deeply totals-by-category($db), %original-totals,
+        'and back again keeps them still';
+    is $ws.scheme.anchor-day, 1, 'the workspace is on the calendar month again';
+    is $db.get-meta(SCHEME-KEY), '{"anchor_day":1,"type":"monthly"}',
+        'with the default written down explicitly rather than left absent';
+
+    # Buckets are NOT restored, and are not meant to be: merging is
+    # lossy by design, and this is the shape of that loss.
+    my @round-tripped = assignment-rows($db);
+    nok @round-tripped.first({ .<period_start>.chars != 10 }),
+        'the round-tripped keys are all period starts';
+    isnt @round-tripped.map({ "{ .<period_start> }|{ .<category_id> }" }).join(','),
+        @original-rows.map({ "{ .<period_start> }|{ .<category_id> }" }).join(','),
+        'but the buckets have moved — the totals are the guarantee, not the split';
+};
+
+subtest 'an empty budget simply adopts the scheme' => {
+    plan 8;
+    my $db = fresh-db;
+    my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+    my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Groceries', sort-order => 1));
+
+    # This is the create-a-budget path: choose the scheme before there
+    # is a penny in the file.
+    my $payday = App::Moneymoor::Util::Period.monthly(anchor-day => 14);
+    my %preview = $ws.re-bucket-preview($payday);
+    my %summary = $ws.change-scheme($payday);
+
+    is-deeply %summary, %preview, 'preview and change agree on nothing to do';
+    is %summary<rows>, 0, 'no rows before';
+    is %summary<rows-after>, 0, 'none after';
+    is %summary<periods-before>, 0, 'no periods before';
+    is %summary<periods-after>, 0, 'none after';
+    is %summary<merged>, 0, 'and nothing merged';
+
+    is $db.get-meta(SCHEME-KEY), '{"anchor_day":14,"type":"monthly"}',
+        'the key is written even so — that is the point of the call';
+
+    # And the file now behaves as a payday budget from its first write.
+    $ws.set-assigned('2026-03-14', $groceries.id, 30000);
+    is $ws.assignments.amount-for('2026-03-14', $groceries.id), 30000,
+        'assignments validate and land under the new scheme';
+};
+
+subtest 'a reopened file comes back on the scheme it was changed to' => {
+    plan 3;
+    my ($ws, $groceries, $dining) = seeded-budget();
+    my $db = $ws.db;
+    $ws.change-scheme(MERGING);
+
+    # Same file, a second workspace: the scheme survives because it is
+    # in the file, not in the object.
+    my $reopened = App::Moneymoor::Service::Workspace.new(:$db);
+    is-deeply $reopened.scheme.to-hash, MERGING.to-hash,
+        'the scheme is loaded back out of budget_meta';
+    ok $reopened.assignments.scheme === $reopened.scheme,
+        'and the gateways are born on it';
+    is-deeply totals-by-category($db),
+        %( $groceries => 92500, $dining => 20000 ),
+        'with the money the budget was seeded with, penny for penny';
+};
+
+# --- the runtime guard ----------------------------------------------
+
+#| A workspace whose re-bucket mapping is wrong in the one way the
+#| runtime guard exists to catch: it sends every row to a single
+#| category, so the money is still all there but it is in the wrong
+#| envelopes. A misplaced period key cannot trip the guard — moving a
+#| row between periods does not change what a category is assigned in
+#| total, which is exactly why the guard is stated per category.
+class WrongWorkspace is App::Moneymoor::Service::Workspace {
+    has Int $.everything-to is required;
+
+    method re-bucket-cell(App::Moneymoor::Util::Period:D $new,
+                          Str:D $old-period, Int:D $category-id --> List) {
+        ($new.period-of($old-period), $!everything-to);
+    }
+}
+
+subtest 'a mapping that would move money is refused, and nothing changes'
+=> {
+    plan 6;
+    my ($ws, $groceries, $dining) = seeded-budget();
+    my $db = $ws.db;
+
+    my @before = assignment-rows($db);
+    my %before-totals = totals-by-category($db);
+
+    my $wrong = WrongWorkspace.new(:$db, everything-to => $groceries);
+    my $died = False;
+    my Str $message = '';
+    {
+        $wrong.change-scheme(MERGING);
+        CATCH { default { $died = True; $message = .message } }
+    }
+
+    ok $died, 'the change dies rather than committing money into the wrong '
+            ~ 'envelope';
+    like $message, /'assigned'/, 'saying that what is assigned would change';
+    like $message, /"$dining"/, 'and naming the category that lost it';
+
+    is-deeply assignment-rows($db), @before,
+        'the transaction rolled back — every row is where it was';
+    is-deeply totals-by-category($db), %before-totals,
+        'so every total is what it was';
+    nok $db.get-meta(SCHEME-KEY).defined,
+        'and the file never adopted the scheme';
+};

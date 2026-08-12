@@ -1,0 +1,278 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Gateway::Assignment;
+use App::Moneymoor::Gateway::Category;
+
+# The distribution's first TRANSFORMING migration, and the only one so
+# far that rewrites data the user already has. `run-migrations` replays
+# on every connect, so the transform is gated on `budget_meta.schema_rev`
+# and everything below is about that gate holding:
+#
+#   1. a fresh file arrives already in the new shape, and stamped;
+#   2. a genuinely legacy file — the pre-period schema, hand-rebuilt,
+#      with no budget_meta table at all, exactly like the real dogfood
+#      one — migrates without losing or moving a penny;
+#   3. reopening it again does not apply the transform a second time;
+#   4. the gateway will not write the old shape afterwards;
+#   5. the additive columns that arrived after it — the target tuple and
+#      carry_overspend — land on its categories with the defaults that
+#      describe what the file already meant.
+
+plan 5;
+
+my $db-path = $*TMPDIR.add("moneymoor-period-migration-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $legacy-path = $*TMPDIR.add("moneymoor-period-legacy-{$*PID}.db").Str;
+LEAVE { unlink $legacy-path if $legacy-path.IO.e }
+
+sub columns-of($db, Str $table --> Array) {
+    $db.query-all("PRAGMA table_info($table)").map({ .<name> }).Array;
+}
+
+sub index-names($db --> Array) {
+    $db.query-all("SELECT name FROM sqlite_master WHERE type='index'")
+        .map({ .<name> }).Array;
+}
+
+subtest 'a fresh file is born in the new shape' => {
+    plan 8;
+    my $db = App::Moneymoor::DB.new(:$db-path);
+    $db.connect('testpass');
+    LEAVE { $db.disconnect if $db.is-connected }
+
+    my @columns = columns-of($db, 'assignments');
+    ok @columns.first({ $_ eq 'period_start' }).defined,
+        'assignments is keyed by period_start';
+    nok @columns.first({ $_ eq 'month' }).defined,
+        'and has no month column at all';
+
+    is $db.get-meta('schema_rev'), '1', 'the schema revision is stamped';
+
+    my @indices = index-names($db);
+    ok @indices.first({ $_ eq 'idx_assignments_period_category' }).defined,
+        'the unique period index exists';
+    ok @indices.first({ $_ eq 'idx_assignments_period' }).defined,
+        'and the lookup index beside it';
+    nok @indices.first({ $_ eq 'idx_assignments_month_category' }).defined,
+        'the old unique index is not created on a fresh file';
+    nok @indices.first({ $_ eq 'idx_assignments_month' }).defined,
+        'nor the old lookup one';
+
+    # The upsert path end to end, which is what the unique index is for.
+    my $rta = $db.query-one("SELECT id FROM categories WHERE kind='rta'");
+    $db.execute(
+        "INSERT INTO categories (name, kind, sort_order, hidden)
+         VALUES ('Groceries', 'standard', 1, 0)");
+    my $groceries = $db.last-insert-id;
+    my $gw = App::Moneymoor::Gateway::Assignment.new(:$db);
+    $gw.set('2026-03-01', $groceries, 40000);
+    is $gw.set('2026-03-01', $groceries, 45000).amount, 45000,
+        'the gateway upserts through the new index';
+};
+
+# --- the legacy file ------------------------------------------------
+#
+# Built by connecting once (so SQLCipher keys the file and the rest of
+# the schema exists) and then winding `assignments` back by hand to
+# exactly what it was before periods: a `month TEXT NOT NULL` column,
+# the two indices that named it, and no budget_meta table, because the
+# real file in the wild has never had one.
+
+my Int $groceries-id;
+my Int $dining-id;
+
+{
+    my $db = App::Moneymoor::DB.new(db-path => $legacy-path);
+    $db.connect('testpass');
+
+    $db.execute(
+        "INSERT INTO categories (name, kind, sort_order, hidden)
+         VALUES ('Groceries', 'standard', 1, 0)");
+    $groceries-id = $db.last-insert-id;
+    $db.execute(
+        "INSERT INTO categories (name, kind, sort_order, hidden)
+         VALUES ('Dining Out', 'standard', 2, 0)");
+    $dining-id = $db.last-insert-id;
+
+    # A file this old predates every additive column on `categories`
+    # too, so the two rows above are wound back to the shape they were
+    # written in. carry_overspend is the interesting one: its default of
+    # 0 is the rollover rule this file's whole history was derived
+    # under, so the migration must not need to know that.
+    $db.execute("ALTER TABLE categories DROP COLUMN $_")
+        for <target_pence target_kind target_period target_start
+             target_repeat carry_overspend>;
+
+    $db.execute('DROP TABLE assignments');
+    $db.execute(q:to/SQL/);
+        CREATE TABLE assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            month TEXT NOT NULL,
+            category_id INTEGER NOT NULL
+                REFERENCES categories(id) ON DELETE CASCADE,
+            amount INTEGER NOT NULL DEFAULT 0
+        )
+        SQL
+    $db.execute('CREATE UNIQUE INDEX idx_assignments_month_category
+                 ON assignments(month, category_id)');
+    $db.execute('CREATE INDEX idx_assignments_month ON assignments(month)');
+
+    for ('2026-01', $groceries-id, 40000),
+        ('2026-01', $dining-id,    15000),   # same month, other category
+        ('2026-02', $groceries-id, 42500),
+        ('2026-03', $groceries-id,     0),   # a zeroed row still counts
+        ('2026-12', $dining-id,    30000)    # budgeted well ahead
+    -> ($month, $category, $amount) {
+        $db.execute(
+            'INSERT INTO assignments (month, category_id, amount)
+             VALUES (?, ?, ?)', $month, $category, $amount);
+    }
+
+    # The dogfood file has never seen budget_meta, so its schema_rev
+    # reads as absent on the very connect that creates the table — the
+    # migration must not depend on the stamp to spot the legacy shape.
+    $db.execute('DROP TABLE budget_meta');
+    $db.disconnect;
+}
+
+subtest 'a legacy month-keyed file migrates, penny for penny' => {
+    plan 13;
+    my $db = App::Moneymoor::DB.new(db-path => $legacy-path);
+    my $result = $db.connect('testpass');
+    LEAVE { $db.disconnect if $db.is-connected }
+
+    ok $db.is-connected && !($result ~~ Failure),
+        'the legacy file opens rather than failing on the old column';
+
+    my @columns = columns-of($db, 'assignments');
+    ok @columns.first({ $_ eq 'period_start' }).defined,
+        'the column was renamed';
+    nok @columns.first({ $_ eq 'month' }).defined, 'and the old name is gone';
+
+    my @rows = $db.query-all(
+        'SELECT period_start, category_id, amount FROM assignments
+         ORDER BY period_start, category_id');
+    is @rows.elems, 5, 'every row survived — none added, none dropped';
+    is @rows.map({ .<period_start> }).Array,
+        ['2026-01-01', '2026-01-01', '2026-02-01', '2026-03-01', '2026-12-01'],
+        'every key is now a period start';
+
+    # Per (category, key), exactly what was written. A migration that
+    # moves money between envelopes is worse than one that fails.
+    my %by-pair;
+    %by-pair{ "{ .<period_start> }|{ .<category_id> }" } = .<amount> for @rows;
+    is-deeply %by-pair,
+        %( "2026-01-01|$groceries-id" => 40000,
+           "2026-01-01|$dining-id"    => 15000,
+           "2026-02-01|$groceries-id" => 42500,
+           "2026-03-01|$groceries-id" => 0,
+           "2026-12-01|$dining-id"    => 30000 ),
+        'and every amount is where it was, to the penny';
+
+    my $groceries-total = $db.query-one(
+        'SELECT sum(amount) AS n FROM assignments WHERE category_id = ?',
+        $groceries-id);
+    is $groceries-total<n>, 82500, "Groceries' total is unchanged";
+    my $dining-total = $db.query-one(
+        'SELECT sum(amount) AS n FROM assignments WHERE category_id = ?',
+        $dining-id);
+    is $dining-total<n>, 45000, "and so is Dining Out's";
+
+    is $db.get-meta('schema_rev'), '1', 'the file is stamped as migrated';
+
+    my @indices = index-names($db);
+    nok @indices.first({ $_ eq 'idx_assignments_month_category' }).defined,
+        'the old unique index was dropped, not carried across the rename';
+    nok @indices.first({ $_ eq 'idx_assignments_month' }).defined,
+        'and so was the old lookup index';
+    ok @indices.first({ $_ eq 'idx_assignments_period_category' }).defined,
+        'the new unique index is in place';
+
+    # Which means the upsert works on a migrated row: same row updated,
+    # no second one alongside it.
+    my $gw = App::Moneymoor::Gateway::Assignment.new(:$db);
+    $gw.set('2026-01-01', $groceries-id, 50000);
+    my $after = $db.query-all(
+        'SELECT amount FROM assignments
+         WHERE period_start = ? AND category_id = ?',
+        '2026-01-01', $groceries-id);
+    ok $after.elems == 1 && $after[0]<amount> == 50000,
+        'the gateway upserts into the migrated row rather than beside it';
+};
+
+subtest 'reopening does not migrate a second time' => {
+    plan 4;
+    # The whole reason schema_rev exists: `period_start || '-01'` is a
+    # function applied to rows, not a statement about a shape, so
+    # replaying it would produce '2026-01-01-01'. Nothing in the schema
+    # records that it ran — the stamp has to.
+    my $db = App::Moneymoor::DB.new(db-path => $legacy-path);
+    $db.connect('testpass');
+    LEAVE { $db.disconnect if $db.is-connected }
+
+    my @keys = $db.query-all(
+        'SELECT DISTINCT period_start FROM assignments ORDER BY period_start')
+        .map({ .<period_start> });
+    is @keys.Array,
+        ['2026-01-01', '2026-02-01', '2026-03-01', '2026-12-01'],
+        'the keys are untouched by the second connect';
+    nok @keys.first({ .chars != 10 }).defined,
+        'nothing grew a second suffix';
+
+    my $count = $db.query-one('SELECT count(*) AS n FROM assignments');
+    is $count<n>, 5, 'the row count is unchanged';
+    is $db.get-meta('schema_rev'), '1', 'and the stamp is still 1';
+};
+
+subtest 'the gateway refuses the old shape after the migration' => {
+    plan 4;
+    my $db = App::Moneymoor::DB.new(db-path => $legacy-path);
+    $db.connect('testpass');
+    LEAVE { $db.disconnect if $db.is-connected }
+
+    my $gw = App::Moneymoor::Gateway::Assignment.new(:$db);
+    my $r = $gw.set('2026-03', $groceries-id, 1000);
+    ok $r ~~ Failure, "set('2026-03', ...) is refused";
+    like $r.exception.message, /'budget period'/,
+        'with a message naming what a key has to be';
+    $r.so;
+
+    my $rows = $db.query-one(
+        "SELECT count(*) AS n FROM assignments WHERE period_start = '2026-03'");
+    is $rows<n>, 0, 'and no old-shaped row was written';
+
+    my $total = $db.query-one('SELECT count(*) AS n FROM assignments');
+    is $total<n>, 5, 'the table is exactly as the migration left it';
+};
+
+subtest "the legacy file's envelopes read as the rules they were derived under"
+        => {
+    plan 5;
+    # The additive columns, on the file that actually needs them. A
+    # transforming migration and five (now six) additive ones replay on
+    # the same connect, and the additive ones have no gate: their
+    # defaults have to BE the old behaviour, or reopening a five-year-old
+    # budget would quietly re-derive it under rules it has never seen.
+    my $db = App::Moneymoor::DB.new(db-path => $legacy-path);
+    $db.connect('testpass');
+    LEAVE { $db.disconnect if $db.is-connected }
+
+    my @columns = columns-of($db, 'categories');
+    ok @columns.first({ $_ eq 'carry_overspend' }).defined,
+        'the carry-overspend column was added on reopening';
+
+    my $gw = App::Moneymoor::Gateway::Category.new(:$db);
+    my $groceries = $gw.find-by-id($groceries-id);
+    ok $groceries.defined, 'the legacy envelope is still there';
+    nok $groceries.carry-overspend,
+        'and reads as the forcing rule — reset and charge Ready to Assign';
+    nok $groceries.carries-negative,
+        'so the engine will not carry its negatives';
+    nok $gw.find-by-id($dining-id).has-target,
+        'and its target columns say "no target", which is what it meant';
+};

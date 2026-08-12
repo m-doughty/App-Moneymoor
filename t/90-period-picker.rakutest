@@ -1,0 +1,731 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Button;
+use Selkie::Widget::RichText;
+use Selkie::Widget::Select;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Util::Period;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The budget-period picker: the dialog that decides how the whole
+# budget is bucketed, driven without a terminal against real SQLCipher
+# files — t/87's treatment for the one dialog whose Save rewrites every
+# assignment row in the file.
+#
+# Three things are worth more than the widget assertions here.
+#
+# The FIRST-RUN path applies to an empty budget and must leave the file
+# alone when the answer is the calendar month: an absent
+# `period_scheme` IS the calendar month, and writing it back would turn
+# the default into a recorded choice.
+#
+# The SETTINGS path must not re-bucket without asking, must not ask
+# when there is nothing to move, and must not ask at all when the
+# answer is the scheme the budget is already on — `change-scheme` would
+# happily rewrite every row onto the scheme it is already using.
+#
+# And every apply path must RE-SEED `app/period`, because the store is
+# holding a key from the old scheme which is, in general, not a period
+# start under the new one — and `app/period-set`'s guard would drop it,
+# leaving the app looking at a bucket the engine no longer has.
+#
+# The widget assertions that DO earn their place are the ones about
+# which detail rows exist. A field that renders, takes focus and
+# accepts a keystroke reads as an input; `parse-period-choice` ignores
+# the fields its mode does not use; and those two facts together are
+# what made a correct save ("Budget period unchanged") look like a
+# broken one to somebody who had just typed 14 into a visible Day box
+# under the calendar month. So the tests below pin what is NOT in the
+# tree as hard as what is.
+
+plan 12;
+
+my constant M = App::Moneymoor::Screen::Main::Modals;
+my constant P = App::Moneymoor::Util::Period;
+my constant SCHEME-KEY = 'period_scheme';
+
+# --- Budget files -----------------------------------------------------
+
+my Int $seq = 0;
+my @dbs;
+my @paths;
+
+LEAVE {
+    for @dbs -> $db { $db.disconnect if $db.is-connected }
+    for @paths -> $path { unlink $path if $path.IO.e }
+}
+
+#| A fresh, connected budget file nobody else in this run touches.
+sub fresh-ws(--> Hash) {
+    my Str $path = $*TMPDIR.add(
+        "moneymoor-period-picker-{$*PID}-{$seq++}.db").Str;
+    @paths.push($path);
+    my $db = App::Moneymoor::DB.new(db-path => $path);
+    $db.connect('testpass');
+    @dbs.push($db);
+    { :$db, ws => App::Moneymoor::Service::Workspace.new(:$db) };
+}
+
+#|( A budget with history in it: an inflow, two envelopes and five
+    assignments spread over four calendar months — t/21's seed, which
+    is what makes the re-bucket confirm have real numbers to quote. )
+sub seeded-ws(--> Hash) {
+    my %f = fresh-ws();
+    my $ws = %f<ws>;
+
+    my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+        name => 'Current', type => 'cash'));
+    my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Groceries', sort-order => 1));
+    my $dining = $ws.categories.create(App::Moneymoor::Model::Category.new(
+        name => 'Dining Out', sort-order => 2));
+    my $rta = $ws.categories.rta-category;
+
+    $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $current.id, date => '2026-01-05', amount => 200000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $rta.id, amount => 200000)],
+    );
+
+    $ws.set-assigned('2026-01-01', $groceries.id, 40000);
+    $ws.set-assigned('2026-01-01', $dining.id,    15000);
+    $ws.set-assigned('2026-02-01', $groceries.id, 42500);
+    $ws.set-assigned('2026-03-01', $groceries.id, 10000);
+    $ws.set-assigned('2026-04-01', $dining.id,     5000);
+
+    %f<groceries> = $groceries.id;
+    %f<dining>    = $dining.id;
+    %f;
+}
+
+sub totals-by-category($db --> Hash) {
+    my %t;
+    for $db.query-all('SELECT category_id, sum(amount) AS total
+                       FROM assignments GROUP BY category_id') -> $row {
+        %t{ $row<category_id>.Int } = $row<total>.Int;
+    }
+    %t;
+}
+
+# --- The stand-in screen ---------------------------------------------
+
+my class FakeApp {
+    has @.toasts;
+    has Int $.closes is rw = 0;
+    method toast(Str:D $message --> Nil) { @!toasts.push($message); Nil }
+    method close-modal(--> Nil) { $!closes++; Nil }
+}
+
+my class FakeMain {
+    has $.app is required;
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.view is rw;
+    has @.modals;
+    has @.emitted;              # every value the submit supply carried
+
+    method icons() { icons() }
+    method viewed-period(--> Str) {
+        ($!store.get-in('app', 'period') // $!workspace.current-period).Str;
+    }
+
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted {
+            @!emitted.push($emitted);
+            body($emitted);
+        };
+    }
+}
+
+sub fixture(%budget --> Hash) {
+    my $ws    = %budget<ws>;
+    my $store = mock-store;
+    my $app   = FakeApp.new;
+    my $main  = FakeMain.new(
+        :$app, :$store, workspace => $ws,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        toast     => -> Str $m { $app.toasts.push($m) },
+        on-view   => -> $v { $main.view = $v },
+    ).register($store);
+    dispatch-and-tick($store, 'app/init');
+    { :$store, :$main, :$app, :$ws, db => %budget<db> };
+}
+
+# --- Reading the dialog ----------------------------------------------
+
+#| The container the picker swaps its detail rows in and out of: the
+#| one VBox among the content's otherwise-flat children.
+sub fields-box($modal) {
+    $modal.content.children.first({ $_ ~~ Selkie::Layout::VBox });
+}
+
+#| The captions of the detail rows currently on the dialog, in the
+#| order they are stacked — the list this suite pins per mode.
+sub field-captions($modal --> List) {
+    fields-box($modal).children.map({ .children[0].text }).List;
+}
+
+#| Every labelled field, keyed by its caption — the picker's detail
+#| fields are two-child VBoxes, a Text caption over its TextInput.
+sub fields($modal --> Hash) {
+    my %out;
+    for fields-box($modal).children -> $row {
+        my @kids = $row.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %out{ @kids[0].text } = @kids[1];
+    }
+    %out;
+}
+
+#| Every TextInput anywhere in the modal, so "there is no Day field"
+#| can be asserted against the whole tree rather than against the one
+#| place a Day field is expected to live.
+sub inputs($modal --> List) {
+    my @found;
+    my @queue = $modal.content;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @found.push($w) if $w ~~ Selkie::Widget::TextInput;
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @found.List;
+}
+
+sub option-select($modal) {
+    $modal.content.children.first({ $_ ~~ Selkie::Widget::Select });
+}
+
+#| The direct-child Text widgets, in order: the copy line, the 'Period'
+#| caption and the error line. The hint is a RichText, so that it wraps
+#| rather than losing the end of its sentence.
+sub texts($modal --> List) {
+    $modal.content.children.grep({ $_ ~~ Selkie::Widget::Text }).List;
+}
+
+sub status($modal --> Str) { (texts($modal).tail andthen .text) // '' }
+
+sub hint-widget($modal) {
+    $modal.content.children.first({ $_ ~~ Selkie::Widget::RichText });
+}
+
+sub hint-of($modal --> Str) {
+    (hint-widget($modal) andthen .spans.map(*.text).join) // '';
+}
+
+#| The rows a child declares outright, or Nil for a flex/percent one —
+#| t/63's helper, for the same arithmetic.
+sub fixed-rows($w) {
+    return Nil unless $w.sizing.mode === SizeFixed;
+    $w.sizing.value.Int;
+}
+
+sub open-picker(%f, Bool :$first-run = False) {
+    M::open-period-picker(%f<main>, :$first-run);
+    %f<main>.modals.tail;
+}
+
+#| Every Button in a widget tree, in order — a ConfirmModal's Yes is
+#| the first of two.
+sub buttons($widget --> List) {
+    my @found;
+    my @queue = $widget;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @found.push($w) if $w ~~ Selkie::Widget::Button;
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @found.List;
+}
+
+sub press-button($button --> Nil) {
+    $button.set-focused(True);
+    press-key($button, 'enter');
+    Nil
+}
+
+#| Every piece of text in a modal's tree, joined — a ConfirmModal's
+#| message is a RichText span rather than a Text.
+sub copy-of($modal --> Str) {
+    my @texts;
+    my @queue = $modal.content;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @texts.push($w.text) if $w.can('text');
+        @texts.append($w.spans.map(*.text)) if $w.can('spans');
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @texts.join(' ');
+}
+
+# --- Tests ------------------------------------------------------------
+
+subtest 'the picker offers three options and says which it is asking' => {
+    plan 10;
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f);
+
+    is $modal.frame-title, 'Budget period', 'the dialog knows what it is';
+    is $modal.frame-bottom-title, 'ctrl+s save · esc cancel',
+        'and advertises the save key and the way out';
+    is-deeply option-select($modal).items,
+        ('Calendar month (the 1st)', 'Day of the month', 'Every N weeks'),
+        'three options: the two monthly shapes and the weekly one';
+    is texts($modal).head.text, 'Currently: Calendar month',
+        'and says what the budget is on now, in words';
+
+    # The calendar month reads no detail field, so it renders none: a
+    # box that takes a keystroke and has it discarded on save is the
+    # bug this dialog was reported for.
+    is-deeply field-captions($modal), (),
+        'the calendar month asks for nothing, so no detail row is rendered';
+    is inputs($modal).elems, 0,
+        'and there is no text field anywhere in the dialog to type into';
+    is fields-box($modal).sizing.value, 0,
+        'with the row block claiming no height either';
+
+    # First run: the question is asked outright, and Esc is a choice
+    # rather than a cancel — there is nothing to cancel yet.
+    my %g = fixture(fresh-ws());
+    my $first = open-picker(%g, :first-run);
+    is $first.frame-bottom-title, 'ctrl+s save · esc keep calendar month',
+        'the first-run dialog says what Esc means';
+    is texts($first).head.text, 'When does your budget period start?',
+        'and asks the question rather than reporting the default back';
+    is status($first), '', 'with nothing on its error line yet';
+};
+
+subtest 'it opens on whatever scheme the budget is already using' => {
+    plan 11;
+    my %cal = fixture(fresh-ws());
+    my $cm = open-picker(%cal);
+    is option-select($cm).selected, 0, 'monthly/1 preselects Calendar month';
+    is-deeply field-captions($cm), (),
+        'and offers no day, because the calendar month is not a day choice';
+
+    my %pay = fresh-ws();
+    %pay<ws>.change-scheme(P.monthly(anchor-day => 14));
+    my $day = open-picker(fixture(%pay));
+    is option-select($day).selected, 1, 'monthly/14 preselects Day of the month';
+    is-deeply field-captions($day), ('Day',),
+        'showing the one field that option reads';
+    is fields($day)<Day>.text, '14', 'prefilled with the anchor day';
+    is texts($day).head.text, 'Currently: Monthly from the 14th',
+        'and the current-scheme line describes it';
+
+    my %four = fresh-ws();
+    %four<ws>.change-scheme(P.weekly(weeks => 4, anchor => '2026-08-14'));
+    my $wk = open-picker(fixture(%four));
+    is option-select($wk).selected, 2, 'weekly/4 preselects Every N weeks';
+    is-deeply field-captions($wk), ('Weeks', 'First payday'),
+        'showing the two fields that one reads, in that order';
+    is fields($wk)<Weeks>.text, '4', 'with the week count prefilled';
+    is fields($wk){'First payday'}.text, '2026-08-14',
+        'and the anchor as the payday';
+    is texts($wk).head.text, 'Currently: Every 4 weeks from 14 Aug 2026',
+        'described the way the Settings line describes it';
+};
+
+subtest 'only the fields the option reads are on the dialog' => {
+    plan 16;
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f);
+    my $select = option-select($modal);
+
+    ok hint-of($modal).contains('calendar'),
+        'the calendar-month hint is up first';
+    is-deeply field-captions($modal), (), 'over no detail rows at all';
+
+    $select.select-index(1);
+    is-deeply field-captions($modal), ('Day',),
+        'picking the day of the month brings up the Day row, and only it';
+    is fields($modal)<Day>.placeholder, '1–31 · e.g. 14',
+        'with the range in its placeholder';
+    is fields-box($modal).sizing.value, 2,
+        'and the row block claims exactly the one field it holds';
+    ok hint-of($modal).contains('14th'), 'and the hint explains the anchor day';
+
+    fields($modal)<Day>.set-text('14');
+    $select.select-index(2);
+    is-deeply field-captions($modal), ('Weeks', 'First payday'),
+        'the weekly option swaps in its own two rows';
+    is inputs($modal).grep({ .placeholder eq '1–31 · e.g. 14' }).elems, 0,
+        'and the day field it does not read is gone from the tree entirely';
+    is fields($modal)<Weeks>.placeholder, 'e.g. 4', 'the Weeks placeholder';
+    is fields($modal){'First payday'}.placeholder, 'YYYY-MM-DD',
+        'and the payday one says what shape the date takes';
+    is fields($modal){'First payday'}.text, Date.today.Str,
+        'which offers today as the payday to start counting from';
+    is fields-box($modal).sizing.value, 4, 'two rows, four rows of height';
+
+    # What was typed is remembered across a round trip, which is the
+    # whole reason the values live outside the widgets.
+    fields($modal){'First payday'}.set-text('2026-08-14');
+    $select.select-index(1);
+    is fields($modal)<Day>.text, '14',
+        'coming back gives the day the user typed, not a blank field';
+    $select.select-index(2);
+    is fields($modal){'First payday'}.text, '2026-08-14',
+        'and the payday survives the round trip too';
+
+    $select.select-index(0);
+    is-deeply field-captions($modal), (),
+        'and the calendar month takes every field back off the dialog';
+
+    # The rows come and go inside their own container; nothing else in
+    # the dialog moves, so the modal never resizes under the user.
+    is $modal.content.children.elems, 6,
+        'the copy line, caption, Select, row block, hint and error line stand';
+};
+
+subtest 'every hint is read in full, at the width the dialog has' => {
+    plan 13;
+    # The numbers are re-stated rather than imported: a constant shared
+    # between the code and its test proves only that the two agree. 80x24
+    # is the terminal this app is built to fit (see Login's DIALOG-ROWS),
+    # and the picker asks for 0.6 of its width and 0.75 of its height.
+    my constant TERM-ROWS = 24;
+    my constant TERM-COLS = 80;
+
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f);
+    my ($interior-rows, $interior-cols)
+        = $modal.content-extent(TERM-ROWS, TERM-COLS);
+    is $interior-cols, 44,
+        'the content box is 44 columns on an 80-column terminal';
+    is $interior-rows, 14, 'and 14 rows on a 24-row one';
+
+    my $hint = hint-widget($modal);
+    ok $hint ~~ Selkie::Widget::RichText,
+        'the hint is a RichText, so its copy wraps instead of being cut';
+    is fixed-rows($hint), 3, 'claiming three rows, at every option';
+
+    # RichText answers overflow by dropping the line it cannot fit, so a
+    # hint re-worded past its budget would quietly lose its last clause —
+    # which is exactly what the old one-row Text did to all three of
+    # them. Re-wrap the real spans at the real width and count.
+    my $select = option-select($modal);
+    for 0, 1, 2 -> $mode {
+        $select.select-index($mode.UInt);
+        my @lines = Selkie::Widget::RichText.wrap-spans(
+            hint-widget($modal).spans, $interior-cols,
+        );
+        ok @lines.elems <= fixed-rows($hint),
+            "option $mode: the hint wraps to {@lines.elems} lines at "
+                ~ "$interior-cols columns, within the 3 it has";
+        # Nothing is lost between the copy and the wrap: the same words,
+        # in the same order, with the wrap's line breaks for whitespace.
+        is @lines.map({ .map(*.text).join }).join(' ').words.join(' '),
+            hint-of($modal).words.join(' '),
+            "option $mode: every word of the hint survives the wrap";
+    }
+
+    # And the block that holds them still leaves the error line room for
+    # the longest refusal, under the option that spends the most rows.
+    $select.select-index(2);
+    my $claimed = $modal.content.children.map({ fixed-rows($_) // 0 }).sum;
+    is $claimed, 10, 'the weekly option claims ten rows outright';
+    ok $claimed + 2 <= $interior-rows,
+        'leaving the flex error line at least two for a wrapped refusal';
+
+    is fixed-rows(hint-widget($modal)), 3,
+        'and the hint never changed height while the fields did';
+};
+
+subtest 'a refusal paints the error line and emits nothing' => {
+    plan 12;
+    for ('', 'the day of the month'),
+        ('0', 'between 1 and 31'),
+        ('32', 'between 1 and 31'),
+        ('the 14th', 'whole number')
+    -> ($typed, $expected) {
+        my %f = fixture(fresh-ws());
+        my $modal = open-picker(%f, :first-run);
+        option-select($modal).select-index(1);
+        fields($modal)<Day>.set-text($typed);
+        press-key($modal, 'ctrl+s');
+        %f<store>.tick;
+
+        ok status($modal).contains($expected),
+            "a day of '$typed' is refused, on the dialog's own error line";
+        is %f<main>.emitted.elems, 0, "and '$typed' emits nothing at all";
+        nok %f<db>.get-meta(SCHEME-KEY).defined,
+            "so the file is untouched after '$typed'";
+    }
+};
+
+subtest 'the weekly fields are refused the same way' => {
+    plan 8;
+    for ('0', '2026-08-14', 'at least one week'),
+        ('every', '2026-08-14', 'whole number'),
+        ('4', '', 'first payday'),
+        ('4', '2026-02-30', 'Malformed date')
+    -> ($weeks, $payday, $expected) {
+        my %f = fixture(fresh-ws());
+        my $modal = open-picker(%f, :first-run);
+        option-select($modal).select-index(2);
+        fields($modal)<Weeks>.set-text($weeks);
+        fields($modal){'First payday'}.set-text($payday);
+        press-key($modal, 'ctrl+s');
+        %f<store>.tick;
+
+        ok status($modal).contains($expected),
+            "weeks '$weeks' / payday '$payday' is refused";
+        is %f<main>.emitted.elems, 0, 'and emits nothing';
+    }
+};
+
+subtest 'a valid submit builds the scheme the fields describe' => {
+    plan 6;
+    # The pure half of the dialog, which is where the rules live.
+    is-deeply M::parse-period-choice(0).to-hash, P.default-scheme.to-hash,
+        'the calendar month';
+    is-deeply M::parse-period-choice(1, day => '14').to-hash,
+        %( type => 'monthly', anchor_day => 14 ),
+        'a day of the month';
+    is-deeply M::parse-period-choice(
+            2, weeks => '4', payday => '2026-08-14').to-hash,
+        %( type => 'weekly', weeks => 4, anchor => '2026-08-14' ),
+        'every four weeks from a payday';
+
+    # Day 1 needs no special case: 'the 1st of the month' and 'the
+    # calendar month' are the same scheme, and normalising is what
+    # `.monthly(anchor-day => 1)` already does.
+    is-deeply M::parse-period-choice(1, day => '1').to-hash,
+        P.default-scheme.to-hash,
+        'a typed day of 1 normalises onto the calendar month';
+
+    # And the same three through the widgets, so the fields are read
+    # from where the parser expects them.
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f);
+    option-select($modal).select-index(2);
+    fields($modal)<Weeks>.set-text('2');
+    fields($modal){'First payday'}.set-text('2026-08-14');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    is %f<main>.emitted.elems, 1, 'a valid weekly choice emits once';
+    is-deeply %f<main>.emitted[0].to-hash,
+        %( type => 'weekly', weeks => 2, anchor => '2026-08-14' ),
+        'carrying the scheme the fields described';
+};
+
+subtest 'the first run writes the scheme and re-seeds the period' => {
+    plan 7;
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f, :first-run);
+    option-select($modal).select-index(1);
+    fields($modal)<Day>.set-text('14');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    is-deeply %f<ws>.scheme.to-hash, %( type => 'monthly', anchor_day => 14 ),
+        'the workspace adopted the answer';
+    is %f<db>.get-meta(SCHEME-KEY), '{"anchor_day":14,"type":"monthly"}',
+        'and the budget file records it';
+
+    my Str $period = %f<store>.get-in('app', 'period').Str;
+    is $period, %f<ws>.current-period,
+        'the viewed period is re-seeded onto the new scheme';
+    is %f<ws>.scheme.period-of($period), $period,
+        'which is a real period start under it, not a stale key';
+
+    ok %f<app>.toasts.grep({ $_.contains('Budget period set') }).elems == 1,
+        'the change is announced';
+    ok %f<app>.toasts.grep({ $_.contains('Monthly from the 14th') }).elems == 1,
+        'in words, not as a scheme dump';
+
+    # An empty budget has nothing to re-bucket, so the confirm has no
+    # business appearing: the picker is the only dialog opened.
+    is %f<main>.modals.elems, 1, 'and nothing was confirmed on an empty budget';
+};
+
+subtest 'the calendar month is the answer that writes nothing' => {
+    plan 6;
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f, :first-run);
+    press-key($modal, 'ctrl+s');               # Calendar month, preselected
+    %f<store>.tick;
+
+    is %f<main>.emitted.elems, 1, 'the choice is made';
+    nok %f<db>.get-meta(SCHEME-KEY).defined,
+        'but no key is written: an absent scheme IS the calendar month';
+    is %f<app>.toasts.elems, 0,
+        'and nothing is announced, because nothing changed';
+
+    # Esc is the same answer by another route. `with-modal` owns the Esc
+    # binding, so what this pins is that the picker itself does not turn
+    # Esc into a save behind its back.
+    my %g = fixture(fresh-ws());
+    my $escaped = open-picker(%g, :first-run);
+    press-key($escaped, 'esc');
+    %g<store>.tick;
+    is %g<main>.emitted.elems, 0, 'Esc emits nothing';
+    nok %g<db>.get-meta(SCHEME-KEY).defined, 'and writes nothing';
+    is %g<app>.toasts.elems, 0, 'and says nothing';
+};
+
+subtest 'from Settings: unchanged, and nothing to move' => {
+    plan 7;
+    # The same scheme again. `change-scheme` would accept it — a legal
+    # no-op that still rewrites every row — so the dialog has to stop
+    # short of asking.
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f);
+    press-key($modal, 'ctrl+s');               # Calendar month, preselected
+    %f<store>.tick;
+
+    is %f<app>.toasts.tail, 'Budget period unchanged — Calendar month',
+        'picking the scheme the budget is on says so, and names it';
+    nok %f<db>.get-meta(SCHEME-KEY).defined, 'and writes nothing';
+    is %f<main>.modals.elems, 1, 'and opens no confirm';
+
+    # A different scheme on a budget with no assignments in it: nothing
+    # to re-bucket, so no confirm either.
+    my %g = fixture(fresh-ws());
+    my $empty = open-picker(%g);
+    option-select($empty).select-index(1);
+    fields($empty)<Day>.set-text('14');
+    press-key($empty, 'ctrl+s');
+    %g<store>.tick;
+
+    is %g<main>.modals.elems, 1,
+        'an empty budget is not asked to confirm a re-bucket of nothing';
+    is-deeply %g<ws>.scheme.to-hash, %( type => 'monthly', anchor_day => 14 ),
+        'the scheme changed anyway';
+    is %g<store>.get-in('app', 'period').Str, %g<ws>.current-period,
+        'and the viewed period followed it';
+    ok %g<app>.toasts.grep({ $_.contains('Budget period set') }).elems == 1,
+        'with the same toast the first run gives';
+};
+
+subtest 'the reported bug: a day typed under another option cannot leak' => {
+    plan 6;
+    # What was reported, in order: pick a day of the month, type 14,
+    # go back to the calendar month, save. `parse-period-choice` has
+    # always answered monthly/1 there — correctly — but the Day box was
+    # still on screen with 14 in it, so the "unchanged" toast read as a
+    # save that had silently failed. The fix is at the other end: the
+    # field is not there to be typed into under an option that ignores
+    # it, and the toast says which scheme the budget is staying on.
+    my %f = fixture(fresh-ws());
+    my $modal = open-picker(%f);
+    my $select = option-select($modal);
+
+    $select.select-index(1);
+    fields($modal)<Day>.set-text('14');
+    $select.select-index(0);
+
+    is-deeply field-captions($modal), (),
+        'the Day row is off the dialog, so the 14 is nowhere to be read';
+    is inputs($modal).elems, 0, 'and nothing is offering to be typed into';
+
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    is %f<main>.emitted.elems, 1, 'saving emits once';
+    is-deeply %f<main>.emitted[0].to-hash, P.default-scheme.to-hash,
+        'the calendar month, regardless of the day typed under option two';
+    nok %f<db>.get-meta(SCHEME-KEY).defined,
+        'nothing is written, because nothing changed';
+    is %f<app>.toasts.tail, 'Budget period unchanged — Calendar month',
+        'and the toast names the scheme the budget is staying on';
+};
+
+subtest 'a budget with history asks first, with the numbers in it' => {
+    plan 15;
+    my %budget = seeded-ws();
+    my %f = fixture(%budget);
+    my %before = totals-by-category(%budget<db>);
+    my Str $was = %f<store>.get-in('app', 'period').Str;
+
+    my $picker = open-picker(%f);
+    option-select($picker).select-index(2);
+    fields($picker)<Weeks>.set-text('5');
+    fields($picker){'First payday'}.set-text('2026-01-01');
+    press-key($picker, 'ctrl+s');
+    %f<store>.tick;
+
+    is %f<main>.modals.elems, 2, 'the confirm opened over the picker';
+    my $confirm = %f<main>.modals.tail;
+    my Str $copy = copy-of($confirm);
+    ok $copy.contains('Change budget period'), 'and it is the confirm';
+    ok $copy.contains('Re-bucket 5 assignments'),
+        'naming how many assignments move';
+    ok $copy.contains('across 4 periods'), 'how many periods they are in now';
+    ok $copy.contains('Every 5 weeks from 1 Jan 2026'),
+        'the scheme they are moving to, in words';
+    ok $copy.contains('into 3 periods'), 'and how many they will be in';
+    ok $copy.contains('Envelope totals are preserved'),
+        'and the guarantee that makes yes safe';
+
+    # Five-week windows are long enough to swallow two calendar-month
+    # starts, so one assignment lands on another here. That is the only
+    # irreversible half of the operation and the confirm has to say so
+    # before the user agrees to it, not afterwards.
+    ok $copy.contains('1 assignment lands on top of another')
+        && $copy.contains('changing back will not undo'),
+        'the merge, and that it cannot be undone by changing back';
+
+    # No: the second button. Nothing at all may have happened.
+    press-button(buttons($confirm)[1]);
+    %f<store>.tick;
+    is-deeply %f<ws>.scheme.to-hash, P.default-scheme.to-hash,
+        'Cancel leaves the scheme where it was';
+    nok %budget<db>.get-meta(SCHEME-KEY).defined, 'and the file untouched';
+    is %f<store>.get-in('app', 'period').Str, $was,
+        'and the viewed period where the user left it';
+
+    # Yes, from a second run at the same dialog.
+    my %g = fixture(%budget);
+    my $again = open-picker(%g);
+    option-select($again).select-index(2);
+    fields($again)<Weeks>.set-text('5');
+    fields($again){'First payday'}.set-text('2026-01-01');
+    press-key($again, 'ctrl+s');
+    %g<store>.tick;
+    press-button(buttons(%g<main>.modals.tail).head);
+    %g<store>.tick;
+
+    is-deeply %g<ws>.scheme.to-hash,
+        %( type => 'weekly', weeks => 5, anchor => '2026-01-01' ),
+        'Re-bucket adopts the new scheme';
+    is-deeply totals-by-category(%budget<db>), %before,
+        'every category is assigned exactly what it was, penny for penny';
+
+    my Str $now = %g<store>.get-in('app', 'period').Str;
+    is %g<ws>.scheme.period-of($now), $now,
+        'the viewed period is a start under the new scheme';
+    ok %g<app>.toasts.grep({ $_.contains('Budget period changed') }).elems == 1,
+        'and the change is announced';
+};

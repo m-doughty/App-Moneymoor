@@ -1,0 +1,349 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Select;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Screen::Main::Modals;
+
+# The other two dialogs that write: the transfer, and the account
+# editor. Filled in and submitted against a real SQLCipher file, the
+# same way t/77 drives the transaction editor.
+#
+# The transfer is the one with a rule the spec's field list does not
+# show: a transfer that crosses the budget boundary has to name an
+# envelope, because money is entering or leaving the budget, and one
+# that stays inside must not, because no envelope moves. The dialog
+# carries the picker either way and decides from the two accounts.
+
+plan 7;
+
+my constant DAY = '2026-03-11';
+
+my $db-path = $*TMPDIR.add("moneymoor-accounts-dialogs-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $current = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Current', type => 'cash', sort-order => 1));
+my $savings = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'Savings', type => 'cash', sort-order => 2));
+my $house = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+    name => 'House', type => 'tracking', sort-order => 3));
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+
+# --- The stand-ins ----------------------------------------------------
+
+my class FakeTab {
+    has Int $.register-account-id = 0;
+    has Int $.selected-account-id = 0;
+}
+
+my class FakeMain {
+    has $.app;
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.accounts-tab is rw;
+    has @.modals;
+
+    method icons() { icons() }
+    method account(Int $id) {
+        $id.defined ?? $!workspace.accounts.find-by-id($id) !! Nil;
+    }
+    method category(Int $id) {
+        $id.defined
+            ?? $!workspace.categories.find-all(:include-hidden)
+                   .first({ .id == $id })
+            !! Nil;
+    }
+    method accounts(--> List) {
+        $!workspace.accounts.find-all(:include-closed).List;
+    }
+    method categories(--> List) {
+        $!workspace.categories.find-all(:include-hidden).List;
+    }
+    method groups(--> List) {
+        $!workspace.categories.find-groups(:include-hidden).List;
+    }
+    method payees(--> List) { $!workspace.payees.find-all.List }
+    method view() { Nil }
+
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { body($emitted) };
+    }
+}
+
+sub fixture(Int :$account-id = 0 --> Hash) {
+    my $store = mock-store;
+    my @toasts;
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws, toast => -> Str $m { @toasts.push($m) },
+    ).register($store);
+    my $main = FakeMain.new(
+        :$store, workspace => $ws,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    $main.accounts-tab = FakeTab.new(register-account-id => $account-id,
+                                     selected-account-id => $account-id);
+    dispatch-and-tick($store, 'app/init');
+    { :$store, :$main, :@toasts };
+}
+
+sub fields($modal --> Hash) {
+    my %out;
+    for $modal.content.children -> $child {
+        next unless $child.can('children');
+        my @kids = $child.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %out{ @kids[0].text } = @kids[1];
+    }
+    %out;
+}
+
+sub status($modal --> Str) {
+    my @texts = $modal.content.children.grep({ $_ ~~ Selkie::Widget::Text });
+    (@texts.tail andthen .text) // '';
+}
+
+sub index-of($select, Str $name --> Int) {
+    ($select.items.first({ $_.contains($name) }, :k) // 0).Int;
+}
+
+sub txn-count(--> Int) { $ws.transactions.find-all.elems }
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'a transfer inside the budget moves no envelope' => {
+    plan 5;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transfer($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    is %field<From>.selected-value, 'Current',
+        'the register\'s own ledger is the obvious from';
+    isnt %field<To>.selected-value, 'Current',
+        'and the to opens on a legal pair';
+
+    %field<To>.select-index(index-of(%field<To>, 'Savings').UInt);
+    %field<Amount>.set-text('500');
+    %field<Date>.set-text(DAY);
+    %field<Memo>.set-text('sweep');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my @legs = $ws.transactions.find-all.grep({ .memo eq 'sweep' });
+    is @legs.elems, 2, 'both legs were written';
+    is-deeply @legs.map({ $_.amount }).sort.List, (-50000, 50000),
+        'one out, one in, the same size';
+    is $ws.transactions.find-splits(@legs[0].id).elems
+       + $ws.transactions.find-splits(@legs[1].id).elems, 0,
+        'and neither leg carries an envelope, because none moved';
+};
+
+subtest 'a transfer across the boundary carries its envelope' => {
+    plan 3;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transfer($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    %field<To>.select-index(index-of(%field<To>, 'House').UInt);
+    %field<Amount>.set-text('100');
+    %field<Date>.set-text(DAY);
+    %field<Memo>.set-text('to the house');
+    %field<Category>.select-index(
+        index-of(%field<Category>, 'Groceries').UInt);
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my @legs = $ws.transactions.find-all.grep({ .memo eq 'to the house' });
+    is @legs.elems, 2, 'the engine accepted it';
+
+    # The on-budget leg is the one that has to say which envelope the
+    # money left; the tracking leg must not be categorised at all.
+    my $on-budget = @legs.first({ .account-id == $current.id });
+    my @splits = $ws.transactions.find-splits($on-budget.id);
+    is-deeply @splits.map({ ($_.category-id, $_.amount) }).List,
+        (($groceries.id, -10000),),
+        'and it is the on-budget leg that carries it, signed outwards';
+    is $ws.transactions.find-splits(
+        @legs.first({ .account-id == $house.id }).id).elems, 0,
+        'while the tracking leg carries nothing';
+};
+
+subtest 'the transfer dialog refuses what the engine would' => {
+    plan 4;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    my Int $before = txn-count();
+    App::Moneymoor::Screen::Main::Modals::open-transfer($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    %field<To>.select-index(index-of(%field<To>, 'Current').UInt);
+    %field<Amount>.set-text('10');
+    press-key($modal, 'ctrl+s');
+    ok status($modal).contains('two different accounts'),
+        'the same account on both sides is caught before the gateway';
+    is txn-count(), $before, 'and nothing was written';
+
+    %field<To>.select-index(index-of(%field<To>, 'Savings').UInt);
+    %field<Amount>.set-text('nope');
+    press-key($modal, 'ctrl+s');
+    ok status($modal).contains('parse') || status($modal).contains('Malformed'),
+        'so is an amount that is not one';
+    is txn-count(), $before, 'and still nothing was written';
+};
+
+subtest 'a new cash account, typed and saved' => {
+    plan 4;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-account-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    is-deeply %field<Type>.items.List, ('cash', 'credit', 'tracking'),
+        'the three types the engine knows';
+    %field<Name>.set-text('Joint');
+    %field<Note>.set-text('the household one');
+    %field{'Sort order'}.set-text('7');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $saved = $ws.accounts.find-by-name('Joint');
+    ok $saved.defined, 'it reached the database';
+    is $saved.sort-order, 7, 'with the order that was typed';
+    nok $ws.accounts.payment-category-for($saved.id).defined,
+        'and no payment envelope, because it is not a card';
+};
+
+subtest 'a new credit account brings its payment envelope' => {
+    plan 3;
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-account-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    %field<Name>.set-text('Visa');
+    %field<Type>.select-index(index-of(%field<Type>, 'credit').UInt);
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+
+    my $saved = $ws.accounts.find-by-name('Visa');
+    ok $saved.defined && $saved.is-credit, 'the card exists';
+    my $payment = $ws.accounts.payment-category-for($saved.id);
+    ok $payment.defined && $payment.is-payment,
+        'and the engine made its payment envelope in the same breath';
+    is $payment.name, 'Visa', 'named after the card it pays';
+};
+
+subtest 'an existing account cannot change its type' => {
+    plan 4;
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-account-editor(
+        $main, account-id => $current.id);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    ok $modal.frame-title.starts-with('Edit account'), 'the editor opened';
+    # Static text, not a picker: Gateway::Account.update refuses a type
+    # change outright, so offering the field would be a promise the
+    # engine breaks on save.
+    ok %field<Type> ~~ Selkie::Widget::Text, 'the type is read-only';
+    is %field<Type>.text, 'cash', 'and says what it is';
+
+    %field<Name>.set-text('Current Account');
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    is $ws.accounts.find-by-id($current.id).name, 'Current Account',
+        'while the name is editable, and saved';
+};
+
+subtest 'Enter saves these dialogs too' => {
+    plan 6;
+    # Same convention as the transaction editor (t/77): Enter in a text
+    # field runs the save ctrl+s runs, while Enter in a picker stays the
+    # picker's own.
+    my %f = fixture();
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-account-editor($main);
+    my $editor = $main.modals[0];
+    my %field = fields($editor);
+
+    ok $editor.frame-bottom-title.contains('enter/^s save'),
+        'the account editor advertises it';
+    %field<Name>.set-text('Enter Saved');
+    %field<Name>.set-focused(True);
+    press-key(%field<Name>, 'enter');
+    %f<store>.tick;
+    ok $ws.accounts.find-by-name('Enter Saved').defined,
+        'and Enter in its name field writes the account';
+
+    # An empty name is the gate; Enter must refuse exactly as ctrl+s
+    # does, and leave the dialog up.
+    my %g = fixture();
+    App::Moneymoor::Screen::Main::Modals::open-account-editor(%g<main>);
+    my $blank = %g<main>.modals[0];
+    my %blank-field = fields($blank);
+    my Int $before = $ws.accounts.find-all(:include-closed).elems;
+    %blank-field<Name>.set-focused(True);
+    press-key(%blank-field<Name>, 'enter');
+    %g<store>.tick;
+    is $ws.accounts.find-all(:include-closed).elems, $before,
+        'an unnamed account is refused through Enter as well';
+    ok status($blank).contains('needs a name'), 'with the same message';
+
+    # The transfer: Enter in the amount saves, Enter on the From picker
+    # opens it.
+    my %t = fixture(account-id => $current.id);
+    App::Moneymoor::Screen::Main::Modals::open-transfer(%t<main>);
+    my $transfer = %t<main>.modals[0];
+    my %tf = fields($transfer);
+    %tf<To>.select-index(index-of(%tf<To>, 'Savings').UInt);
+    %tf<Amount>.set-text('12.34');
+    %tf<Date>.set-text(DAY);
+    %tf<Memo>.set-text('entered');
+
+    my Int $txns = txn-count();
+    %tf<From>.set-focused(True);
+    press-key(%tf<From>, 'enter');
+    is txn-count(), $txns, 'Enter on the From picker transfers nothing';
+    press-key(%tf<From>, 'esc');
+    %tf<From>.set-focused(False);
+
+    %tf<Amount>.set-focused(True);
+    press-key(%tf<Amount>, 'enter');
+    %t<store>.tick;
+    is $ws.transactions.find-all.grep({ .memo eq 'entered' }).elems, 2,
+        'while Enter in the amount field makes the transfer';
+};

@@ -1,0 +1,510 @@
+use Test;
+use lib 'lib';
+
+use MacOS::NativeLib <sqlcipher>;
+
+use Selkie::Layout::VBox;
+use Selkie::Sizing;
+use Selkie::Test::Keys;
+use Selkie::Test::Store;
+use Selkie::Widget::Border;
+use Selkie::Widget::Button;
+use Selkie::Widget::Text;
+use Selkie::Widget::TextInput;
+
+use App::Moneymoor::DB;
+use App::Moneymoor::Model::Account;
+use App::Moneymoor::Model::Category;
+use App::Moneymoor::Model::CategoryGroup;
+use App::Moneymoor::Model::Split;
+use App::Moneymoor::Model::Transaction;
+use App::Moneymoor::Service::Icons;
+use App::Moneymoor::Service::Workspace;
+use App::Moneymoor::StoreHandlers;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Screen::Accounts;
+use App::Moneymoor::Screen::Main::Modals;
+
+# Reconcile mode end to end: a real SQLCipher budget, a real store, a
+# real register Table, and no terminal.
+#
+# The three things only a flow test can catch:
+#
+# 1. Enter and Esc are mode-guarded on a widget that consults its
+#    keybinds before its own navigation. Enter goes through
+#    `on-activate` precisely so it is not stolen; Esc is a keybind
+#    precisely so it IS. Both have to do the right thing in the mode
+#    and out of it.
+# 2. A finish is ONE write. Promoting nine transactions through nine
+#    dispatches would derive the whole budget nine times, and the only
+#    place that shows up is `ws/rev`.
+# 3. The mode has to end by itself. A statement balance is about one
+#    ledger, and the register must never show a diff against an
+#    account the statement says nothing about.
+#
+# Every date is derived from PINNED-PERIOD, and the balance adjustment's
+# date is passed in rather than read from the clock.
+
+plan 9;
+
+my constant PINNED-PERIOD = '2026-03-01';
+my constant DAY1 = '2026-03-02';
+my constant DAY2 = '2026-03-09';
+my constant PINNED-TODAY = Date.new('2026-03-31');
+
+my $db-path = $*TMPDIR.add("moneymoor-reconcile-{$*PID}.db").Str;
+LEAVE { unlink $db-path if $db-path.IO.e }
+
+my $db = App::Moneymoor::DB.new(:$db-path);
+$db.connect('testpass');
+LEAVE { $db.disconnect if $db.is-connected }
+
+my $ws = App::Moneymoor::Service::Workspace.new(:$db);
+
+my $bills = $ws.categories.create-group(
+    App::Moneymoor::Model::CategoryGroup.new(name => 'Monthly Bills',
+                                             sort-order => 1));
+my $groceries = $ws.categories.create(App::Moneymoor::Model::Category.new(
+    name => 'Groceries', group-id => $bills.id, sort-order => 1));
+my $rta = $ws.categories.rta-category;
+
+# One ledger per subtest, so a cleared mark made in one cannot leak
+# into the next. The derivation covers all of them either way.
+my Int $next-order = 0;
+sub ledger(Str:D $name, Str :$type = 'cash' --> Hash) {
+    my $account = $ws.accounts.create(App::Moneymoor::Model::Account.new(
+        :$name, :$type, sort-order => ++$next-order));
+    my $pay = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $account.id, date => DAY1, amount => 200000),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $rta.id, amount => 200000)],
+    );
+    my $shop = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => $account.id, date => DAY2, amount => -4210,
+            memo => 'weekly shop'),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -4210)],
+    );
+    %( :$account, :$pay, :$shop );
+}
+
+# --- The stand-ins -----------------------------------------------------
+
+my class FakeApp {
+    has @.toasts;
+    method toast(Str $m) { @!toasts.push($m) }
+    method focus($) { }
+}
+
+#| t/76's stand-in screen, plus t/78's modal tap: the dialogs here are
+#| driven to their submit, so the body has to actually run.
+my class FakeMain {
+    has $.app is required;
+    has $.store is required;
+    has $.workspace is required;
+    has $.theme is required;
+    has $.content-host is required;
+    has $.root is required;
+    has $.view is rw;
+    has %.accounts-by-id;
+    has %.categories-by-id;
+    has %.groups-by-id;
+    has %.payees-by-id;
+    has @.mounted;
+    has @.modals;
+    has $.accounts-tab is rw;
+
+    method icons() { icons() }
+    method account(Int $id)  { $id.defined ?? %!accounts-by-id{$id}   !! Nil }
+    method category(Int $id) { $id.defined ?? %!categories-by-id{$id} !! Nil }
+    method group(Int $id)    { $id.defined ?? %!groups-by-id{$id}     !! Nil }
+    method payee(Int $id)    { $id.defined ?? %!payees-by-id{$id}     !! Nil }
+    method accounts(--> List)   { %!accounts-by-id.values.List   }
+    method categories(--> List) { %!categories-by-id.values.List }
+    method groups(--> List)     { %!groups-by-id.values.List     }
+    method payees(--> List)     { %!payees-by-id.values.List     }
+
+    method set-view($view --> Nil) {
+        $!view = $view;
+        %!accounts-by-id = $!workspace.accounts.find-all(:include-closed)
+                               .map({ .id => $_ }).Hash;
+        %!categories-by-id = $!workspace.categories.find-all(:include-hidden)
+                                .map({ .id => $_ }).Hash;
+        %!groups-by-id = $!workspace.categories.find-groups(:include-hidden)
+                             .map({ .id => $_ }).Hash;
+        %!payees-by-id = $!workspace.payees.find-all.map({ .id => $_ }).Hash;
+        Nil
+    }
+
+    method pane-border(Str:D $title, $sizing --> Selkie::Widget::Border) {
+        Selkie::Widget::Border.new(:$sizing, :$title, padding => 1);
+    }
+
+    method mount-pane($parent, Selkie::Widget::Border $border,
+                      $pane, Str:D $context --> Nil) {
+        $border.set-content($pane);
+        $parent.add($border);
+        $border.set-store($!store);
+        @!mounted.push($pane => $context);
+        Nil
+    }
+
+    method with-modal($supply, $modal, $focus, :&body!, :&on-cancel) {
+        @!modals.push($modal);
+        $supply.tap: -> $emitted { body($emitted) };
+    }
+}
+
+sub mounted-tab(Int :$account-id --> Hash) {
+    my $host  = Selkie::Layout::VBox.new(sizing => Sizing.flex);
+    my $store = mock-store;
+    my $app   = FakeApp.new;
+    my $main  = FakeMain.new(
+        :$app, :$store, workspace => $ws, content-host => $host, root => $host,
+        theme => App::Moneymoor::Themes::load('gruvbox'),
+    );
+    App::Moneymoor::StoreHandlers.new(
+        workspace => $ws,
+        toast     => -> Str $m { $app.toast($m) },
+        on-view   => -> $v { $main.set-view($v) },
+    ).register($store);
+    $host.set-store($store);
+
+    my $tab = App::Moneymoor::Screen::Accounts.new(main => $main);
+    $main.accounts-tab = $tab;
+    $tab.build($host);
+    $tab.install-subscriptions;
+    $tab.install-keybinds;
+
+    dispatch-and-tick($store, 'app/init');
+    dispatch-and-tick($store, 'app/period-set', period => PINNED-PERIOD);
+    dispatch-and-tick($store, 'accounts/select-account', :$account-id)
+        with $account-id;
+    { :$tab, :$main, :$store, :$app };
+}
+
+# --- Poking at what got built ------------------------------------------
+
+#| The register's frame title. The Border is the Table's parent.
+sub title-of($tab --> Str) { ($tab.table.parent andthen .title) // '' }
+
+#| Every labelled field in a dialog, keyed by its caption — t/78's
+#| helper, which works for a static field and an input alike.
+sub fields($modal --> Hash) {
+    my %out;
+    for $modal.content.children -> $child {
+        next unless $child.can('children');
+        my @kids = $child.children;
+        next unless @kids.elems == 2 && @kids[0] ~~ Selkie::Widget::Text;
+        %out{ @kids[0].text } = @kids[1];
+    }
+    %out;
+}
+
+#| Every Button in a widget tree, in order — a ConfirmModal's Yes is
+#| the first of two.
+sub buttons($widget --> List) {
+    my @found;
+    my @queue = $widget;
+    while @queue.elems {
+        my $w = @queue.shift;
+        next without $w;
+        @found.push($w) if $w ~~ Selkie::Widget::Button;
+        @queue.append($w.children) if $w.can('children');
+        @queue.push($w.content) if $w.can('content') && $w.content.defined;
+    }
+    @found.List;
+}
+
+#| Submit a dialog's text field the way a user does. The focus is not
+#| decoration: TextInput drops every key event while unfocused.
+sub submit-field($input --> Nil) {
+    $input.set-focused(True);
+    press-key($input, 'enter');
+    Nil
+}
+
+sub press-button($button --> Nil) {
+    $button.set-focused(True);
+    press-key($button, 'enter');
+    Nil
+}
+
+sub cleared-of(Int $id --> Str) { $ws.transactions.find-by-id($id).cleared }
+sub rev($store --> Int) { state-at($store, 'ws', 'rev').Int }
+
+#| Mark a transaction cleared the way the user does: cursor onto its
+#| row, then `c`.
+sub press-c($tab, $store, Int $txn-id --> Nil) {
+    my $idx = $tab.table.rows.first({ $_<id> == $txn-id }, :k);
+    $tab.table.select-index($idx.UInt);
+    press-key($tab.table, 'c');
+    $store.tick;
+    Nil
+}
+
+# --- Tests ---------------------------------------------------------------
+
+subtest 'ctrl+r on All Accounts explains itself instead' => {
+    plan 3;
+    my %m = mounted-tab();
+    press-key(%m<tab>.table, 'ctrl+r');
+    %m<store>.tick;
+
+    is %m<main>.modals.elems, 0, 'no dialog';
+    ok %m<app>.toasts.tail.contains('one account'),
+        'and a toast saying why — a statement is about one ledger';
+    nok %m<tab>.reconciling, 'the mode did not start';
+};
+
+subtest 'ctrl+r asks for the statement and enters the mode' => {
+    plan 7;
+    my %l = ledger('Enter');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+
+    press-key(%m<tab>.table, 'ctrl+r');
+    $store.tick;
+    is %m<main>.modals.elems, 1, 'the dialog opened';
+    my %field = fields(%m<main>.modals[0]);
+
+    # Nothing is cleared yet, so the register's cleared balance is zero
+    # — and the dialog says so rather than making the user work it out.
+    is %field{'Cleared balance'}.text, '£0.00',
+        'it states what the register thinks has cleared';
+    ok %field{'Statement balance'} ~~ Selkie::Widget::TextInput,
+        'and offers the statement figure as the one thing to type';
+
+    %field{'Statement balance'}.set-text('1957.90');
+    submit-field(%field{'Statement balance'});
+    $store.tick;
+
+    ok %m<tab>.reconciling, 'submitting entered the mode';
+    is state-at($store, 'accounts', 'reconcile')<statement>, 195790,
+        'with the statement parsed into pence';
+    is title-of(%m<tab>),
+        'Reconciling · cleared £0.00 · statement £1,957.90 · diff +£1,957.90',
+        'and the frame says how far apart they are';
+    is %m<tab>.frame-style.fg, %m<main>.theme.fg-red,
+        'and the frame is painted red, because they are apart';
+};
+
+subtest 'a malformed statement leaves the dialog open' => {
+    plan 3;
+    my %l = ledger('Typo');
+    my %m = mounted-tab(account-id => %l<account>.id);
+
+    press-key(%m<tab>.table, 'ctrl+r');
+    %m<store>.tick;
+    my %field = fields(%m<main>.modals[0]);
+    %field{'Statement balance'}.set-text('twelve pounds');
+    submit-field(%field{'Statement balance'});
+    %m<store>.tick;
+
+    nok %m<tab>.reconciling, 'the mode did not start';
+    ok %m<app>.toasts.tail.contains('Malformed')
+       || %m<app>.toasts.tail.contains('parse'),
+        'the parse error is surfaced';
+    # with-modal closes on emit, and a dialog that vanished would have
+    # thrown the typo away with it.
+    is %m<main>.modals.elems, 1, 'and no second dialog was opened';
+};
+
+subtest 'c inside the mode walks the diff down to zero' => {
+    plan 4;
+    my %l = ledger('Marking');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 195790);
+
+    press-c(%m<tab>, $store, %l<pay>.id);
+    is title-of(%m<tab>),
+        'Reconciling · cleared £2,000.00 · statement £1,957.90 '
+        ~ '· diff -£42.10',
+        'one row cleared, and the frame follows it through the '
+        ~ 'ordinary recompute';
+
+    press-c(%m<tab>, $store, %l<shop>.id);
+    is title-of(%m<tab>),
+        'Reconciling · cleared £1,957.90 · statement £1,957.90 · diff £0.00',
+        'the second closes the gap';
+    is %m<tab>.frame-style.fg, %m<main>.theme.fg-green,
+        'and the frame turns green';
+    is cleared-of(%l<pay>.id), 'cleared',
+        'the rows are cleared, not yet reconciled';
+};
+
+subtest 'Enter at zero promotes the cleared rows, in one write' => {
+    plan 6;
+    my %l = ledger('Finish');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+
+    # A third transaction that the statement never mentioned, left
+    # uncleared: finishing must not touch it.
+    my $pending = $ws.transactions.create(
+        App::Moneymoor::Model::Transaction.new(
+            account-id => %l<account>.id, date => DAY2, amount => -1000,
+            memo => 'not on the statement'),
+        splits => [App::Moneymoor::Model::Split.new(
+            category-id => $groceries.id, amount => -1000)],
+    );
+    dispatch-and-tick($store, 'ws/recompute');
+
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 195790);
+    press-c(%m<tab>, $store, %l<pay>.id);
+    press-c(%m<tab>, $store, %l<shop>.id);
+
+    my Int $before = rev($store);
+    press-key(%m<tab>.table, 'enter');
+    $store.tick;
+
+    is rev($store), $before + 1,
+        'two promotions, one recompute — the whole point of the closure';
+    is cleared-of(%l<pay>.id), 'reconciled', 'the first cleared row';
+    is cleared-of(%l<shop>.id), 'reconciled', 'and the second';
+    is cleared-of($pending.id), 'uncleared',
+        'while the row the statement never mentioned is untouched';
+    nok %m<tab>.reconciling, 'the mode is over';
+    ok %m<app>.toasts.first({ .contains('Reconciled') }).defined,
+        'and it said so';
+};
+
+subtest 'Esc leaves the mode and keeps the marks' => {
+    plan 4;
+    my %l = ledger('Escape');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 195790);
+    press-c(%m<tab>, $store, %l<pay>.id);
+
+    ok press-key(%m<tab>.table, 'esc'),
+        'the register consumes Esc — it must not fall through while a '
+        ~ 'reconciliation is running';
+    $store.tick;
+
+    nok %m<tab>.reconciling, 'the mode is off';
+    is cleared-of(%l<pay>.id), 'cleared',
+        'the mark stays: it is a fact about a transaction, not the mode';
+    is title-of(%m<tab>), 'Escape · cleared £2,000.00 · working £1,957.90',
+        'and the frame goes back to saying what the account is worth';
+};
+
+subtest 'the mode ends when the ledger or the tab does' => {
+    plan 5;
+    my %l = ledger('Leaving');
+    my %other = ledger('Elsewhere');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 100);
+    ok %m<tab>.reconciling, 'reconciling one ledger';
+
+    dispatch-and-tick($store, 'accounts/select-account',
+                      account-id => %other<account>.id);
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        'arrowing onto another ledger ends it';
+    nok title-of(%m<tab>).contains('Reconciling'),
+        'and the frame is an ordinary register again';
+
+    dispatch-and-tick($store, 'accounts/select-account',
+                      account-id => %l<account>.id);
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 100);
+    dispatch-and-tick($store, 'app/tab-selected', name => 'budget');
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        'so does walking off the tab';
+
+    # Coming back must not resurrect it with a statement balance the
+    # user typed ten minutes ago.
+    dispatch-and-tick($store, 'app/tab-selected', name => 'accounts');
+    nok state-at($store, 'accounts', 'reconcile').defined,
+        'and coming back does not bring it with it';
+};
+
+subtest 'an out-of-balance finish offers the adjustment' => {
+    plan 7;
+    my %l = ledger('Adjusting');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+    my $main = %m<main>;
+
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 195790);
+    press-c(%m<tab>, $store, %l<pay>.id);   # cleared £2,000, out by -£42.10
+
+    my Int $txns-before = $ws.transactions.find-by-account(%l<account>.id).elems;
+    App::Moneymoor::Screen::Main::Modals::finish-reconcile(
+        $main, today => PINNED-TODAY);
+    $store.tick;
+
+    is $main.modals.elems, 1, 'a confirm, not a promotion';
+    ok $main.modals[0].content.children.first({
+        $_ ~~ Selkie::Widget::Text && $_.text.contains('£42.10') }).defined,
+        'named for the difference';
+    ok %m<tab>.reconciling, 'and the mode is still running behind it';
+
+    # Declining is a real answer: the user has a receipt to find.
+    press-button(buttons($main.modals[0])[1]);
+    $store.tick;
+    is $ws.transactions.find-by-account(%l<account>.id).elems, $txns-before,
+        'saying no writes nothing';
+    ok %m<tab>.reconciling, 'and leaves the mode exactly as it was';
+
+    App::Moneymoor::Screen::Main::Modals::finish-reconcile(
+        $main, today => PINNED-TODAY);
+    $store.tick;
+    press-button(buttons($main.modals[1])[0]);
+    $store.tick;
+
+    my @after = $ws.transactions.find-by-account(%l<account>.id);
+    my $adj = @after.first({ .date eq PINNED-TODAY.Str });
+    ok $adj.defined && $adj.amount == -4210,
+        'saying yes writes the difference, signed the account\'s way';
+    nok %m<tab>.reconciling, 'and the reconciliation is finished';
+};
+
+subtest 'the adjustment is filed, dated and reconciled' => {
+    plan 6;
+    my %l = ledger('Filing');
+    my %m = mounted-tab(account-id => %l<account>.id);
+    my $store = %m<store>;
+    my $main = %m<main>;
+
+    # A Balance Adjustment payee already exists from the subtest above,
+    # so this also proves find-or-create reuses it rather than making a
+    # second one.
+    my Int $payees-before = $ws.payees.find-all.elems;
+
+    dispatch-and-tick($store, 'accounts/reconcile-start',
+                      account-id => %l<account>.id, statement => 200500);
+    press-c(%m<tab>, $store, %l<pay>.id);   # cleared £2,000, out by +£5.00
+
+    App::Moneymoor::Screen::Main::Modals::finish-reconcile(
+        $main, today => PINNED-TODAY);
+    $store.tick;
+    press-button(buttons($main.modals[0])[0]);
+    $store.tick;
+
+    my $adj = $ws.transactions.find-by-account(%l<account>.id)
+                 .first({ .date eq PINNED-TODAY.Str });
+    ok $adj.defined, 'the adjustment exists';
+    is $adj.amount, 500, 'for the difference, inward this time';
+    is $adj.cleared, 'reconciled',
+        'already reconciled — it exists because a statement said so';
+    is $ws.payees.find-by-id($adj.payee-id).name, 'Balance Adjustment',
+        'under the named payee';
+    is $ws.payees.find-all.elems, $payees-before,
+        'which was reused, not created again';
+
+    my @splits = $ws.transactions.find-splits($adj.id);
+    is-deeply @splits.map({ ($_.category-id, $_.amount) }).List,
+        (($rta.id, 500),),
+        'and the money lands in Ready to Assign, where new money goes';
+};
