@@ -1,18 +1,23 @@
 # Run App::Moneymoor's own test suite on Linux, macOS and Windows.
 #
-# Scaffolded by ariza 0.0.1 (`ariza scaffold-ci`), and yours
-# from here on: this file is written only when it is absent, and never
-# overwritten, because a test workflow grows things no generator can
-# infer from a manifest.
+# Originally scaffolded by ariza (`ariza scaffold-ci`); hand-maintained
+# from here on — the generator writes this file only when it is absent.
 #
-# One of those things, probably, is this app's native libraries:
+# The suite talks to real encrypted databases, so the runner needs
+# SQLCipher: libsqlcipher-dev on Ubuntu (the -dev package, because
+# `is native('sqlcipher')` dlopens the unversioned libsqlcipher.so,
+# which only -dev ships), the Homebrew keg on macOS (found via
+# MacOS::NativeLib's symlink pass at test time). Notcurses arrives by
+# itself: Notcurses-Native's Build.rakumod downloads its prebuilt pack
+# during the dependency install.
 #
-#     notcurses, sqlcipher
-#
-# Nothing below installs them. They are what a *bundle* carries, and
-# whether the *test suite* needs them on the runner is a question only
-# this repository can answer -- add the steps if it does. Selkie's and
-# Vips-Native's test.yml are worked examples.
+# Windows runs the full suite too. Zetetic publishes no free prebuilt
+# DLL (binaries are the commercial tier), so the runner's preinstalled
+# vcpkg builds sqlcipher:x64-windows once and actions/cache keeps the
+# built tree — the first run pays ~10-15 minutes, every run after
+# restores it in seconds. The DLL is staged under the canonical
+# sqlcipher.dll name beside its OpenSSL deps and put on PATH, which is
+# all `is native('sqlcipher')` needs.
 
 name: test
 
@@ -29,19 +34,92 @@ env:
   LC_ALL: en_US.UTF-8
 
 jobs:
-  test:
-    name: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  test-linux:
+    name: ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - uses: Raku/setup-raku@v1
         with:
           raku-version: 'latest'
+
+      - name: Install SQLCipher
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlcipher-dev
+
+      - name: Install Raku dependencies
+        run: zef install --/test --test-depends --deps-only .
+
+      - name: Install App::Prove6
+        run: zef install --/test App::Prove6
+
+      - name: Run tests
+        run: prove6 -I. t
+
+  test-macos:
+    name: macos-latest
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: 'latest'
+
+      - name: Install SQLCipher
+        run: brew install sqlcipher
+
+      - name: Install Raku dependencies
+        run: zef install --/test --test-depends --deps-only .
+
+      - name: Install App::Prove6
+        run: zef install --/test App::Prove6
+
+      - name: Run tests
+        run: prove6 -I. t
+
+  test-windows:
+    name: windows-latest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: 'latest'
+
+      - name: Cache vcpkg-built SQLCipher
+        id: cache-sqlcipher
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-sqlcipher-x64-windows-v1
+
+      - name: Build SQLCipher (vcpkg, cache miss only)
+        if: steps.cache-sqlcipher.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: vcpkg install sqlcipher:x64-windows
+
+      # Stage the DLL under the canonical name NativeCall mangles
+      # 'sqlcipher' to, beside the OpenSSL DLLs it imports, and put
+      # that one directory on PATH. DBIISH_SQLCIPHER_LIB covers
+      # DBDish's explicit pre-load path as belt and braces.
+      - name: Expose SQLCipher
+        shell: pwsh
+        run: |
+          $bin = 'C:\vcpkg\installed\x64-windows\bin'
+          $stage = 'C:\sqlcipher-lib'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "$bin\*.dll" $stage
+          $dll = Get-ChildItem "$stage\*sqlcipher*.dll" | Select-Object -First 1
+          if (-not $dll) { throw "no sqlcipher DLL produced by vcpkg" }
+          if ($dll.Name -ne 'sqlcipher.dll') {
+              Copy-Item $dll.FullName "$stage\sqlcipher.dll"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $stage
+          Add-Content -Path $env:GITHUB_ENV -Value "DBIISH_SQLCIPHER_LIB=$stage\sqlcipher.dll"
 
       - name: Install Raku dependencies
         run: zef install --/test --test-depends --deps-only .
