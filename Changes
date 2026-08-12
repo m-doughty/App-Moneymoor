@@ -1,0 +1,658 @@
+Revision history for App::Moneymoor
+
+{{$NEXT}}
+
+0.3.0  2026-08-12T23:04:59+01:00
+    - [2026-08-12] Notcurses::Native dependency floor raised to 0.5.0
+      — the release whose prebuilt binary packs carry self-built,
+      licence-audited LGPL dependencies (with corresponding source
+      attached to each binary release) on every platform. Bundles
+      built from this version inherit those packs.
+    - [2026-08-07] Overspending can be carried, per envelope. Rule 3
+      has always had two answers for a negative balance — a payment
+      envelope carries it forward, everything else resets to zero and
+      charges the shortfall to every subsequent period's Ready to
+      Assign — and which one you got was decided by `kind`. The forcing
+      rule is the right default and the wrong rule for the envelope you
+      deliberately run negative: a reimbursable expense, a bill you
+      front and get back. `categories.carry_overspend` is that choice,
+      a sixth `ensure-column` whose `DEFAULT 0` is not just a sensible
+      value for a legacy row but the rule every period of that file was
+      already derived under, so there is nothing to backfill and no
+      existing budget changes by a penny. The engine's Pass B now asks
+      `Model::Category.carries-negative` — payment envelopes by kind,
+      standard envelopes by flag — which turns the two ternaries that
+      encoded the exception into the general case. Cash overspending is
+      zero on a carrying envelope, because the hole is not being
+      written off and charging Ready to Assign for it as well as
+      carrying it forward would take the same money out of the budget
+      twice; credit overspending is untouched by the flag, since that
+      debt lives on the card and adding it back would double-count
+      against the master invariant. The flag is retroactive by
+      construction and that is the settled ruling, not an oversight:
+      `compute` stores nothing, so turning it on re-derives every
+      period under the carrying rule, past Ready to Assign figures
+      included, which is the only honest reading of "this envelope was
+      always allowed to run negative". A carried negative gets its own
+      `carried-negative` flag and its own §2 severity — fg-purple, the
+      same hue as `payment-negative` because the arithmetic is
+      identical, its own key because the rail words them differently
+      ("Overspend carries forward" against "Payment envelope
+      negative"): a purple row with no explanation reads as a bug in
+      the budget rather than as the setting that produced it. The
+      envelope editor gains a `Carry overspending` checkbox above the
+      target block, offered on standard rows only — a payment envelope
+      already carries by kind and Ready to Assign has no available to
+      carry, so `Gateway::Category.update` refuses the flag on both
+      with the same "only its sort order and hidden flag" refusal a
+      rename gets — and the dialog grew a row taller to keep the flex
+      error line its two rows on a 24-row terminal. The catalogue token
+      carries the flag too: the derivation can see it, so flipping it
+      on an envelope that has ever been overspent moves the digest by
+      itself, but on one that has not it changes only what the editor
+      renders, which is exactly the class of change that token exists
+      to catch.
+    - [2026-08-04] Target kinds reach the screen, which finishes the
+      program. The envelope editor gains a `Kind` picker — `Refill each
+      period` / `Set aside each period` / `Goal by period` — and, under
+      the last of those only, a `Goal period` date and a `Repeat`,
+      mounted and unmounted through the same swap-container pattern the
+      budget-period picker uses, so a field is never on the dialog
+      unless the option that reads it is selected and what was typed in
+      it survives a round trip. The date's placeholder carries the one
+      piece of guidance the design settled on — "when the bill is paid"
+      — because a goal targets the period its payment lands in, and the
+      date is read as "the period containing it" so a scheme change
+      re-derives the plan rather than orphaning a key. Blank still
+      clears a target, and clearing one forces the kind back to
+      `refill`: "no target" has exactly one shape. Saving splits in two:
+      name, group and sort order go through `categories.update`
+      carrying the row's **existing** target tuple unchanged, and the
+      target itself goes through `Workspace.set-target` and only when it
+      actually changed. That is not tidiness — `update` writes the whole
+      row, this dialog builds a fresh model from its own fields, and the
+      obvious version of it wipes a £50,000 plan every time somebody
+      fixes a typo in a name. A new envelope is created without a target
+      and then given one through the same front door, so its plan start
+      is stamped on the first save rather than the second.
+      Everything that reads a target now asks `Service::Target` and
+      nothing else: a bare `=` in the assign field adjusts by
+      `target-ask` (it used to be a fund-to, which is only the same
+      question for a refill — a set-aside's gap is measured against
+      this period's assignments and a goal's against its milestone),
+      `f` sweeps the same figure across every envelope and its confirm
+      lines say the milestone each lands on rather than a goal's total,
+      the grid's Target column shows the current milestone for a goal
+      (and group headers sum those, so the column still adds up to
+      something anybody is being asked for), and the detail rail grew a
+      block per kind: `Target £100.00 /period` and `Funded this period`
+      for a set-aside; the goal, a schedule line packed to fit the
+      rail's 26 columns (`by April 2027 · 3 of 9 · every 3 periods`,
+      broken across lines rather than truncated when a `monthly/14`
+      label will not share one), and `On track` / `Target met` told
+      apart for a goal. The catalogue token gained all four new columns
+      — including `target_start`, since a re-stamp moves every milestone
+      after it — and the rail's subscription gained the catalogue token,
+      which fixes a bug that predates this work: a target moves no
+      money, so the derivation's digest is byte-identical either side of
+      saving one, and the rail was keyed only on the digest and the
+      cursor. Saving a target repainted the grid and left the rail
+      showing the old block until the selection happened to move.
+    - [2026-08-04] Targets grow kinds, in the engine. A target used to
+      be one idea — "available should be £N each period" — which is
+      right for groceries and wrong for everything you are saving up
+      for: carry-in satisfies the level, so a Christmas fund with £900
+      in it asks for nothing, and "£50,000 by April" is neither
+      £50,000 this month nor a refill to £5,000. `target_kind` now
+      says which of three senses a target is meant in — `refill`
+      (unchanged, the default, and what every file written before
+      today reads as with no migration), `set_aside` ("put £N in each
+      period, whatever the balance") and `by_period` ("reach £N by the
+      period containing this date") — alongside `target_period`,
+      `target_start` and `target_repeat`, four more `ensure-column`s
+      whose defaults describe exactly what a legacy row already meant.
+      The new `Service::Target` is where they mean something:
+      `target-ask` is the kind-aware "what would funding this
+      envelope's plan for this period cost", and it is deliberately
+      the ONE function the rest of the app keys on, because `=`, `f`,
+      the grid's colour and the rail's copy all already key on
+      underfunded. `refill` measures available; `set_aside` measures
+      **assigned**, so carry-in never silences it, a refund is not
+      saving, and pulling this period's money back out re-opens the
+      ask; `by_period` measures a milestone on a straight line from
+      the stamped plan start to the goal period — `base + (N-base)·i/k`
+      in integer pence, with the last milestone forced to exactly N
+      because nine steps to £50,000 is £5,555.55 and nine of those is
+      not £50,000. Getting ahead makes later periods ask less; raiding
+      the pot makes the gap reappear **in that same period**, unspread,
+      whether it was raided by a move or by a spend. The ramp's base is
+      the envelope's carry-in at the cycle's first period, derived from
+      the view and never snapshotted, so a pre-funded pot is asked only
+      for the remaining gap and a retroactive history edit re-derives
+      the whole schedule. Goals repeat in periods (`R` ≥ 1 puts them at
+      E, E+R, E+2R…, so quarterly VAT is "every 3" under calendar
+      months), each cycle re-deriving its base from what was left after
+      the last bill; and in the goal period the envelope's own outflow
+      counts toward the milestone, so paying the bill mid-period does
+      not read as a £3,000 raid for the rest of it while the same spend
+      one period early still does. `Workspace.set-target` is the front
+      door, and the only thing in the app that may write
+      `target_start`: it stamps the current period when a target
+      becomes by-period or when its amount or goal period changes — a
+      different plan re-ramps from today — and pointedly does not when
+      only the repeat changes, which would move a cycle that is already
+      under way. It also normalises the fields a kind does not use,
+      because a form carries all of them whichever option is selected;
+      `Gateway::Category` refuses them instead, since an explicit
+      caller storing a goal date on a refill target has two ideas about
+      what it is storing. The gateway stays clock-free and scheme-free
+      (dates are validated for shape, and `set-target` is handed the
+      stamp), a system row refuses all five columns exactly as it
+      refuses a rename, and zero pence is legal only for `refill`,
+      because zero means "no target" and no target has one shape. This
+      was the engine half; the bullet above it is the other one, and
+      with it the target-kinds program is complete.
+    - [2026-08-04] A budget can now be asked when its period starts,
+      and told to change its mind — which completes the budget-periods
+      program. A budget created from the login screen is met, on its
+      first frame, by "When does your budget period start?": the
+      calendar month, a day of the month, or every N weeks from a first
+      payday. It is asked there rather than in the create form because
+      that form is 24 rows tall on the nose — the height of the
+      terminal it has to fit — and because the budget behind the
+      dialog is empty, so whatever is chosen re-buckets nothing at all.
+      Esc means "the calendar month, then", and nothing is written for
+      that answer: an absent `period_scheme` IS the calendar month, and
+      recording the default as a choice would leave a file diff and a
+      "changed" toast for a change nobody made. Settings gains a period
+      section — a line saying what the budget is on, in words
+      (`Calendar month`, `Monthly from the 14th`, `Every 4 weeks from
+      14 Aug 2026`, from the new `Util::Period.describe`), and `ctrl+p`
+      to change it. Deliberately not a fifth picker beside the palette
+      and the currency: those four are display preferences in
+      `config.json` that a save writes and a rebuild re-renders, and
+      the period is a property of the budget file whose change rewrites
+      every assignment row, which must never happen as a side effect of
+      changing a currency symbol. Changing it on a budget with history
+      goes through `Workspace.re-bucket-preview` and a confirm made of
+      its actual numbers — how many assignments move, how many periods
+      they are in now, how many they will be in, that envelope totals
+      are preserved, and, when it is not zero, how many will land on
+      top of another and be added together, which is the one half of
+      the operation changing back will not undo. Picking the scheme the
+      budget is already on is a toast rather than a dialog, because
+      `change-scheme` would accept it and rewrite every row to no
+      effect; a budget with no assignments skips the confirm for the
+      same reason fund-all with nothing to fund does. Every apply path
+      re-seeds `app/period` with the new scheme's current period,
+      because the store is holding a key from the old one that is in
+      general not a start under the new one and `app/period-set`'s
+      guard would drop it — and the recompute that follows carries the
+      change to the banner, the grid, the Ready-to-Assign pill and the
+      reports through the digest every subscription already watches, so
+      none of them needed plumbing. The picker validates before its
+      supply emits, like every other dialog: a day of 32, a week count
+      of 0 or a payday that is not a date paints the refusal inside the
+      still-open dialog, and only the detail fields the selected option
+      actually reads are on it at all — none for the calendar month,
+      Day for the day of the month, Weeks and First payday for every N
+      weeks — with what was typed remembered across a switch, so
+      flipping between the options and back costs nobody the date they
+      just entered. That last part is a fix for the shape this shipped
+      in earlier the same day, found by using it: all three fields
+      stayed in the tree and were merely blanked, so it was possible to
+      choose the calendar month, type 14 into the Day box that was
+      still sitting there, hit `ctrl+s` and be told "Budget period
+      unchanged" — a correct save (`parse-period-choice` has always
+      ignored the fields its mode does not use) that reads as a broken
+      one, because a field that renders, takes focus and accepts a
+      keystroke *is* an input. Two smaller pieces of the same
+      confusion went with it: the first option now names the day it
+      pins (`Calendar month (the 1st)`, since `Calendar month` beside a
+      Day field invites "a month starting on that day"), and the no-op
+      toast names the scheme the budget is staying on (`Budget period
+      unchanged — Calendar month`) instead of only reporting that
+      nothing happened. The rows that freed up went to the hint under
+      the fields, which was a one-row `Text` clipping all three of its
+      sentences mid-clause — including the only place the weekly option
+      says what it counts periods from, which also said "the payday
+      below" about a field above it. It is now a wrapping `RichText`
+      claiming the three rows the longest hint measures at the dialog's
+      44-column interior, the same at every option so the error line
+      does not move when the Select does. A day of 1 needs no
+      special case — "the 1st of the month" and "the calendar month"
+      are the same scheme, and `.monthly(anchor-day => 1)` normalises
+      one onto the other. The one thing that can go wrong at the
+      boundary now also has somewhere to go: a budget file whose stored
+      scheme cannot be read makes `Workspace.new` throw, and the entry
+      point catches it, leaves the login screen up and puts the
+      engine's own message — naming the key and quoting what it found —
+      on its status line, rather than letting a modal body explode over
+      a half-switched screen. The copy that used to say "month"
+      generalises with it: `[` and `]` are the previous and next
+      period, the hint bar says `period`, fund-all has nothing to do
+      "this period", the rail says there are no derived moves "this
+      period" and the grid's note is money "assigned in future
+      periods". Targets generalise in words as well as in mechanism — a
+      target is what an envelope wants in one budget period, so
+      `Gateway::Category` refuses "a target" rather than "a monthly
+      target" that cannot be negative.
+    - [2026-08-04] A budget's period scheme is now a property of the
+      budget file, and changing it moves the money with it.
+      `Service::Workspace` reads `budget_meta.period_scheme` —
+      `Util::Period.to-hash` as one line of JSON, keys sorted — before
+      it builds a single gateway, so the two that validate period keys
+      are born holding the file's scheme rather than the default. An
+      absent key still means the calendar month, which is what every
+      budget written so far has been using; a key that is present but
+      unreadable *throws*, naming the key and quoting what it found,
+      because a budget opened under a scheme its owner never chose
+      buckets every derived figure by the wrong windows and then
+      refuses every write the user attempts, and a file that will not
+      open is a problem with an obvious cause where one that opens
+      wrong is not. For the same reason the scheme is no longer a
+      constructor argument at all: passing one throws rather than
+      being quietly ignored. `change-scheme` is the single mutator,
+      and it does not merely record the new choice — it re-buckets, by
+      the settled rule that each assignment row moves to whichever new
+      period contains its old period's *start date*, with rows that
+      land together summed. Nothing is created, dropped or moved
+      between categories, only re-labelled, so total assigned per
+      category is preserved and Ready to Assign and the master
+      invariant come out exactly as they went in; that is asserted at
+      runtime as well as in the tests, by re-reading the per-category
+      totals after the rewrite and refusing — rolling the whole thing
+      back, `period_scheme` included — if a single penny has drifted.
+      The read, the rewrite, the assertion and the `budget_meta` write
+      share one transaction, and the rewrite is a delete-and-reinsert
+      in `(period start, category)` order rather than an in-place
+      re-key, because the unique index constrains each statement
+      rather than the transaction and merging rows has to delete one
+      of them anyway. It is lossy in the buckets by design — two
+      periods that merge cannot be told apart afterwards, so changing
+      back restores the totals and not the split — and `t/21` says so
+      rather than pretending otherwise. `re-bucket-preview` computes
+      the same five counts (`rows`, `periods-before`, `rows-after`,
+      `periods-after`, `merged`) with no writes at all, which is the
+      material the confirm dialog will be made of. An empty budget
+      re-buckets nothing and just writes the key, which is how a newly
+      created budget will adopt a non-default scheme. The invariant
+      property suite now runs its four properties under three schemes
+      — `monthly/1`, `monthly/14` and a four-weekly window anchored
+      inside the dates it draws from — on every one of its eight
+      seeds, 1080 random operations in all: the same generated facts,
+      bucketed three ways, because the derivation depends only on each
+      fact landing in exactly one period and on keys ordering as text.
+      That soak is what reaches the boundaries a calendar month never
+      has, a transaction dated on the anchor day itself among them.
+    - [2026-08-04] The engine is keyed by budget period. Everything
+      that used to be bucketed by a `'YYYY-MM'` calendar month is now
+      bucketed by a `'YYYY-MM-DD'` period start, and `Service::Budget`
+      takes the scheme that decides what that means as `:$scheme`.
+      Under `monthly/1` — the default, and the only value anything
+      passes today — every start is `'YYYY-MM-01'`, so this release
+      derives exactly the same budget from exactly the same facts; the
+      property suite, which asserts the master invariant, the move
+      ledger, rule 3's carry algebra and order-independence after every
+      one of 360 random operations, holds with every expected number
+      unchanged. That is the point of doing the re-key on its own: the
+      algebra depends only on facts bucketing into one period each and
+      on period keys ordering as text, never on how long a period is,
+      and now the code says so. `CategoryMonth` and `BudgetMonth`
+      become `CategoryPeriod` and `BudgetPeriod`, `BudgetView.months`
+      becomes `.periods`, `month-of` / `next-month` / `prev-month` /
+      `month-range` / `valid-month` are gone in favour of asking the
+      scheme, and `valid-period` (format only — start-ness needs a
+      scheme) and `period-range` (the capped run the derivation walks;
+      `Util::Period.periods-through` stays uncapped, because the cap
+      guards against a typo'd fact date, which is an engine problem
+      and not a fact about schemes) take their place.
+      `Model::Transaction.month` is deleted outright: deriving a
+      bucket from a date is scheme-dependent, and a scheme-ignorant
+      model that does it is right for the calendar month and silently
+      wrong for every other scheme. The gateways validate period keys
+      as *starts*, not merely as well-formed dates — a key like
+      `'2026-03-15'`, or an unmigrated `'2026-03'`, opens a phantom
+      bucket that the derivation sums alongside the real periods, so
+      the money is neither lost nor visible and the budget stops
+      adding up in a way no screen explains — and `Service::Workspace`
+      owns the one scheme object that the two validating gateways and
+      every `compute` call share. `find-by-month` becomes
+      `find-by-period` on both gateways, and asks the scheme where the
+      window ends rather than assuming a month. The UI half lands with
+      it: the store's `app/month` becomes `app/period` and holds a
+      start key, `app/month-prev` / `-next` / `-set` become
+      `app/period-prev` / `-next` / `-set` with a `period` payload,
+      and every screen, view builder and modal that took a `$month`
+      takes a `$period` — `viewed-month` → `viewed-period`,
+      `through-month` → `through-period`, `budget-rows(:$month!)` →
+      `:$period!`, and so on down. Two of those renames carry a
+      behaviour change rather than a spelling one. The store's guard
+      is now *start-ness*, not well-formedness: `app/period-set`
+      refuses `'2026-03-15'` and an unmigrated `'2026-03'` as flatly
+      as it refuses `'not-a-period'`, because a well-formed date that
+      is not a start under the workspace's scheme is exactly the key
+      that opens a phantom bucket. And the step handlers navigate by
+      asking that scheme — `next-period` / `prev-period` — rather than
+      by calling a free function that assumed the calendar, with a
+      junk key resetting to the current period instead of propagating
+      a throw out of a dispatch. `Screen::Main::Subscriptions`'
+      `month-label` is deleted in favour of `Util::Period.label`,
+      which reproduces its `monthly/1` output byte for byte and its
+      never-throw contract exactly; the banner, the Ready-to-Assign
+      pill's frame title and the reports strip's all read the scheme
+      live off the workspace rather than building one, so the release
+      that loads a real scheme from the budget file relabels all three
+      for free. Two things deliberately do *not* follow the rename.
+      The navigation copy still says "Previous month" / "Next month"
+      and the hint bar still says `[ ]  month`, because under
+      `monthly/1` that is what they do and "period" is the engine's
+      word, not the user's. The delete-refusal copy does follow it —
+      "money assigned to it in any **period**" — because it is
+      mirroring a gateway guard whose own message now names the
+      "period(s) of non-zero assignments" it found, and a dialog that
+      called them months would be describing a different rule from the
+      toast that follows it. The one visible change is in the
+      diagnostics dump (Ctrl+G), which prints raw keys on purpose: its
+      `Month` and `Months N (a … b)` lines become `Period` and
+      `Periods N (a … b)`, and the keys under them are now
+      `'YYYY-MM-01'`.
+    - [2026-08-04] `assignments` is re-keyed on disk, by the
+      distribution's first *transforming* migration: `month` becomes
+      `period_start`, and every `'2026-03'` becomes `'2026-03-01'`.
+      Migrations replay on every connect, and the two patterns that
+      makes safe — `CREATE IF NOT EXISTS` and `ensure-column` — both
+      work because they are statements about a desired shape, which
+      can be asked for twice. A transform is a function applied to
+      rows: run `period_start || '-01'` twice and you have
+      `'2026-03-01-01'`. So the fact that it ran has to be recorded,
+      and a new `budget_meta` key/value table records it as
+      `schema_rev`, reachable through `DB.get-meta` / `set-meta` (an
+      absent key reads as the `Str` type object, because absence is an
+      answer — for the period scheme it will mean "the calendar
+      month"). The drop-indices / rename / rewrite / stamp sequence
+      shares one `run-txn`, and SQLite's DDL is transactional, so a
+      crash mid-migration reopens the file as the old shape or the new
+      one and never as a mixture. The legacy shape is detected by
+      asking `PRAGMA table_info` for a `month` column rather than by
+      trusting the stamp, because the real dogfood file has never had
+      a `budget_meta` table at all and so reads as unstamped on the
+      very connect that creates one. `t/20` rebuilds a genuine
+      pre-period file by hand and asserts the migration penny for
+      penny, that reopening does not apply it twice, and that the
+      gateway will not write the old shape afterwards.
+    - [2026-08-04] `Util::Period`, the first piece of budget periods.
+      Most people budget pay-to-pay rather than 1st-to-1st, so the
+      engine's keying dimension becomes the period: `monthly` with an
+      anchor day of 1–31 (`1` being the calendar month exactly, and
+      the default, so nothing that exists today changes) or `weekly`
+      with an every-N-weeks step from a first payday — four-weekly UK
+      pay being the case no month can fake. A period is named by its
+      own start date, `'YYYY-MM-DD'`, which makes lexicographic order
+      chronological order and lets the derivation go on comparing,
+      sorting and hashing period keys as text; the old `'YYYY-MM'`
+      months degenerate into `'YYYY-MM-01'`. The monthly sequence is
+      generated by iterating months and clamping the anchor into each
+      one, never by adding days: `2026-01-31` → `2026-02-28` →
+      `2026-03-31` recovers, where anything stepping from the clamped
+      date walks three days off the user's payday and stays there.
+      Navigation throws — `next-period` of a string that is not a
+      start under this scheme means a caller's key drifted, and a
+      budget bucketed two ways at once surfaces days later as money
+      that does not add up — while `label` returns `''`, because it is
+      composed inside a store selector where an exception takes out
+      the subscription walk. `monthly/1` labels "August 2026" exactly
+      as `month-label` did; everything else labels its range
+      ("14 Aug – 13 Sep 2026", "14 – 27 Aug 2026"). Pure: no DB, no
+      I/O and, for now, no consumers — but property-tested first, over
+      nine scheme shapes and two centuries of seeded random dates, on
+      partition, fixpoint, monotonicity, next/prev inversion and
+      contiguity of `periods-through`.
+    - [2026-08-04] Monthly targets. An envelope can say what it wants
+      to have available each month (`categories.target_pence`, 0
+      meaning no target, added by `DB.ensure-column` — its first
+      caller, so a budget file written before today opens and reads
+      "no target" rather than failing). The grid grows a fifth
+      column, blank where there is no target and summed on group
+      headers; the detail rail gains `Target` plus either
+      `To fund  +£72.50` in amber or `Target met`; the envelope
+      editor gains the field, where blank clears it. `Service::Budget`
+      is untouched and stays that way: underfunded is
+      `max(0, target - available)`, derived in the view layer, and a
+      target moves no money by itself. `Gateway::Category` refuses a
+      negative one on both paths and refuses one on a system row with
+      the same message it refuses a rename with — a payment
+      envelope's figure is the card's balance and Ready to Assign is
+      not an envelope. `target-pence` joins the catalogue token,
+      because the derivation's digest cannot see it and a saved
+      target that does not repaint the grid is a feature that looks
+      broken.
+    - [2026-08-04] The assign field learns `=n` and `=`, and the grid
+      learns `f`. `=450` means "make this envelope's available £450",
+      applied as an adjustment by the difference — never as a set,
+      because assigned and available differ by carry-in, activity and
+      the derivation's own card moves, so setting assigned to 450 on
+      an envelope carrying £37.50 would leave £487.50 available and
+      not what was typed. A bare `=` is `={target}`, and with no
+      target set it refuses on the dialog's own error line rather
+      than closing. `=-5` and `=(5)` are refused too: taking money
+      out is `-5`, which the sign rule already reads. A zero delta
+      closes with a toast and dispatches nothing at all — a no-op
+      upsert would still bump `ws/rev` and re-derive the budget to
+      announce that nothing had changed. `f` is the same idea over
+      the whole month: a confirm listing every visible, underfunded
+      envelope with its `+£`, the total, and the resulting Ready to
+      Assign, applied in ONE `ws/mutate` closure so twenty envelopes
+      are one derivation and cannot half-happen. It only ever adds —
+      an envelope over its target is left alone. A total that would
+      push Ready to Assign below zero is stated in red, in words, and
+      then permitted: assigning money that has not arrived yet is a
+      real step on the way to a plan, and the app's job there is to
+      be unmistakable rather than to forbid.
+    - [2026-08-04] Settings picks the currency symbol (£, $, €) and
+      the number format (`1,234.56` or `1.234,56`), and both apply
+      without a restart. The symbol is display only — nothing
+      converts, and the engine still has never heard of a currency —
+      but the number format is not: the decimal mark decides how a
+      typed figure is READ as well as how it is written, and thousands
+      are grouped with whichever of `.` / `,` the decimal mark is not.
+      `Util::Money` holds the pair as module state, set once by `UI`
+      from the config before the first frame and again by the Settings
+      save, so all 37 `format-pence` call sites and all 5
+      `parse-pence` ones are unchanged; the redraw is the rebuild
+      `apply-theme-live` was already doing. Grouping is accepted only
+      in exact groups of three, which is what makes `10,00` under a
+      `.` decimal mark an error rather than a silent £1,000 — that
+      typo (the other locale's number) is the one a user of this
+      setting will actually make, and it is 100x the value they meant.
+      Three digits after the decimal mark says so, and names the
+      separator that was wanted. Every symbol is still accepted on
+      input whatever is being displayed, because a pasted `$12.34` has
+      one meaning. `Config` validates both keys on load and falls back
+      to £ / `.` on a hand-edited value it does not know: a typo in a
+      plaintext file must not stop the app opening.
+    - [2026-08-03] The Reports tab's summary box is as deep as the
+      summary. It was a fixed four rows — frame, line, line, frame —
+      with the second content line held in reserve for the wrap the
+      strip only needs on a narrow terminal, so every ordinary
+      terminal drew a blank line inside the box and gave the chart one
+      row fewer than it could have had. `View::ReportRow` grew
+      `summary-rows-needed`, which answers three rows when the strip
+      fits its content box and four when it does not (and four when
+      nothing has been measured yet, which is what an unlaid-out pane
+      reports); `Screen::Reports` applies it on both paths that can
+      move the answer — the strip's own repaint, where the month's
+      figures can gain a digit, and a resize, which previously
+      returned early whenever the chart's bar cut had not moved and so
+      never re-checked the wrap on a width-only change.
+    - [2026-08-03] Deleting an envelope is possible again, and
+      reachable. The engine refused any category with an assignment
+      ROW against it, but `Gateway::Assignment.set` upserts a row for
+      every month you touch — including one you typed a 0 into — so
+      every envelope that had ever been budgeted to was undeletable
+      for good, however carefully the user emptied it first. The
+      refusal now counts months that hold money ("N month(s) of
+      non-zero assignments"), and the leftover zero rows are swept in
+      the same transaction as the category. Splits still refuse
+      outright, in any month, past or future: a transaction
+      categorized to an envelope is history, and deleting the envelope
+      would rewrite it. `Gateway::Account.delete` is deliberately
+      unchanged — it cascades where the category gateway restricts,
+      and `assignments.category_id` is ON DELETE CASCADE, so budgeting
+      to a card's payment envelope never wedged the account.
+    - [2026-08-03] `d` on the budget grid deletes what the cursor is
+      on, dispatching on the row exactly as `e` does: an envelope gets
+      the confirm the editor's `ctrl+d` opens, a group header gets the
+      group confirm (its envelopes survive, ungrouped), and the rows
+      that are not deletable — a card's payment envelope, the
+      Ungrouped bucket, the empty state — are told rather than asked.
+      The footer advertises it. The envelope confirm's copy now states
+      the rule the engine actually enforces: transactions, or money
+      assigned in any month, not "any history".
+    - [2026-08-03] Enter saves the multi-field editors — envelope,
+      group, account, transaction, transfer, split — through the same
+      closure `ctrl+s` runs, with the same validation and the same
+      refusals (a transaction whose splits do not add up will not save
+      on Enter either). Every field in them is single-line, so Enter
+      had nothing else to mean in one. It is wired per text field
+      rather than as an `enter` keybind on the modal, because Selkie
+      offers a key to the focused widget first and the modal's own
+      binds last: a modal-level bind would never see Enter from a
+      field, and the widgets that already own it keep it — Enter opens
+      a Select, toggles a Checkbox, picks a RadioGroup option and
+      edits the split under the cursor. Settings is the one dialog
+      without an Enter-save: it has no text field, only pickers.
+      Bottom titles now read `enter/^s save`.
+    - [2026-08-03] Selkie TUI v0.1 (v0.2.0): the whole app, on top of
+      the headless engine below. Built to `docs/ui-v0.1-spec.md`,
+      which stays the source of truth for what it is supposed to do.
+      `bin/moneymoor` launches it; the engine tiers are unchanged.
+
+      B<The shell.> A notcurses app with a login handshake in front of
+      it: `~/.moneymoor/` (overridable with `$MONEYMOOR_HOME`) holds
+      one encrypted `*.db` per budget, listed most-recently-modified
+      first, and the passphrase typed into the centred 24x64 dialog is
+      the SQLCipher key. Both of `DB.connect`'s Failure messages reach
+      the status line verbatim — "wrong passphrase" and "wrong file"
+      are different mistakes and lead to different next moves. Behind
+      it: a banner with the tab and month, a three-tab strip, a
+      content host whose single child is swapped per tab, and a hint
+      footer that follows focus. `Ctrl+H` lists the keys for whatever
+      is focused, `Ctrl+G` opens diagnostics, `Ctrl+,` settings —
+      eleven palettes and two glyph tiers, applied live.
+
+      B<One store, one mutation path.> `App::Moneymoor::StoreHandlers`
+      owns the state shape, tab and month navigation, and the single
+      `ws/mutate` effect every write in the app funnels through: on a
+      gateway Failure it toasts the engine's own message, defuses the
+      Failure and leaves the change tokens alone, so a write that did
+      not happen cannot make the screen repaint. Three tokens, because
+      one cannot answer every question: `budget/digest` (the
+      derivation), `budget/catalogue` (the envelope catalogue, which
+      the digest deliberately cannot see — renaming an envelope leaves
+      the derivation byte-identical) and `ws/rev` (an integer bumped
+      per recompute, for the register, whose payees, memos and cleared
+      states are invisible to both).
+
+      B<The Budget tab.> The envelope grid for one month, group
+      headers and category rows in one `Table` — one cursor, one
+      scrollbar, and a cursor restored by category id after every
+      rebuild. Ready-to-Assign above it, a detail rail beside it
+      writing out Rule 1 term by term (`available = carry-in +
+      assigned + activity + moved-in - moved-out`, with `moved out`
+      negated so the column adds up), and six dialogs: assign, move,
+      explain, the category and group editors, and a hide that asks
+      first when the envelope still holds money. The two overspend
+      kinds render differently, as the engine spec requires: cash red,
+      credit amber.
+
+      B<The Accounts tab.> A sidebar of ledgers and a register, one
+      selection between them, both cursors restored by id. Seven
+      dialogs: a transaction editor with a splits entries list that
+      refuses to save until the lines add up (and the nested dialog
+      that adds to it), transfers, the account editor, cleared
+      cycling, and the three confirms — delete a transaction, close an
+      account, delete an account and everything it touched. The
+      running-balance column is single-account-only and appears above
+      95 columns; the column set is rebuilt when the terminal crosses
+      that threshold, because `Table` has no per-column visibility.
+
+      B<Reconcile mode.> `Ctrl+R` asks for the statement balance and
+      then paints the register's whole frame in the difference's
+      colour — red until it is zero, green when it lands — because a
+      `Border` title cannot be styled on its own. Finishing promotes
+      every cleared transaction on the account inside one `ws/mutate`
+      closure, so the budget is derived once rather than once per row.
+      An out-of-balance finish offers a signed `Balance Adjustment`
+      rather than refusing; declining leaves the mode running with
+      every mark intact. Switching ledger or tab ends the mode, in the
+      store handlers, so there is one rule and not one per exit.
+
+      B<The Reports tab.> A four-row cash-flow strip over a horizontal
+      `BarChart`. Spending is `-activity` where activity is negative;
+      the payment envelopes are excluded, or a card purchase would
+      appear twice. Transfer legs whose peer is also on-budget are not
+      cash flow and are dropped; the ones to and from tracking
+      accounts are. `b` toggles category/group aggregation. Bars do
+      not scroll, so the chart is cut to the rows it has and the
+      remainder is counted in the pane's bottom title.
+
+      B<The visual kit>, copied from App-Mindmoor with the domain
+      content replaced: eleven palettes with WCAG floors pinned by
+      test, a fifteen-glyph icon service in Unicode and Nerd Font
+      tiers, the canonical modal chrome, the hint table, and the
+      empty states. `App::Moneymoor::Theme` and `Themes` gained the
+      Pod they never had.
+
+      B<Testing.> 28 new files, 44 in all. Every view function is pure
+      and tested against real derivations from a real SQLCipher
+      budget; every tab is mounted and driven through a store with no
+      terminal involved; source-level scans keep each hint context
+      honest against the keys actually bound, and the Main-to-sibling
+      module boundary honest against accessors resolved at runtime.
+      `t/85` holds the distribution itself to account — `provides`
+      against `lib/`, every module loading in one process, every
+      module carrying Pod.
+
+      B<Fixed on the way out.> An ordinary tab switch (`Ctrl+2`, or a
+      click) rebuilt the content host and never moved focus, leaving
+      the keyboard pointing at a destroyed pane and the footer on the
+      generic hints until the user pressed Tab; the re-focus lived at
+      one of the two rebuild call sites instead of inside the rebuild.
+      And the login screen's `Ctrl+N` was advertised by the hint bar
+      without being bound to anything.
+
+    - [2026-08-02] Initial headless release (v0.1.0): the envelope
+      budgeting engine, its SQLCipher persistence layer, and the
+      pure derivation service.
+
+      * `App::Moneymoor::DB` — single-connection SQLCipher wrapper
+        with idempotent `CREATE TABLE IF NOT EXISTS` migrations
+        re-run on every connect, `!ensure-column` additive column
+        migrations, wrong-key vs plaintext-file detection,
+        `busy_timeout`, foreign keys ON, and `run-txn` for
+        multi-statement atomicity.
+      * Schema: accounts (cash / credit / tracking), category groups,
+        categories (standard / payment / rta), payees, transactions,
+        splits, assignments. Money is integer pence throughout; no
+        floats anywhere.
+      * `Model::*` — attribute-only row classes with
+        `new-from-row(%row)` snake_case → kebab-case mapping and
+        predicate methods.
+      * `Gateway::*` — Account (auto-creates a payment category per
+        credit account, atomically), Category (groups, ordering,
+        hiding, system-row guards), Payee, Transaction (splits sum
+        enforcement, transfer pairing), Assignment (per-month upsert
+        plus atomic `move-money`).
+      * `Service::Budget` — the pure, DB-free derivation: per-category
+        available, deterministic credit-card coverage moves, rollover
+        with the credit-overspend / cash-overspend split, and
+        Ready-to-Assign including future-month assignments. Emits a
+        `Move` log so every derived number can be explained.
+      * `Service::Workspace` — gateways → `compute`, plus the
+        `set-assigned` / `move-money` mutation helpers.
+      * `Util::Money` — integer pence ↔ "£12.34" format / parse.
+      * 16 test files covering the DB layer, every gateway, each
+        budgeting rule, and a seeded-PRNG property suite that asserts
+        the master invariant, move-ledger consistency, and
+        recomputation determinism after every random operation.
