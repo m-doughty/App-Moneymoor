@@ -308,12 +308,15 @@ C<INSERT ... SELECT ... WHERE NOT EXISTS> so re-running is a no-op:
 =head1 PORTABILITY
 
 The C<sqlcipher> shared library has to be findable by NativeCall.
-On macOS that means C<use MacOS::NativeLib E<lt>sqlcipherE<gt>;>
+On macOS that means C<<use MacOS::NativeLib <sqlcipher>;>>
 before C<use DBIish> (Homebrew installs it outside the default search
-path); on Linux and Windows the system loader finds the installed
-library on its own. This module deliberately does not C<use
-MacOS::NativeLib> itself — it is a macOS-only distribution and
-depending on it here would make every Linux consumer install it.
+path). On Linux the loader manages alone only for soname-0 builds;
+distros that ship C<libsqlcipher.so.1> (Debian 13, Ubuntu 24.04+)
+need C<DBIISH_SQLCIPHER_LIB> pointed at the library, because DBIish's
+own lookup hardcodes C<.so.0>. On Windows the DLL must be on C<PATH>.
+This module deliberately does not C<use MacOS::NativeLib> itself — it
+is a macOS-only distribution and depending on it here would make
+every Linux consumer install it.
 
 =end pod
 

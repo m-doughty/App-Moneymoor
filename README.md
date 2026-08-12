@@ -203,12 +203,10 @@ Not in v0.1
 
 Scheduled transactions, CSV and bank imports, multi-currency, incremental rollup caching, and net worth over time (which wants a per-month, per-account balance derivation the engine does not have yet).
 
-Monthly targets shipped after v0.1 (see above). YNAB-style **goals** — rolling targets, due dates, "put aside another £X a month until March" — did not: a goal is a plan with a clock in it, and every figure in this app so far is a plan with only arithmetic in it.
-
 Portability
 -----------
 
-The `sqlcipher` shared library has to be loadable by NativeCall. On macOS put `use MacOS::NativeLib E<lt>sqlcipherE<gt>;` before the first `use App::Moneymoor::DB`; on Linux and Windows the system loader finds an installed sqlcipher without help. The pure engine — `Service::Budget`, `Util::Money`, every `Model` — needs no native library at all, which is why the budgeting tests run everywhere regardless.
+The `sqlcipher` shared library has to be loadable by NativeCall. On macOS put `use MacOS::NativeLib <sqlcipher>;` before the first `use App::Moneymoor::DB`. On Linux the system loader manages by itself only when the library's soname is `libsqlcipher.so.0` — the distros that ship soname 1 (Debian 13, Ubuntu 24.04+) need `DBIISH_SQLCIPHER_LIB` pointed at the library file, which is loaded verbatim. On Windows the DLL has to be on `PATH`. The pure engine — `Service::Budget`, `Util::Money`, every `Model` — needs no native library at all, which is why the budgeting tests run everywhere regardless.
 
 Testing
 -------

@@ -200,12 +200,17 @@ remembered in C<~/.moneymoor/config.json>.
 =head1 PORTABILITY
 
 The C<sqlcipher> shared library has to be loadable by NativeCall. On
-macOS, C<use MacOS::NativeLib E<lt>sqlcipherE<gt>;> before the first
-C<use App::Moneymoor::DB> points NativeCall at the Homebrew install;
-on Linux and Windows the system loader finds an installed sqlcipher
-without help. Nothing else in the distribution is platform-specific,
-and the pure engine (C<Service::Budget>, C<Util::Money>, every
-C<Model>) needs no native library at all.
+macOS, C<<use MacOS::NativeLib <sqlcipher>;>> before the first
+C<use App::Moneymoor::DB> points NativeCall at the Homebrew install.
+On Linux the system loader finds a distro sqlcipher by itself only
+when its soname is C<libsqlcipher.so.0>; modern Debian and Ubuntu
+(24.04+) package soname 1, which DBIish's built-in lookup refuses —
+point C<DBIISH_SQLCIPHER_LIB> at the library
+(C</usr/lib/x86_64-linux-gnu/libsqlcipher.so.1>) and it is loaded
+verbatim. On Windows the DLL just has to be on C<PATH>. Nothing else
+in the distribution is platform-specific, and the pure engine
+(C<Service::Budget>, C<Util::Money>, every C<Model>) needs no native
+library at all.
 
 =head1 AUTHOR
 

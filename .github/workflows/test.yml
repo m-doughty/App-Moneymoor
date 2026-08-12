@@ -44,10 +44,23 @@ jobs:
         with:
           raku-version: 'latest'
 
+      # Ubuntu 24.04 packages SQLCipher as libsqlcipher1 — soname
+      # libsqlcipher.so.1, and no .so.0 exists. DBIish 0.6.7 hardcodes
+      # a version-0 preload (NativeLibs try-versions('sqlcipher', …, 0))
+      # and refuses the library it is standing next to. Its own escape
+      # hatch is DBIISH_SQLCIPHER_LIB: an explicit extensioned path is
+      # loaded verbatim, and the -dev package's unversioned .so symlink
+      # keeps `is native('sqlcipher')` itself happy.
       - name: Install SQLCipher
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlcipher-dev
+          lib=$(ldconfig -p | awk '/libsqlcipher\.so\./ {print $NF; exit}')
+          if [ -z "$lib" ]; then
+            echo "no libsqlcipher on the runner after install" >&2
+            exit 1
+          fi
+          echo "DBIISH_SQLCIPHER_LIB=$lib" >> "$GITHUB_ENV"
 
       - name: Install Raku dependencies
         run: zef install --/test --test-depends --deps-only .

@@ -298,9 +298,12 @@ yet).
 =head2 Portability
 
 The C<sqlcipher> shared library has to be loadable by NativeCall. On
-macOS put C<use MacOS::NativeLib E<lt>sqlcipherE<gt>;> before the
-first C<use App::Moneymoor::DB>; on Linux and Windows the system
-loader finds an installed sqlcipher without help. The pure engine —
+macOS put C<<use MacOS::NativeLib <sqlcipher>;>> before the first
+C<use App::Moneymoor::DB>. On Linux the system loader manages by
+itself only when the library's soname is C<libsqlcipher.so.0> — the
+distros that ship soname 1 (Debian 13, Ubuntu 24.04+) need
+C<DBIISH_SQLCIPHER_LIB> pointed at the library file, which is loaded
+verbatim. On Windows the DLL has to be on C<PATH>. The pure engine —
 C<Service::Budget>, C<Util::Money>, every C<Model> — needs no native
 library at all, which is why the budgeting tests run everywhere
 regardless.
