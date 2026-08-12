@@ -103,9 +103,15 @@ jobs:
         with:
           raku-version: 'latest'
 
-      - name: Cache vcpkg-built SQLCipher
+      # restore/save split rather than the combined actions/cache: the
+      # combined action saves in a post step that only runs when the
+      # job SUCCEEDS, so every red test run would throw away the
+      # 15-minute vcpkg build and pay it again next push. Saving
+      # explicitly, immediately after the build, keeps the cache
+      # whatever the tests go on to do.
+      - name: Restore vcpkg-built SQLCipher
         id: cache-sqlcipher
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: C:\vcpkg\installed
           key: vcpkg-sqlcipher-x64-windows-v1
@@ -114,6 +120,13 @@ jobs:
         if: steps.cache-sqlcipher.outputs.cache-hit != 'true'
         shell: pwsh
         run: vcpkg install sqlcipher:x64-windows
+
+      - name: Save vcpkg-built SQLCipher
+        if: steps.cache-sqlcipher.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-sqlcipher-x64-windows-v1
 
       # Stage the DLL under the canonical name NativeCall mangles
       # 'sqlcipher' to, beside the OpenSSL DLLs it imports, and put

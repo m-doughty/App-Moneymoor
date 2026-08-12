@@ -21,6 +21,60 @@ MONEYMOOR_HOME=/tmp/demo moneymoor    # ...against a throwaway data home
 L<vhs|https://github.com/charmbracelet/vhs> against a throwaway data
 home.)
 
+=head2 Installing
+
+Two ways in, depending on whether the machine already speaks Raku.
+
+=head3 The installer — no Raku required
+
+From the first tagged release onwards, one command installs a
+self-contained bundle: a Rakudo runtime, every module precompiled,
+notcurses and SQLCipher carried along. Nothing is compiled on your
+machine, nothing needs root, and everything lands under your own home
+directory:
+
+=begin code :lang<shell>
+curl -fsSL https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.sh | sh
+=end code
+
+On Windows, PowerShell:
+
+=begin code :lang<shell>
+irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.ps1 | iex
+=end code
+
+The script works out which bundle your machine takes (macOS arm64,
+Linux x86_64 with glibc 2.28+, or Windows x86_64), downloads it from
+the releases page, verifies its sha256, and links C<moneymoor> onto
+your C<PATH>. Re-running it upgrades in place — a failed download can
+never break the version you already have — and C<uninstall.sh> /
+C<uninstall.ps1> take it all off again, including the C<PATH> entry.
+
+=head3 zef — Raku already installed
+
+=begin code :lang<shell>
+zef install App::Moneymoor
+=end code
+
+The one thing zef cannot bring along is the C<sqlcipher> shared
+library:
+
+=item B<macOS> — C<brew install sqlcipher>. C<bin/moneymoor> finds the
+      keg by itself on first launch.
+=item B<Debian / Ubuntu> — C<apt install libsqlcipher-dev>. On
+      releases that package soname 1 (Debian 13, Ubuntu 24.04+), also
+      C<export DBIISH_SQLCIPHER_LIB=/usr/lib/x86_64-linux-gnu/libsqlcipher.so.1>
+      — DBIish's own lookup only knows soname 0.
+=item B<Fedora / RHEL> — C<dnf install sqlcipher>, then point
+      C<DBIISH_SQLCIPHER_LIB> at the library it installed (EPEL ships
+      it under a versioned name like C<libsqlcipher-3.34.1.so.0>).
+=item B<Windows> — build C<sqlcipher.dll> with
+      C<vcpkg install sqlcipher:x64-windows> and put its directory on
+      C<PATH>.
+
+The Portability section below has the why; the pure engine — every
+budgeting rule and its tests — needs no native library at all.
+
 =head2 The app
 
 C<bin/moneymoor> is the whole user interface. C<--version> and

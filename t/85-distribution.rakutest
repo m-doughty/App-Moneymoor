@@ -39,7 +39,12 @@ sub lib-modules(--> Hash) {
         for $dir.dir.sort -> $entry {
             if $entry.d { walk($entry) }
             elsif $entry.Str.ends-with('.rakumod') {
-                my $rel = $entry.relative;
+                # .relative speaks the native separator — backslashes
+                # on Windows — while META6 `provides` paths are
+                # forward-slash by spec. Normalise here, at the one
+                # seam, so the prefix strip, the ::-join and every
+                # comparison against provides stay portable.
+                my $rel = $entry.relative.subst('\\', '/', :g);
                 %found{
                     $rel.subst(/^ 'lib/' /, '')
                         .subst(/ '.rakumod' $ /, '')

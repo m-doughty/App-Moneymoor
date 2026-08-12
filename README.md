@@ -14,6 +14,45 @@ MONEYMOOR_HOME=/tmp/demo moneymoor    # ...against a throwaway data home
 
 (The recording is scripted — `xxt/demo/record.sh` regenerates it with [vhs](https://github.com/charmbracelet/vhs) against a throwaway data home.)
 
+Installing
+----------
+
+Two ways in, depending on whether the machine already speaks Raku.
+
+### The installer — no Raku required
+
+From the first tagged release onwards, one command installs a self-contained bundle: a Rakudo runtime, every module precompiled, notcurses and SQLCipher carried along. Nothing is compiled on your machine, nothing needs root, and everything lands under your own home directory:
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.sh | sh
+```
+
+On Windows, PowerShell:
+
+```shell
+irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.ps1 | iex
+```
+
+The script works out which bundle your machine takes (macOS arm64, Linux x86_64 with glibc 2.28+, or Windows x86_64), downloads it from the releases page, verifies its sha256, and links `moneymoor` onto your `PATH`. Re-running it upgrades in place — a failed download can never break the version you already have — and `uninstall.sh` / `uninstall.ps1` take it all off again, including the `PATH` entry.
+
+### zef — Raku already installed
+
+```shell
+zef install App::Moneymoor
+```
+
+The one thing zef cannot bring along is the `sqlcipher` shared library:
+
+  * **macOS** — `brew install sqlcipher`. `bin/moneymoor` finds the keg by itself on first launch.
+
+  * **Debian / Ubuntu** — `apt install libsqlcipher-dev`. On releases that package soname 1 (Debian 13, Ubuntu 24.04+), also `export DBIISH_SQLCIPHER_LIB=/usr/lib/x86_64-linux-gnu/libsqlcipher.so.1` — DBIish's own lookup only knows soname 0.
+
+  * **Fedora / RHEL** — `dnf install sqlcipher`, then point `DBIISH_SQLCIPHER_LIB` at the library it installed (EPEL ships it under a versioned name like `libsqlcipher-3.34.1.so.0`).
+
+  * **Windows** — build `sqlcipher.dll` with `vcpkg install sqlcipher:x64-windows` and put its directory on `PATH`.
+
+The Portability section below has the why; the pure engine — every budgeting rule and its tests — needs no native library at all.
+
 The app
 -------
 
