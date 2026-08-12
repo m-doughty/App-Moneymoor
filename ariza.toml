@@ -46,3 +46,34 @@ say "ok: encrypted database created, written and reopened";
 # the repository whose raw files the `curl … | sh` one-liner names.
 [installer]
 repo = "m-doughty/App-Moneymoor"
+
+# What the bundle redistributes. Almost all of it is read out of the
+# bundle itself -- the notcurses pack's own licensing kit, ariza's record
+# of the vendored runtime, and every installed distribution's META6
+# `license` field -- so the only rows here are the ones nothing in the
+# bundle can answer for.
+#
+# A distribution whose metadata does not state a licence fails the build
+# rather than shipping unattributed, which is why this table exists at
+# all: somebody has to go and look, once, and write down what they found.
+[licensing]
+
+# NativeLibs (a DBIish dependency) states its licence in its own
+# META6.json -- under the key `licence`, which is the British spelling
+# and not the META6 `license` key any tool reads, so every consumer sees
+# a distribution with no licence at all. The declaration is the author's
+# own and unambiguous; only the key is misspelled.
+[[licensing.dists]]
+name = "NativeLibs"
+spdx-license = "Artistic-2.0"
+project-url = "https://github.com/salortiz/NativeLibs"
+notes = """
+Licence from the distribution's own META6.json, which declares
+`"licence" : "Artistic-2.0"` -- the British spelling, which is not the
+META6 `license` key, so the field is invisible to zef and to ariza. The
+repository ships no LICENSE file and its README makes no licensing
+statement; the metadata declaration is the author's own. Verified at
+https://github.com/salortiz/NativeLibs/blob/master/META6.json (v0.0.9,
+the version DBIish depends on). The upstream fix is a one-character key
+rename, and this row goes away once it lands.
+"""
