@@ -34,13 +34,13 @@ machine, nothing needs root, and everything lands under your own home
 directory:
 
 =begin code :lang<shell>
-curl -fsSL https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.sh | sh
 =end code
 
 On Windows, PowerShell:
 
 =begin code :lang<shell>
-irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.ps1 | iex
 =end code
 
 The script works out which bundle your machine takes (macOS arm64,

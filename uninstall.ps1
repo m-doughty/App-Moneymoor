@@ -13,7 +13,7 @@
     alone, and this says where it is rather than deciding for you.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/uninstall.ps1 | iex
+    irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/uninstall.ps1 | iex
 #>
 [CmdletBinding()]
 param()

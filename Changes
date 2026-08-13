@@ -2,6 +2,44 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.3.1  2026-08-13T01:39:33+01:00
+    - [2026-08-13] An installed bundle starts in about two seconds
+      rather than the best part of a minute. The 0.3.0 bundles carried
+      precompiled bytecode for every module they shipped, and none of
+      it survived being installed: a bundle's module repository had no
+      name Rakudo recognised, so its precompilation records named the
+      machine that built them by absolute path, and the moment the
+      archive was unpacked anywhere else every one of those paths
+      stopped existing and the whole dependency closure was compiled
+      again on the user's machine. Nothing detected it because every
+      check ran where those paths still existed. Bundles are now built
+      with the app's modules installed into the bundled runtime's own
+      vendor repository, which Rakudo names, so the records are
+      relative and survive the move — and the bundle checker fails a
+      bundle whose records name a build machine, so this cannot ship
+      unnoticed twice. There is nothing to do but install 0.3.1: the
+      defect is baked into a 0.3.0 archive and cannot be repaired in
+      place.
+    - [2026-08-13] The installers run Moneymoor once before they
+      finish, under a line that says so. Whatever the first launch has
+      to do — paging a bundle off a cold disk, writing first-run state
+      — now happens while an installer is on screen rather than the
+      first time you actually want the program. A warm-up that fails
+      does not fail the install: the bundle is there and its checksum
+      was verified before anything moved into place.
+    - [2026-08-13] The documented one-liner works. It named the `main`
+      branch, this repository's default branch is `master`, and
+      raw.githubusercontent does not redirect between them, so
+      `curl … | sh` answered 404 for anyone who followed the README.
+      Every generated script and both READMEs now name `HEAD`, which
+      resolves to whatever a repository calls its default branch.
+    - [2026-08-13] Installing tells you your current terminal cannot
+      see the command yet, and gives you the line to paste if you do
+      not want to open a new one. It always meant to; the check asked
+      whether ~/.local/bin was on PATH after the installer had already
+      added it to its own environment, so the answer was always yes
+      and the message never printed.
+
 0.3.0  2026-08-12T23:04:59+01:00
     - [2026-08-12] Notcurses::Native dependency floor raised to 0.5.0
       — the release whose prebuilt binary packs carry self-built,

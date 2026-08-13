@@ -16,6 +16,10 @@
     Nothing is compiled, nothing needs administrator rights, and nothing
     outside %LOCALAPPDATA%\Moneymoor and your user PATH is written.
 
+    The installed application is then run once, so that whatever a first
+    launch has to do is done here rather than the first time you want the
+    program.
+
 .PARAMETER Version
     Install a specific release tag (e.g. -Version v1.2.3) rather than the
     latest one.
@@ -28,11 +32,11 @@
     With -Url only: proceed even when the source has no sibling .sha256.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.ps1 | iex
 
 .EXAMPLE
     # With arguments, a piped script needs to become a script block first:
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.ps1))) -Version v1.2.3
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.ps1))) -Version v1.2.3
 #>
 [CmdletBinding()]
 param(
@@ -255,6 +259,18 @@ function Ariza-LinkBin {
     Ariza-PersistPath $ArizaBinDir
 }
 
+function Ariza-HasEntryPoint {
+    param([string]$Dir)
+    # A bundle launches from bin\<exec>.exe where one was staged, and
+    # from bin\<exec>.cmd otherwise. Either is a complete install: the
+    # directory goes on PATH, and PATHEXT already prefers the executable
+    # over the batch file where both are there.
+    foreach ($leaf in @("bin\$AppExec.exe", "bin\$AppExec.cmd")) {
+        if (Test-Path -LiteralPath (Join-Path $Dir $leaf)) { return $true }
+    }
+    return $false
+}
+
 function Ariza-Prune {
     param([string]$Keep)
     # Exactly one older version is kept, so a bad release can be rolled
@@ -281,7 +297,7 @@ function Ariza-CheckExisting {
     # and it should fix it.
     $dir = Join-Path $ArizaVersions $InstalledVersion
     if (-not (Test-Path -LiteralPath $dir)) { return $false }
-    if (-not (Test-Path -LiteralPath (Join-Path $dir "bin\$AppExec.cmd"))) {
+    if (-not (Ariza-HasEntryPoint $dir)) {
         Ariza-Warn "$dir is incomplete -- installing it again"
         Remove-Item -LiteralPath $dir -Recurse -Force
         return $false
@@ -292,12 +308,61 @@ function Ariza-CheckExisting {
     return $true
 }
 
+function Ariza-Warmup {
+    # Run the app once, now, through the same junction the user's shell
+    # will take. A first launch pages a few hundred megabytes off a cold
+    # disk and builds whatever per-user state the app keeps; doing it
+    # here means it happens while an installer is on screen saying so,
+    # instead of the first time somebody actually wants the program.
+    #
+    # Never fatal. The bundle is installed and its sha256 was checked
+    # before anything was moved into place, so a warm-up that fails on
+    # one machine is far more likely to be that machine -- no console, a
+    # policy, an over-eager scanner -- than a broken release. Refusing to
+    # finish the install over it would take a working program away from
+    # a user who has one.
+    $bin = ''
+    foreach ($leaf in @("$AppExec.exe", "$AppExec.cmd")) {
+        $candidate = Join-Path $ArizaBinDir $leaf
+        if (Test-Path -LiteralPath $candidate) { $bin = $candidate; break }
+    }
+    if (-not $bin) { return }
+
+    # The arguments come from the app's ariza.toml and are written out
+    # already quoted, once as the argument list and once as the single
+    # string the message names. `@warmArgs` is splatting -- an array
+    # written inline at the call site would be passed as one argument
+    # with spaces in it, which is a different command entirely.
+    $warmArgs = @('--version')
+    $what = '--version'
+
+    Ariza-Log 'warming up -- the first launch does the work the rest never repeat'
+    $failed = ''
+    try {
+        & $bin @warmArgs *> $null
+        # A native command's exit code is not an error to PowerShell, so
+        # it has to be looked at on purpose.
+        if ($LASTEXITCODE -ne 0) { $failed = "exit code $LASTEXITCODE" }
+    }
+    catch {
+        $failed = $_.Exception.Message
+    }
+
+    if ($failed) {
+        Ariza-Warn "warm-up failed: $AppExec $what did not complete ($failed)"
+        Ariza-Warn "$AppDisplay is installed and its download was verified -- try running it; the first launch may just take longer"
+    }
+    else {
+        Ariza-Ok 'ready'
+    }
+}
+
 function Ariza-Report {
     param([string]$InstalledVersion)
     Write-Host ''
     Write-Host "    run it:        $AppExec"
     Write-Host "    installed in:  $(Join-Path $ArizaVersions $InstalledVersion)"
-    Write-Host "    uninstall:     irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/uninstall.ps1 | iex"
+    Write-Host "    uninstall:     irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/uninstall.ps1 | iex"
     Write-Host ''
     Write-Host "    Open a new terminal to pick up the PATH change."
 }
@@ -328,7 +393,11 @@ function Ariza-Main {
         Ariza-Log "$AppDisplay $installVer for $slug"
     }
 
+    # Every path that reaches the parting message warms up first,
+    # including the one where nothing was downloaded -- a re-run is what
+    # somebody tries when the last one did not take.
     if ($installVer -and (Ariza-CheckExisting $installVer)) {
+        Ariza-Warmup
         Ariza-Report $installVer
         return
     }
@@ -408,6 +477,7 @@ function Ariza-Main {
         }
 
         if (Ariza-CheckExisting $installVer) {
+            Ariza-Warmup
             Ariza-Report $installVer
             return
         }
@@ -421,14 +491,15 @@ function Ariza-Main {
         # has to mean "the one I installed before this one".
         (Get-Item -LiteralPath $dest).LastWriteTime = Get-Date
 
-        if (-not (Test-Path -LiteralPath (Join-Path $dest "bin\$AppExec.cmd"))) {
-            Ariza-Err "the unpacked bundle has no bin\$AppExec.cmd -- not touching your existing install"
+        if (-not (Ariza-HasEntryPoint $dest)) {
+            Ariza-Err "the unpacked bundle has neither bin\$AppExec.exe nor bin\$AppExec.cmd -- not touching your existing install"
         }
 
         Ariza-PointCurrent $dest
         Ariza-LinkBin
         Ariza-Prune $installVer
         Ariza-Ok "$AppDisplay $installVer installed"
+        Ariza-Warmup
         Ariza-Report $installVer
     }
     finally {

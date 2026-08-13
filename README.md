@@ -24,13 +24,13 @@ Two ways in, depending on whether the machine already speaks Raku.
 From the first tagged release onwards, one command installs a self-contained bundle: a Rakudo runtime, every module precompiled, notcurses and SQLCipher carried along. Nothing is compiled on your machine, nothing needs root, and everything lands under your own home directory:
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.sh | sh
 ```
 
 On Windows, PowerShell:
 
 ```shell
-irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.ps1 | iex
 ```
 
 The script works out which bundle your machine takes (macOS arm64, Linux x86_64 with glibc 2.28+, or Windows x86_64), downloads it from the releases page, verifies its sha256, and links `moneymoor` onto your `PATH`. Re-running it upgrades in place — a failed download can never break the version you already have — and `uninstall.sh` / `uninstall.ps1` take it all off again, including the `PATH` entry.
