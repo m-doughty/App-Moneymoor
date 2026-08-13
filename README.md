@@ -35,6 +35,10 @@ irm https://raw.githubusercontent.com/m-doughty/App-Moneymoor/HEAD/install.ps1 |
 
 The script works out which bundle your machine takes (macOS arm64, Linux x86_64 with glibc 2.28+, or Windows x86_64), downloads it from the releases page, verifies its sha256, and links `moneymoor` onto your `PATH`. Re-running it upgrades in place — a failed download can never break the version you already have — and `uninstall.sh` / `uninstall.ps1` take it all off again, including the `PATH` entry.
 
+Installer-managed copies can also offer updates when Moneymoor starts interactively through the `current` installation. At most once a week, a launch checks for a newer release and, if it finds one, asks before installing it and switching `current`. Declining leaves the installed version in place; Moneymoor never updates silently.
+
+Version 0.3.4 is the first release with this check. An existing 0.3.3 installation cannot discover 0.3.4 by itself, so re-run the installer once to upgrade it manually. From 0.3.4 onwards, the weekly prompt can offer later releases automatically.
+
 ### zef — Raku already installed
 
 ```shell
@@ -269,4 +273,3 @@ COPYRIGHT AND LICENSE
 Copyright 2026 Matt Doughty
 
 This library is free software; you can redistribute it and/or modify it under the Artistic License 2.0.
-

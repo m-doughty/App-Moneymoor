@@ -50,6 +50,17 @@ your C<PATH>. Re-running it upgrades in place — a failed download can
 never break the version you already have — and C<uninstall.sh> /
 C<uninstall.ps1> take it all off again, including the C<PATH> entry.
 
+Installer-managed copies can also offer updates when Moneymoor starts
+interactively through the C<current> installation. At most once a
+week, a launch checks for a newer release and, if it finds one, asks
+before installing it and switching C<current>. Declining leaves the
+installed version in place; Moneymoor never updates silently.
+
+Version 0.3.4 is the first release with this check. An existing 0.3.3
+installation cannot discover 0.3.4 by itself, so re-run the installer
+once to upgrade it manually. From 0.3.4 onwards, the weekly prompt can
+offer later releases automatically.
+
 =head3 zef — Raku already installed
 
 =begin code :lang<shell>

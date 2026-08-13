@@ -119,6 +119,9 @@ say 'ok: Selkie error log redirected and restored';
 [installer]
 repo = "m-doughty/App-Moneymoor"
 
+[updates]
+enabled = true
+
 # What the bundle redistributes. Almost all of it is read out of the
 # bundle itself -- the notcurses pack's own licensing kit, ariza's record
 # of the vendored runtime, and every installed distribution's META6

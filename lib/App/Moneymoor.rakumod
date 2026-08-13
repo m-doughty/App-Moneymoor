@@ -230,4 +230,4 @@ unit class App::Moneymoor;
 #| The distribution version, for callers that want to record which
 #| engine derived a budget they are storing alongside it. Kept in step
 #| with C<META6.json> by C<t/85-distribution.rakutest>.
-method version(--> Version) { v0.3.3 }
+method version(--> Version) { v0.3.4 }
