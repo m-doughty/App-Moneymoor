@@ -30,7 +30,7 @@ use App::Moneymoor::Model::Category;
 use App::Moneymoor::Model::Transaction;
 use App::Moneymoor::Model::Split;
 
-say App::Moneymoor.version;             # v0.3.1
+say App::Moneymoor.version;
 
 my $db = App::Moneymoor::DB.new(:db-path("$*HOME/.moneymoor/budget.db"));
 $db.connect('correct horse battery staple');
@@ -230,4 +230,4 @@ unit class App::Moneymoor;
 #| The distribution version, for callers that want to record which
 #| engine derived a budget they are storing alongside it. Kept in step
 #| with C<META6.json> by C<t/85-distribution.rakutest>.
-method version(--> Version) { v0.3.2 }
+method version(--> Version) { v0.3.3 }

@@ -12,10 +12,11 @@ native = ["notcurses", "sqlcipher"]
 # nothing goes through a shell, so there is no quoting layer to get wrong.
 #
 # The first proves the launcher starts the app at all. The second proves
-# the part a --version flag never touches: that the bundled SQLCipher
-# actually loads, and that an encrypted database can be created, written
-# and reopened from inside the bundle. That is the failure worth catching
-# -- a bundle whose TUI paints perfectly and cannot open a budget.
+# that bundled SQLCipher loads and can create, write, and reopen an encrypted
+# database. The third exercises Selkie's error-log setup without initializing
+# notcurses, including Raku and the Win32 standard-error view. Those
+# are the paths --version never reaches and a superficially healthy bundle
+# can still get wrong.
 smoke = [
     ["{exec}", "--version"],
     ["{raku}", "-e", '''
@@ -39,6 +40,77 @@ die "row did not survive the round trip" unless ($row // {})<note> eq 'round-tri
 $again.disconnect;
 
 say "ok: encrypted database created, written and reopened";
+''', "{tmp}"],
+    ["{raku}", "-e", '''
+use NativeCall;
+use Selkie::App::Internal::ErrorLog;
+use Selkie::App::Internal::ErrorLogPlatform;
+
+class ErrorLogProbe does Selkie::App::Internal::ErrorLog {
+    method install(Str:D $path --> Nil) { self!install-error-log($path) }
+    method uninstall(--> Nil) { self!uninstall-error-log }
+}
+
+sub posix-write(int32, Str, size_t --> ssize_t)
+    is native is symbol('write') { * }
+sub windows-write-file(Pointer, Str, uint32, uint32 is rw, Pointer --> int32)
+    is native('kernel32') is symbol('WriteFile') { * }
+
+my $path = @*ARGS[0].IO.add('ariza-smoke.error.log');
+$path.unlink if $path.e;
+my $original-windows-handle = IS-WINDOWS
+    ?? windows-get-std-handle(WINDOWS-STD-ERROR-HANDLE)
+    !! Pointer;
+
+sub same-windows-handle($left, $right --> Bool:D) {
+    $left.defined && $right.defined && $left.Int == $right.Int;
+}
+
+my $probe = ErrorLogProbe.new;
+$probe.install($path.Str);
+if IS-WINDOWS {
+    die 'Win32 stderr handle was not replaced'
+        if same-windows-handle(
+            windows-get-std-handle(WINDOWS-STD-ERROR-HANDLE),
+            $original-windows-handle,
+        );
+}
+$*ERR.say('raku-error-log-marker');
+$*ERR.flush;
+my $native-marker = "native-error-log-marker\n";
+if IS-WINDOWS {
+    my uint32 $written = 0;
+    my $ok = windows-write-file(
+        windows-get-std-handle(WINDOWS-STD-ERROR-HANDLE),
+        $native-marker,
+        $native-marker.encode.bytes,
+        $written,
+        Pointer,
+    );
+    die 'native stderr write failed'
+        unless $ok && $written == $native-marker.encode.bytes;
+}
+else {
+    my $written = posix-write(2, $native-marker, $native-marker.encode.bytes);
+    die 'native stderr write failed'
+        unless $written == $native-marker.encode.bytes;
+}
+$probe.uninstall;
+
+if IS-WINDOWS {
+    die 'Win32 stderr handle was not restored'
+        unless same-windows-handle(
+            windows-get-std-handle(WINDOWS-STD-ERROR-HANDLE),
+            $original-windows-handle,
+        );
+}
+my $log = $path.slurp;
+die 'Raku stderr did not reach the error log'
+    unless $log.contains('raku-error-log-marker');
+die 'native stderr did not reach the error log'
+    unless $log.contains('native-error-log-marker');
+
+say 'ok: Selkie error log redirected and restored';
 ''', "{tmp}"],
 ]
 

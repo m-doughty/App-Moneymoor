@@ -2,6 +2,15 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.3.3  2026-08-13T21:47:28+01:00
+    - [2026-08-13] Bundle smoke now exercises Selkie's error-log
+      redirect and restore, including Raku stderr, POSIX fd 2, and
+      Windows `WriteFile(GetStdHandle(STD_ERROR_HANDLE), ...)` using the
+      unsigned DWORD selector and opaque HANDLE ABI. The earlier smoke commands
+      only reached `--version` and SQLCipher, so a Windows bundle could
+      pass release checks and then fail as soon as the TUI constructed
+      `Selkie::App`.
+
 0.3.2  2026-08-13T13:30:15+01:00
 
     - [2026-08-13] Windows bundles now launch under the inbox Windows
