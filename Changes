@@ -2,6 +2,16 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.3.4  2026-08-13T23:49:27+01:00
+
+    - [2026-08-13] Installer-managed copies now offer updates during an
+      interactive launch through `current`. At most once a week,
+      Moneymoor checks for a newer release and asks before installing
+      it; it never updates silently. This is the first release with the
+      check, so an existing 0.3.3 installation must be upgraded once by
+      manually re-running the installer. From 0.3.4 onwards, the weekly
+      prompt can offer later releases automatically.
+
 0.3.3  2026-08-13T21:47:28+01:00
     - [2026-08-13] Bundle smoke now exercises Selkie's error-log
       redirect and restore, including Raku stderr, POSIX fd 2, and
