@@ -11,7 +11,7 @@ native = ["notcurses", "sqlcipher"]
 # replaced (env -i style) environment. Every entry is argv, verbatim --
 # nothing goes through a shell, so there is no quoting layer to get wrong.
 #
-# Before these configured commands, Ariza 0.2.2 calls nc-lib() to load the full,
+# Before these configured commands, Ariza 0.2.3 calls nc-lib() to load the full,
 # FFmpeg-linked libnotcurses and prove its Windows dependent-DLL closure, then
 # creates and destroys an in-memory visual through the core bindings without a
 # TTY. It does this for every bundle whose native list contains notcurses. That
