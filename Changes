@@ -2,6 +2,14 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.3.5  2026-08-14T14:11:16+01:00
+
+    - [2026-08-14] Require Selkie 0.14.3, whose centralized terminal
+      platform adapter prevents Windows from resolving POSIX `close`,
+      termios, `/dev/tty`, `stty`, and signal paths during application
+      startup. The bundle smoke now executes those Windows no-op guards so
+      this startup boundary cannot regress behind a healthy `--version`.
+
 0.3.4  2026-08-13T23:49:27+01:00
 
     - [2026-08-13] Installer-managed copies now offer updates during an
