@@ -7,8 +7,8 @@
   ],
   "depends": [
     "DBIish:ver<0.6.7>:auth<zef:raku-community-modules>",
-    "Notcurses::Native:ver<0.5.0+>:auth<zef:apogee>",
-    "Selkie:ver<0.14.3+>:auth<zef:apogee>",
+    "Notcurses::Native:ver<0.5.2+>:auth<zef:apogee>",
+    "Selkie:ver<0.14.4+>:auth<zef:apogee>",
     "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
     "MacOS::NativeLib:ver<0.0.6>:auth<zef:lizmat>"
   ],
@@ -82,5 +82,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.3.5"
+  "version": "0.3.6"
 }

@@ -11,14 +11,21 @@ native = ["notcurses", "sqlcipher"]
 # replaced (env -i style) environment. Every entry is argv, verbatim --
 # nothing goes through a shell, so there is no quoting layer to get wrong.
 #
-# The first proves the launcher starts the app at all. The second proves
-# that bundled SQLCipher loads and can create, write, and reopen an encrypted
-# database. The third exercises Selkie's error-log setup without initializing
-# notcurses, including Raku and the Win32 standard-error view. The fourth
-# exercises Selkie's controlling-terminal platform boundary, including the
-# Windows no-op path that must not resolve POSIX symbols. Those are the paths
-# --version never reaches and a superficially healthy bundle can still get
-# wrong.
+# Before these configured commands, Ariza 0.2.2 calls nc-lib() to load the full,
+# FFmpeg-linked libnotcurses and prove its Windows dependent-DLL closure, then
+# creates and destroys an in-memory visual through the core bindings without a
+# TTY. It does this for every bundle whose native list contains notcurses. That
+# catches loader failures that can hide behind --version; duplicating the
+# generic probe here would only run the identical check twice.
+#
+# The first configured command proves the launcher starts the app at all. The
+# second proves that bundled SQLCipher can create, write, and reopen an
+# encrypted database. The third exercises Selkie's error-log setup without
+# initializing notcurses, including Raku and the Win32 standard-error view.
+# The fourth exercises Selkie's controlling-terminal platform boundary,
+# including the Windows no-op path that must not resolve POSIX symbols. Those
+# are the paths --version never reaches and a superficially healthy bundle can
+# still get wrong.
 smoke = [
     ["{exec}", "--version"],
     ["{raku}", "-e", '''
