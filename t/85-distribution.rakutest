@@ -80,7 +80,7 @@ subtest 'META6 provides and lib/ describe the same distribution' => {
     # version that stopped tracking the dist.
     is App::Moneymoor.version.Str, %meta<version>,
         'App::Moneymoor.version agrees with META6';
-    is %meta<version>, '0.4.0',
+    is %meta<version>, '0.4.1',
         'META6 carries the release version';
     # 0.6.2 is a hard floor, for two stacked Windows reasons. 0.6.0 and
     # earlier destroy the process PATH — they write %*ENV<PATH> while the
@@ -93,13 +93,13 @@ subtest 'META6 provides and lib/ describe the same distribution' => {
     # sat and the banner sheds its leading cells on every Windows resize.
     # 0.6.2's r14 prebuilts clear with \e[H\e[2J.
     ok %meta<depends>.grep(
-        * eq 'Notcurses::Native:ver<0.6.2+>:auth<zef:apogee>'
+        * eq 'Notcurses::Native:ver<0.6.5+>:auth<zef:apogee>'
     ).elems == 1,
         'META6 requires the Windows loader and resize-repaint fixes';
     # 0.15.0 is where the register reversal's companion changes live: the
     # NOTCURSES-GET-ERROR comparison and the polled Windows resize path.
     ok %meta<depends>.grep(
-        * eq 'Selkie:ver<0.15.0+>:auth<zef:apogee>'
+        * eq 'Selkie:ver<0.15.1+>:auth<zef:apogee>'
     ).elems == 1,
         'META6 requires the matching Selkie dependency chain';
 

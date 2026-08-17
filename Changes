@@ -2,6 +2,16 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.4.1  2026-08-17T21:41:35+01:00
+
+    - [2026-08-17] Move the settings binding from Ctrl+, to Ctrl+O.
+      Terminals without a disambiguating keyboard protocol (Windows
+      Terminal, Apple Terminal, xterm) encode ctrl+punctuation by
+      masking with 0x1F, and ',' & 0x1F is 0x0C — byte-identical to
+      Ctrl+L, so on those terminals the combo misfired or was
+      unreachable. Ctrl+letter combos are distinct C0 bytes on every
+      terminal.
+
 0.4.0  2026-08-17T02:29:45+01:00
 
     - [2026-08-17] Keep the banner intact across a Windows resize. Two
