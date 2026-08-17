@@ -1,0 +1,102 @@
+use Test;
+use lib 'lib';
+
+use Selkie::Sizing;
+use App::Moneymoor::Themes;
+use App::Moneymoor::Widget::BannerBar;
+
+# The banner survived a resize showing its pre-resize layout while every
+# other surface repainted.
+#
+# Its content is width-derived — visible-text truncates to the column budget
+# — so a resize changes what it should show even though none of its state
+# changed. Selkie handles that with a mark-all-dirty cascade followed by a
+# synchronous frame. But render() bailed out on a zero geometry (which
+# happens transiently mid-resize, before layout has propagated the new
+# dimensions) and called clear-dirty on the way out: the widget declared the
+# frame served having painted nothing at all. The cascade had already run, so
+# nothing marked it dirty a second time.
+#
+# The rule is simply that a render which painted nothing must not report
+# itself clean — unless it has already served that same geometry, which is
+# what keeps a permanently collapsed banner from forcing a composite on every
+# frame forever.
+#
+# Exercised through note-unpaintable-geometry rather than render(), because
+# render() needs a notcurses plane and no test in this distribution
+# initialises notcurses.
+
+plan 6;
+
+my $theme = App::Moneymoor::Themes::load('gruvbox');
+
+sub banner() {
+    App::Moneymoor::Widget::BannerBar.new(
+        palette => $theme,
+        text    => ' App::Moneymoor',
+        sizing  => Sizing.fixed(1),
+    );
+}
+
+subtest 'a first unpaintable geometry keeps the widget dirty' => {
+    plan 2;
+    my $bar = banner();
+    nok $bar.note-unpaintable-geometry(0),
+        'a zero width never seen before does not count as served';
+    ok $bar.note-unpaintable-geometry(0),
+        'and the repeat does, so a collapsed banner settles rather than '
+            ~ 'forcing a composite every frame';
+};
+
+subtest 'each distinct unpaintable geometry is dirty once' => {
+    plan 3;
+    my $bar = banner();
+    nok $bar.note-unpaintable-geometry(0), 'zero is new';
+    ok  $bar.note-unpaintable-geometry(0), 'zero repeats';
+    nok $bar.note-unpaintable-geometry(-1),
+        'a different unpaintable width is new again, not carried over';
+};
+
+subtest 'the resize case: a transient zero must not settle the widget' => {
+    plan 1;
+    # The sequence that produced the bug: the banner is laid out at some
+    # width, a resize drops it to zero for one frame, and Selkie's cascade
+    # has already run. That single zero must not be reported as served.
+    my $bar = banner();
+    nok $bar.note-unpaintable-geometry(0),
+        'the transient zero of a resize leaves the banner dirty to repaint';
+};
+
+subtest 'width still drives what the banner would show' => {
+    plan 3;
+    # The reason a resize matters at all: identical state, different output.
+    my $bar = banner();
+    $bar.set-text(' App::Moneymoor · Budget · August 2026');
+    my Str $wide   = $bar.visible-text(120);
+    my Str $narrow = $bar.visible-text(24);
+    isnt $wide, $narrow,
+        'the same text renders differently at two widths';
+    ok $narrow.chars <= $bar.text-budget(24),
+        'the narrow form respects its column budget';
+    ok $narrow.ends-with('…'),
+        'and says it was truncated rather than silently dropping the tail';
+};
+
+subtest 'the budget reserves the clock' => {
+    plan 2;
+    my $bar = banner();
+    ok $bar.text-budget(120) < 120,
+        'a wide banner keeps columns back for the clock';
+    is $bar.text-budget(0), 0, 'and a zero width budgets nothing';
+};
+
+subtest 'set-text marks the widget dirty' => {
+    plan 1;
+    # The ordinary path, for contrast: a state change always dirties.
+    my $bar = banner();
+    $bar.clear-dirty;
+    $bar.set-text('changed');
+    ok $bar.is-dirty, 'a text change dirties the banner';
+};
+
+done-testing;

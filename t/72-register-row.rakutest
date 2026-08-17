@@ -35,6 +35,13 @@ my $theme = App::Moneymoor::Themes::load('gruvbox');
 
 # --- Fixtures ---------------------------------------------------------
 
+#| Index rows by the transaction id they were built from. register-rows
+#| returns newest first, but most of the subtests below are about what a row
+#| *contains*, not where it sits — the two that genuinely assert display
+#| order say so and index positionally. Looking the rest up by id keeps them
+#| honest whatever the ordering happens to be.
+sub by-id(@rows --> Hash) { @rows.map({ .<id> => $_ }).Hash }
+
 sub account(Int $id, Str $name, Str $type = 'cash', Bool :$closed = False,
             Int :$order = 0) {
     App::Moneymoor::Model::Account.new(
@@ -109,11 +116,17 @@ subtest 'the running balance is a scan in the order it was given' => {
     my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
                              running-balance => True, :$icons);
 
-    is @rows[0]<balance>, money-cell(200000, BALANCE-COLS), 'the opening pay';
-    is @rows[1]<balance>, money-cell(198500, BALANCE-COLS), 'less the first';
-    is @rows[2]<balance>, money-cell(196000, BALANCE-COLS),
-        'and the second on the same day, in id order';
-    is @rows[3]<balance>, money-cell(186000, BALANCE-COLS), 'and the last';
+    # Rows come back newest first, but the scan that produced these figures
+    # ran chronologically: each row still carries the account's balance as of
+    # its own transaction. Reversing the scan instead would count backwards
+    # from zero and give a plausible-looking, wrong column.
+    is @rows[0]<balance>, money-cell(186000, BALANCE-COLS),
+        'the newest transaction leads, carrying the latest balance';
+    is @rows[1]<balance>, money-cell(196000, BALANCE-COLS), 'then the one before it';
+    is @rows[2]<balance>, money-cell(198500, BALANCE-COLS),
+        'then its same-day partner, still resolved in id order';
+    is @rows[3]<balance>, money-cell(200000, BALANCE-COLS),
+        'and the opening pay is last, not first';
 
     # All Accounts interleaves ledgers by date, so the cumulative sum
     # would be a balance of nothing. The column is simply not filled.
@@ -161,12 +174,13 @@ subtest 'the category cell has three shapes' => {
     my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
                              :%splits, :$icons);
 
-    is @rows[0]<category>, UNCATEGORISED-CELL,
+    my %cat = by-id(@rows);
+    is %cat{1}<category>, UNCATEGORISED-CELL,
         'no splits is an em dash, not an empty cell';
-    is @rows[1]<category>, 'Groceries', 'one split is its category';
-    is @rows[2]<category>, RTA-LABEL,
+    is %cat{2}<category>, 'Groceries', 'one split is its category';
+    is %cat{3}<category>, RTA-LABEL,
         'and the rta row is spelled out as an inflow';
-    is @rows[3]<category>, '(3 splits)', 'more than one is a count';
+    is %cat{4}<category>, '(3 splits)', 'more than one is a count';
 
     my @unknown = register-rows(
         transactions => (txn(5, 1, DAY1, -100),),
@@ -184,16 +198,17 @@ subtest 'outflow and inflow are two columns, never both' => {
                          txn(3, 1, DAY1, 0)),
         :%payees, :%categories, :%accounts, :$icons);
 
-    is @rows[0]<outflow>, money-cell(4210, OUTFLOW-COLS),
+    my %dir = by-id(@rows);
+    is %dir{1}<outflow>, money-cell(4210, OUTFLOW-COLS),
         'money out is the absolute figure';
-    is @rows[0]<inflow>, '', 'and the other cell is empty';
-    is @rows[1]<inflow>, money-cell(125000, INFLOW-COLS), 'money in';
-    is @rows[1]<outflow>, '', 'and the other cell is empty';
+    is %dir{1}<inflow>, '', 'and the other cell is empty';
+    is %dir{2}<inflow>, money-cell(125000, INFLOW-COLS), 'money in';
+    is %dir{2}<outflow>, '', 'and the other cell is empty';
 
     # §4.4: outflow when amount < 0, inflow when > 0. Zero is neither,
     # and a £0.00 in one column would read as a rounding error.
-    is @rows[2]<outflow>, '', 'a zero transaction fills neither column';
-    is @rows[2]<inflow>, '', 'in either direction';
+    is %dir{3}<outflow>, '', 'a zero transaction fills neither column';
+    is %dir{3}<inflow>, '', 'in either direction';
 };
 
 subtest 'reconciled outranks direction, and the palette agrees' => {
@@ -205,11 +220,12 @@ subtest 'reconciled outranks direction, and the palette agrees' => {
                          txn(4, 1, DAY1, 100, cleared => 'reconciled')),
         :%payees, :%categories, :%accounts, :$icons);
 
-    is @rows[0]<severity>, 'outflow', 'money out';
-    is @rows[1]<severity>, 'inflow',  'money in';
-    is @rows[2]<severity>, 'reconciled',
+    my %sev = by-id(@rows);
+    is %sev{1}<severity>, 'outflow', 'money out';
+    is %sev{2}<severity>, 'inflow',  'money in';
+    is %sev{3}<severity>, 'reconciled',
         'a locked row is finished business whichever way it went';
-    is @rows[3]<severity>, 'reconciled', 'in both directions';
+    is %sev{4}<severity>, 'reconciled', 'in both directions';
 
     is register-style('reconciled', :$theme).fg, $theme.fg-dim,
         'reconciled renders dim';
@@ -224,9 +240,10 @@ subtest 'the cleared column is the icon, and c walks it in a circle' => {
                          txn(2, 1, DAY1, -100, cleared => 'cleared'),
                          txn(3, 1, DAY1, -100, cleared => 'reconciled')),
         :%payees, :%categories, :%accounts, :$icons);
-    is @rows[0]<cleared>, ' ' ~ $icons.cleared-uncleared, 'uncleared';
-    is @rows[1]<cleared>, ' ' ~ $icons.cleared-cleared,   'cleared';
-    is @rows[2]<cleared>, ' ' ~ $icons.cleared-reconciled, 'reconciled';
+    my %clr = by-id(@rows);
+    is %clr{1}<cleared>, ' ' ~ $icons.cleared-uncleared, 'uncleared';
+    is %clr{2}<cleared>, ' ' ~ $icons.cleared-cleared,   'cleared';
+    is %clr{3}<cleared>, ' ' ~ $icons.cleared-reconciled, 'reconciled';
 
     is next-cleared-state('uncleared'), 'cleared', 'c clears';
     is next-cleared-state('cleared'), 'reconciled', 'c again reconciles';
@@ -239,8 +256,9 @@ subtest 'the All-Accounts view swaps the balance for the account' => {
     my @txns = (txn(1, 1, DAY1, -100), txn(2, 3, DAY2, -200));
     my @rows = register-rows(transactions => @txns, :%payees, :%categories, :%accounts,
                              :$icons);
-    is @rows[0]<account>, 'Current', 'each row names its own ledger';
-    is @rows[1]<account>, 'Savings', 'including the second';
+    my %acct = by-id(@rows);
+    is %acct{1}<account>, 'Current', 'each row names its own ledger';
+    is %acct{2}<account>, 'Savings', 'including the second';
 
     my @names = register-columns(all-accounts => True, width => 200)
         .map(*<name>);

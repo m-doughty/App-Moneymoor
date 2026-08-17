@@ -187,6 +187,8 @@ method budget-exists(--> Bool) { self.budget-path.IO.e }
 #| (the login screen is a full Selkie tree). Selkie auto-creates the
 #| parent directory on first write.
 method error-log-path(--> Str) { "{self.moneymoor-home}/logs/error.log" }
+method timing-trace-path(--> Str) { "{self.moneymoor-home}/logs/timing-trace.json" }
+method timing-slow-path(--> Str) { "{self.moneymoor-home}/logs/timing-slow.jsonl" }
 
 #| The create-a-budget name rule, exposed as a method so the login
 #| screen validates against the same predicate the path derivation

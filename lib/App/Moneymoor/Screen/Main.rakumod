@@ -150,6 +150,8 @@ register's running-balance column still fits.
 
 =end pod
 
+use Selkie::Trace;
+
 unit class App::Moneymoor::Screen::Main;
 
 use Selkie::App;
@@ -330,11 +332,14 @@ method build(--> Selkie::Layout::VBox) {
     # something.
     self!refresh-content-layout('budget');
 
+    my $bootstrap-span = Selkie::Trace.enabled
+        ?? Selkie::Trace.start('boot.store-bootstrap', cat => 'boot') !! Nil;
     self.store.dispatch('app/init',
         theme => ($!config.defined ?? $!config.theme !! 'gruvbox'),
         icons => ($!config.defined ?? $!config.icons !! 'unicode'),
     );
     self.store.tick;
+    $bootstrap-span.finish with $bootstrap-span;
 
     $!root;
 }
@@ -698,6 +703,15 @@ method !register-resize() {
     my $self-ref = self;
     $!app.on-resize: -> UInt $rows, UInt $cols {
         $self-ref!repaint-hints;
+        # The banner's content is width-derived — visible-text truncates to
+        # the column budget — so a resize changes what it should show even
+        # though nothing about its state changed. Selkie's own post-resize
+        # cascade already marks the tree dirty, but these callbacks fire
+        # after that frame has been composited, so this is the repaint that
+        # survives a banner which skipped the cascade's render (see
+        # BannerBar.render's zero-dimension path).
+        my $bar = $self-ref.top-bar;
+        $bar.mark-dirty with $bar;
         my $accounts = $self-ref.accounts-tab;
         $accounts.handle-resize($cols.Int) if $accounts.defined;
         my $reports = $self-ref.reports-tab;

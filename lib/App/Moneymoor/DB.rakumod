@@ -337,6 +337,7 @@ has Str  $.db-path is required;
 has      $!dbh;
 has Bool $!connected = False;
 has Bool $!in-txn    = False;
+has Int  $!owner-tid;
 
 # Several pragmas answer with a row; leaving it unfetched trips
 # DBIish's deferred "rows() may not be accurate" warning at handle
@@ -347,17 +348,27 @@ my sub pragma($dbh, Str:D $sql) {
     $dbh.execute($sql).allrows.eager;
 }
 
-method connect(Str:D $passphrase) {
+method connect(Str:D $passphrase, :&on-progress = -> % { }) {
     my Bool $is-new = !$!db-path.IO.e;
 
+    sub notify(%info) {
+        try {
+            my $result = &on-progress(%info);
+            $result.so if $result ~~ Failure;
+        }
+    }
+
+    notify(%(phase => 'unlock', detail => 'opening encrypted budget'));
     $!dbh = DBIish.connect('SQLCipher', database => $!db-path);
     $!dbh.key($passphrase);
+    $!owner-tid = $*THREAD.id;
 
     # Prove the key by reading the schema table. Drain the result
     # fully: an unfinalized SELECT holds an implicit read transaction
     # on the connection, which the migration DDL below would then
     # trip over.
     unless $is-new {
+        notify(%(phase => 'verify', detail => 'checking passphrase'));
         my $ok = try {
             $!dbh.execute('SELECT count(*) FROM sqlite_master').allrows.eager;
             True;
@@ -365,6 +376,7 @@ method connect(Str:D $passphrase) {
         unless $ok {
             $!dbh.dispose;
             $!dbh = Nil;
+            $!owner-tid = Int;
             return fail self!looks-like-plaintext-sqlite
                 ?? "Not an encrypted budget file (plain SQLite file)"
                 !! "Invalid passphrase (or corrupted budget file)";
@@ -384,8 +396,25 @@ method connect(Str:D $passphrase) {
     # Migrations are CREATE ... IF NOT EXISTS plus additive column
     # checks, so running them on every connect is idempotent and
     # picks up anything a newer version added.
+    notify(%(phase => 'migrate', detail => 'checking schema'));
     self!run-migrations;
     self;
+}
+
+#| Transfer exclusive ownership of an idle connection to the calling thread.
+#| The boot pipeline connects on a worker, waits for that worker to finish,
+#| then calls this once from Selkie's loop thread before issuing any query.
+method adopt-ui-thread(--> Nil) {
+    die 'Cannot adopt a disconnected database' unless $!connected && $!dbh;
+    die 'Cannot adopt a database during a transaction' if $!in-txn;
+    $!owner-tid = $*THREAD.id;
+    Nil;
+}
+
+method !assert-owner(--> Nil) {
+    return unless $!owner-tid.defined;
+    die "Database connection belongs to thread $!owner-tid, not {$*THREAD.id}"
+        unless $!owner-tid == $*THREAD.id;
 }
 
 #| A SQLCipher file starts with encrypted (random-looking) bytes; an
@@ -400,19 +429,22 @@ method !looks-like-plaintext-sqlite(--> Bool) {
     $blob.subbuf(0, 15).decode('latin-1') eq 'SQLite format 3';
 }
 
-method handle() { $!dbh }
+method handle() { self!assert-owner; $!dbh }
 method is-connected(--> Bool) { $!connected }
 
 method disconnect() {
+    self!assert-owner;
     if $!dbh {
         $!dbh.dispose;
         $!dbh       = Nil;
         $!connected = False;
         $!in-txn    = False;
+        $!owner-tid = Int;
     }
 }
 
 method execute(Str:D $sql, *@bind) {
+    self!assert-owner;
     # DBDish's `do` disposes the prepared statement in a LEAVE block.
     # Necessary for DDL and inserts alike: a leaked statement handle
     # holds a sqlite3 schema-level lock that blocks later ALTER / DROP
@@ -435,12 +467,14 @@ method execute(Str:D $sql, *@bind) {
 }
 
 method query-one(Str:D $sql, *@bind --> Hash) {
+    self!assert-owner;
     my $sth  = $!dbh.execute($sql, |@bind);
     my @rows = $sth.allrows(:array-of-hash);
     @rows.elems > 0 ?? @rows[0].Hash !! Hash.new;
 }
 
 method query-all(Str:D $sql, *@bind --> Array) {
+    self!assert-owner;
     my $sth  = $!dbh.execute($sql, |@bind);
     my @rows = $sth.allrows(:array-of-hash);
     @rows.Array;
@@ -460,6 +494,7 @@ method last-insert-id(--> Int) {
 #| SQLite has no nested BEGIN, and a gateway method that opens its own
 #| transaction must still compose inside a caller's.
 method run-txn(&work) {
+    self!assert-owner;
     return work() if $!in-txn;
 
     self.execute('BEGIN IMMEDIATE');

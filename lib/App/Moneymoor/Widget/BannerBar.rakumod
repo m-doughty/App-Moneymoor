@@ -152,6 +152,10 @@ has UInt $!text-fg;
 has UInt $!clock-fg;
 has Gradient $!gradient;
 
+# Width of the last geometry render() actually served. -1 until the first
+# render, so a widget that has never painted is never treated as clean.
+has Int $!painted-width = -1;
+
 #| Columns the clock occupies: C<HH:MM>.
 my constant CLOCK-COLS = 5;
 
@@ -343,14 +347,47 @@ method visible-text(Int $width --> Str) {
     $budget == 1 ?? '…' !! $!text.substr(0, $budget - 1) ~ '…';
 }
 
+#|( Record that C<render> met a geometry it cannot paint, and answer whether
+    the frame may still be reported as served.
+
+    Only once the same unpaintable geometry has been seen before. The first
+    encounter must leave the widget dirty: zero dimensions occur transiently
+    during a resize, and Selkie's post-resize C<mark-all-dirty> cascade has
+    already run by the time C<render> is called — so clearing the flag here
+    marks the banner clean having painted nothing, and nothing marks it dirty
+    again. The bar then keeps its pre-resize layout until some unrelated
+    change happens to touch it.
+
+    Answering True on the repeat is what stops a genuinely collapsed banner
+    staying dirty forever and forcing a composite every frame: it costs one
+    extra frame, then settles.
+
+    Split out from C<render> so it can be exercised without a terminal — no
+    test in this distribution initialises notcurses. )
+method note-unpaintable-geometry(Int $w --> Bool) {
+    my Bool $already-served = $!painted-width == $w;
+    $!painted-width = $w;
+    $already-served;
+}
+
 method render() {
     return without self.plane;
     my Int $w = self.cols.Int;
     # Zero dimensions happen transiently mid-resize, before the first
-    # layout pass, and for a banner in a collapsed parent. Nothing to
-    # paint, but the frame still counts as served.
+    # layout pass, and for a banner in a collapsed parent.
+    #
+    # Nothing to paint — but only report the frame served once we have
+    # actually served THIS geometry. Clearing unconditionally meant a
+    # transient zero during a resize marked the banner clean having painted
+    # nothing at all: Selkie's post-resize mark-all-dirty cascade had already
+    # run, so nothing marked it dirty a second time and the bar kept the
+    # pre-resize layout until some unrelated change touched it.
+    #
+    # The `$!painted-width == $w` guard is what keeps a genuinely collapsed
+    # banner from staying dirty forever and forcing a composite every frame:
+    # it stays dirty for exactly one more frame, then settles.
     if $w <= 0 || self.rows == 0 {
-        self.clear-dirty;
+        self.clear-dirty if self.note-unpaintable-geometry($w);
         return;
     }
 
@@ -370,6 +407,7 @@ method render() {
         self!stamp-over-ramp($w - $c.chars, $c, $!clock-fg, 0);
     }
 
+    $!painted-width = $w;
     self.clear-dirty;
 }
 

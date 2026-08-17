@@ -60,11 +60,31 @@ transfer leg that has to name the account at the I<other> end, a split
 set that renders three different ways) are all here, where they can be
 tested without a terminal.
 
+=head2 Rows come back newest first
+
+C<register-rows> returns rows in reverse chronological order — the most
+recent transaction first — because a register grows at the recent end and
+scrolling to the bottom of a long ledger to reach today is tedious.
+
+This is a presentation order only. The gateway still returns C<(date, id)>
+ascending and B<must> keep doing so: C<Service::Budget> derives each period
+from the running balance at the instant of each purchase, and the reports
+depend on the same ordering. The reversal happens once, on the finished row
+list, at the very end of C<register-rows>.
+
+Selection survives the flip: C<Screen::Accounts> re-finds the selected row by
+transaction id rather than by index, so the cursor follows its row.
+
 =head2 The running balance is a scan, and only in one view
 
 C<balance> is the cumulative sum of every amount up to and including
-the row, in the C<(date, id)> order the gateway returns. That is a
-number about B<one> account: in the All Accounts view it would be the
+the row, in the C<(date, id)> order the gateway returns — B<not> in the
+order the rows are displayed. The scan runs before the reversal above, so
+each row's balance is the account's balance as of that transaction; running
+it over reversed input would instead count backwards from zero, which yields
+a column that looks plausible and is wrong.
+
+That is a number about B<one> account: in the All Accounts view it would be the
 sum of unrelated ledgers interleaved by date, which is not a balance of
 anything. So C<:running-balance> is off by default, the column is only
 added in the single-account view, and the All Accounts view spends the
@@ -628,7 +648,12 @@ sub register-rows(
             account  => ($account.defined ?? $account.name !! ''),
         );
     }
-    @rows.List;
+    # Newest first. The scan above must stay chronological — each row's
+    # balance is the account's balance *as of* that transaction, so
+    # accumulating in reverse would count backwards from zero and produce a
+    # column that looks plausible and is wrong. Build in (date, id) order,
+    # then flip the finished rows for display.
+    @rows.reverse.List;
 }
 
 #| §2's state key for one transaction. Reconciled outranks direction:

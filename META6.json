@@ -7,8 +7,8 @@
   ],
   "depends": [
     "DBIish:ver<0.6.7>:auth<zef:raku-community-modules>",
-    "Notcurses::Native:ver<0.5.2+>:auth<zef:apogee>",
-    "Selkie:ver<0.14.4+>:auth<zef:apogee>",
+    "Notcurses::Native:ver<0.6.2+>:auth<zef:apogee>",
+    "Selkie:ver<0.15.0+>:auth<zef:apogee>",
     "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
     "MacOS::NativeLib:ver<0.0.6>:auth<zef:lizmat>"
   ],
@@ -25,6 +25,7 @@
     "App::Moneymoor::Gateway::Category": "lib/App/Moneymoor/Gateway/Category.rakumod",
     "App::Moneymoor::Gateway::Payee": "lib/App/Moneymoor/Gateway/Payee.rakumod",
     "App::Moneymoor::Gateway::Transaction": "lib/App/Moneymoor/Gateway/Transaction.rakumod",
+    "App::Moneymoor::Handlers::Boot": "lib/App/Moneymoor/Handlers/Boot.rakumod",
     "App::Moneymoor::Model::Account": "lib/App/Moneymoor/Model/Account.rakumod",
     "App::Moneymoor::Model::Assignment": "lib/App/Moneymoor/Model/Assignment.rakumod",
     "App::Moneymoor::Model::Category": "lib/App/Moneymoor/Model/Category.rakumod",
@@ -68,7 +69,8 @@
     "App::Moneymoor::View::ModalChrome": "lib/App/Moneymoor/View/ModalChrome.rakumod",
     "App::Moneymoor::View::RegisterRow": "lib/App/Moneymoor/View/RegisterRow.rakumod",
     "App::Moneymoor::View::ReportRow": "lib/App/Moneymoor/View/ReportRow.rakumod",
-    "App::Moneymoor::Widget::BannerBar": "lib/App/Moneymoor/Widget/BannerBar.rakumod"
+    "App::Moneymoor::Widget::BannerBar": "lib/App/Moneymoor/Widget/BannerBar.rakumod",
+    "App::Moneymoor::Widget::BootProgressModal": "lib/App/Moneymoor/Widget/BootProgressModal.rakumod"
   },
   "resources": [
   ],
@@ -82,5 +84,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.3.6"
+  "version": "0.4.0"
 }

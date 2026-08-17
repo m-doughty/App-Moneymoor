@@ -29,8 +29,12 @@ The whole of the app's lifecycle, in one small class:
       construction, so the login screen is themed from the first frame
       rather than starting stock and snapping over once a budget opens;
 =item show C<Screen::Login> and wait for an unlock or a create;
-=item on success, open the C<DB>, build a C<Service::Workspace> over
-      it, construct C<Screen::Main> and switch to it;
+=item on submit, claim the handshake and show a non-dismissable progress
+      modal, so repeated Enter presses cannot queue a second login;
+=item open and migrate the C<DB> on a worker, while a child Rakudo warms
+      C<Service::Workspace> and C<Screen::Main> compilation;
+=item on success, hand DB ownership to the UI thread, build the workspace
+      and main screen there, and switch to it;
 =item on a B<create>, ask the new budget's owner when their period
       starts, over the empty budget the shell has just come up on.
 
@@ -117,27 +121,74 @@ MONEYMOOR_HOME=/tmp/mm-demo raku -I lib bin/moneymoor
 unit class App::Moneymoor::UI;
 
 use Selkie::App;
+use Selkie::Trace;
 
 use App::Moneymoor::Config;
 use App::Moneymoor::DB;
-use App::Moneymoor::Service::Workspace;
 use App::Moneymoor::Theme;
 use App::Moneymoor::Themes;
 use App::Moneymoor::Util::Money;
 use App::Moneymoor::Screen::Login;
-use App::Moneymoor::Screen::Main;
+use App::Moneymoor::Handlers::Boot;
+use App::Moneymoor::Widget::BootProgressModal;
 
 has Selkie::App $!app;
 has App::Moneymoor::Config $!config;
 has App::Moneymoor::Theme $!theme;
 has App::Moneymoor::DB $!db;
-has App::Moneymoor::Service::Workspace $!workspace;
+has $!workspace;
 has App::Moneymoor::Screen::Login $!login-screen;
-has App::Moneymoor::Screen::Main $!main-screen;
+has $!main-screen;
+has App::Moneymoor::Handlers::Boot $!boot;
+has App::Moneymoor::Widget::BootProgressModal $!boot-modal;
+has Promise $!module-warmup;
+has Bool $!show-main-pending = False;
+has Bool $!show-main-fresh = False;
+has Bool $!main-first-frame-pending = False;
+has &!boot-launch;
+has Bool $!boot-launch-armed = False;
+
+constant WARMUP-PROGRAM =
+    'use App::Moneymoor::Service::Workspace; use App::Moneymoor::Screen::Main;';
+constant WARMUP-TIMEOUT-SECONDS = 300;
+
+our sub warmup-command(--> List) {
+    my @inc = $*REPO.repo-chain
+        .grep({ $_ ~~ CompUnit::Repository::FileSystem })
+        .map({ '-I' ~ .prefix.absolute });
+    ($*EXECUTABLE.absolute, |@inc, '-e', WARMUP-PROGRAM).List;
+}
+
+our sub warm-modules(--> Bool) {
+    my Bool $ok = False;
+    try {
+        my $proc = Proc::Async.new(:w, |warmup-command());
+        $proc.stdout.tap(-> $ { });
+        $proc.stderr.tap(-> $ { });
+        my $done = $proc.start;
+        $proc.close-stdin;
+        await Promise.anyof($done, Promise.in(WARMUP-TIMEOUT-SECONDS));
+        unless $done.status == Kept {
+            try $proc.kill(SIGKILL);
+            try await Promise.anyof($done, Promise.in(5));
+        }
+        if $done.status == Kept {
+            my $result = try $done.result;
+            $ok = $result.defined && $result.exitcode == 0;
+        }
+    }
+    $ok;
+}
 
 method run() {
     $!config = App::Moneymoor::Config.new;
     $!config.load;
+    Selkie::Trace.init(
+        mode       => (%*ENV<MONEYMOOR_TIMINGS> // 'off'),
+        trace-path => $!config.timing-trace-path,
+        slow-path  => $!config.timing-slow-path,
+        thresholds => %(default => 8e0, boot => 1e0, db => 8e0),
+    );
     # The data home is created lazily, in !handle-login / !handle-create,
     # once the user has actually named a budget.
 
@@ -176,7 +227,25 @@ method run() {
 
     self!show-login;
 
+    $!boot = App::Moneymoor::Handlers::Boot.new(
+        show-main => -> Bool :$fresh = False {
+            $!show-main-fresh = $fresh;
+            $!show-main-pending = True;
+        },
+        on-failed => -> Str $message { self!boot-failed($message) },
+    );
+    $!boot.register($!app.store);
+    $!app.on-frame(-> { self!boot-frame-tick }, name => 'moneymoor-boot');
+    $!module-warmup = start {
+        my $span = Selkie::Trace.enabled
+            ?? Selkie::Trace.start('boot.module-warmup', cat => 'boot') !! Nil;
+        my Bool $ok = warm-modules();
+        $span.finish(:$ok) with $span;
+        $ok;
+    };
+
     $!app.run;
+    Selkie::Trace.shutdown;
 }
 
 method !show-login() {
@@ -226,28 +295,19 @@ method !handle-focus-next(Str $target) {
 }
 
 method !handle-login(Str $budget-name, Str $passphrase) {
+    return unless $!boot.claim;
     $!config.budget-name = $budget-name;
     $!config.ensure-directories;
 
-    $!db = App::Moneymoor::DB.new(db-path => $!config.budget-path);
-    my $result = $!db.connect($passphrase);
-
-    if $result ~~ Failure {
-        # Verbatim: the two messages say different things and the user
-        # needs to know which one they got.
-        $!login-screen.set-status($result.exception.message, :error);
-        $result.so;
-        return;
-    }
-
-    $!config.save;
-    self!show-main;
+    self!start-boot($passphrase, title => 'Opening budget');
 }
 
 method !handle-create(Str $budget-name, Str $passphrase) {
+    return unless $!boot.claim;
     $!config.budget-name = $budget-name;
 
     if $!config.budget-exists {
+        $!boot.release;
         $!login-screen.set-status(
             "Budget '$budget-name' already exists — pick it from the list",
             :error,
@@ -257,23 +317,108 @@ method !handle-create(Str $budget-name, Str $passphrase) {
 
     $!config.ensure-directories;
 
+    self!start-boot($passphrase, title => 'Creating budget', :fresh);
+}
+
+method !start-boot(Str:D $passphrase, Str:D :$title!, Bool :$fresh = False --> Nil) {
+    $!login-screen.set-status('');
+    $!boot-modal = App::Moneymoor::Widget::BootProgressModal.new(
+        store => $!app.store, :$title);
+    $!app.show-modal($!boot-modal.build);
+    $!app.focus($!boot-modal.focus-widget);
+    $!app.store.dispatch('boot/started', detail => $!config.budget-name);
+
     $!db = App::Moneymoor::DB.new(db-path => $!config.budget-path);
-    my $result = $!db.connect($passphrase);
+    my $db = $!db;
+    my $store = $!app.store;
+    my $warmup = $!module-warmup;
+    # Do not start expensive native/compile work from the submit callback.
+    # The on-frame callback below deliberately waits through this frame, so
+    # the newly-mounted progress modal reaches notcurses_render first.
+    &!boot-launch = -> {
+      start {
+        CATCH { default { $store.dispatch('boot/failed', message => .message) } }
+        my $span = Selkie::Trace.enabled
+            ?? Selkie::Trace.start('boot.database', cat => 'boot') !! Nil;
+        my $phase-span;
+        my $result = $db.connect($passphrase, on-progress => -> %phase {
+            $phase-span.finish with $phase-span;
+            $phase-span = Selkie::Trace.enabled
+                ?? Selkie::Trace.start("boot.{%phase<phase>}", cat => 'boot')
+                !! Nil;
+            $store.dispatch('boot/phase', |%phase);
+        });
+        $phase-span.finish with $phase-span;
+        if $result ~~ Failure {
+            my Str $message = $result.exception.message;
+            $result.so;
+            $span.finish(ok => False) with $span;
+            $store.dispatch('boot/failed', :$message);
+        } else {
+            $span.finish(ok => True) with $span;
+            unless $warmup.status == Kept {
+                $store.dispatch('boot/phase', phase => 'compile',
+                    detail => 'first run after an update');
+            }
+            await $warmup;
+            $store.dispatch('boot/ready', :$fresh);
+        }
+      }
+    };
+    $!boot-launch-armed = False;
+    Nil;
+}
 
-    if $result ~~ Failure {
-        # A create can only fail for reasons that aren't the
-        # passphrase — the file didn't exist a moment ago, so there is
-        # no key to get wrong. Surfacing the engine's message anyway
-        # beats inventing a vaguer one.
-        $!login-screen.set-status($result.exception.message, :error);
-        $result.so;
-        return;
+method !boot-frame-tick(--> Nil) {
+    if &!boot-launch.defined {
+        if $!boot-launch-armed {
+            my &launch = &!boot-launch;
+            &!boot-launch = Callable;
+            $!boot-launch-armed = False;
+            launch();
+        } else {
+            # This is the submission frame. Leave the continuation parked so
+            # render-frame can present the modal before boot competes for CPU,
+            # precomp locks, or a native-call boundary.
+            $!boot-launch-armed = True;
+        }
     }
+    if $!main-first-frame-pending {
+        $!main-first-frame-pending = False;
+        Selkie::Trace.instant('boot.main-first-frame', cat => 'boot')
+            if Selkie::Trace.enabled;
+    }
+    .tick with $!boot-modal;
+    if $!show-main-pending {
+        $!show-main-pending = False;
+        self!show-main(fresh => $!show-main-fresh);
+    }
+    Nil;
+}
 
-    $!config.save;
-    # `:fresh` is what turns the first frame of a brand-new budget into
-    # the period question. See !show-main.
-    self!show-main(:fresh);
+method !close-boot-modal(--> Nil) {
+    with $!boot-modal {
+        $!boot-modal = Nil;
+        $!app.close-modal;
+    }
+    Nil;
+}
+
+method !boot-failed(Str:D $message --> Nil) {
+    &!boot-launch = Callable;
+    $!boot-launch-armed = False;
+    self!close-boot-modal;
+    with $!db {
+        try {
+            .adopt-ui-thread if .is-connected;
+            .disconnect if .is-connected;
+        }
+    }
+    $!db = App::Moneymoor::DB;
+    $!login-screen.set-status($message, :error);
+    $!login-screen.reset-credentials unless $!login-screen.in-new-db-mode;
+    self!focus-first-login-field;
+    Nil;
 }
 
 #|( Open the budget, build the shell, and switch to it.
@@ -290,29 +435,43 @@ method !handle-create(Str $budget-name, Str $passphrase) {
     the failure is caught here and the screen switch simply does not
     happen. )
 method !show-main(Bool :$fresh = False) {
-    $!workspace = try App::Moneymoor::Service::Workspace.new(db => $!db);
+    my \Workspace = (require ::('App::Moneymoor::Service::Workspace'));
+    my \Main = (require ::('App::Moneymoor::Screen::Main'));
+    $!db.adopt-ui-thread;
+    my $workspace-span = Selkie::Trace.enabled
+        ?? Selkie::Trace.start('boot.workspace', cat => 'boot') !! Nil;
+    $!workspace = try Workspace.new(db => $!db);
+    $workspace-span.finish(ok => $!workspace.defined) with $workspace-span;
     without $!workspace {
-        $!login-screen.set-status(
-            ($! andthen .message) // 'This budget file could not be opened',
-            :error,
-        );
+        self!boot-failed(($! andthen .message)
+            // 'This budget file could not be opened');
         return;
     }
 
-    $!main-screen = App::Moneymoor::Screen::Main.new(
+    my $build-span = Selkie::Trace.enabled
+        ?? Selkie::Trace.start('boot.main-build', cat => 'boot') !! Nil;
+    $!main-screen = Main.new(
         app       => $!app,
         db        => $!db,
         workspace => $!workspace,
         config    => $!config,
         theme     => $!theme,
     );
-    $!app.add-screen('main', $!main-screen.build);
+    my $root = $!main-screen.build;
+    $build-span.finish(ok => True) with $build-span;
+    my $mount-span = Selkie::Trace.enabled
+        ?? Selkie::Trace.start('boot.screen-mount', cat => 'boot') !! Nil;
+    $!app.add-screen('main', $root);
     $!app.switch-screen('main');
+    $mount-span.finish with $mount-span;
+    $!main-first-frame-pending = True;
     # After the switch, not before: `switch-screen` restores whatever
     # focus it remembers for the screen (nothing, the first time) and
     # would override an earlier placement. The shell handles every
     # later content rebuild itself.
     $!main-screen.focus-content;
+    $!config.save;
+    self!close-boot-modal;
 
     # And after the focus, not before: the picker takes focus itself,
     # and placing the content focus afterwards would pull it back out

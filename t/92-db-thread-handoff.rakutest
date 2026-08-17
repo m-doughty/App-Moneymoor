@@ -1,0 +1,33 @@
+use Test;
+use lib 'lib';
+
+use App::Moneymoor::DB;
+
+plan 1;
+
+subtest 'worker connect requires explicit ownership handoff' => {
+    plan 7;
+    my $path = $*TMPDIR.add("moneymoor-handoff-{$*PID}.db");
+    LEAVE { unlink $path if $path.e }
+
+    my Int $worker-tid;
+    my @phases;
+    my $db = await start {
+        $worker-tid = $*THREAD.id;
+        App::Moneymoor::DB.new(db-path => $path.Str).connect(
+            'thread-test',
+            on-progress => -> %phase { @phases.push(%phase<phase>.Str) },
+        );
+    };
+
+    ok $db.is-connected, 'worker opened the encrypted database';
+    isnt $worker-tid, $*THREAD.id, 'connect ran off the test/UI thread';
+    dies-ok { $db.query-one('SELECT 1 AS n') },
+        'cross-thread query is rejected before adoption';
+    $db.adopt-ui-thread;
+    is $db.query-one('SELECT 1 AS n')<n>.Int, 1,
+        'adopted connection is usable by the new owner';
+    ok @phases.grep(* eq 'unlock'), 'unlock progress emitted';
+    ok @phases.grep(* eq 'migrate'), 'migration progress emitted';
+    lives-ok { $db.disconnect }, 'new owner can disconnect';
+};

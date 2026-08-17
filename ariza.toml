@@ -139,9 +139,28 @@ if $*DISTRO.is-win {
     restore-controlling-terminal-state(CArray[uint8].allocate(256));
     write-controlling-terminal('not emitted');
     disable-controlling-terminal-flow-control;
+
+    # Windows gets no SIGWINCH and, because notcurses drives the console in
+    # pure VT input mode, no resize input event either -- Selkie polls the
+    # viewport through this instead. It is a kernel32 binding, so a bundle
+    # that cannot resolve it loses resize handling with no error at all.
+    # Under smoke, stdout is captured rather than a console, so the empty
+    # answer is the expected one; what matters is that it answers rather
+    # than dying, and never invents a geometry.
+    my @dims = windows-console-dimensions();
+    die 'windows-console-dimensions did not answer a list'
+        unless @dims ~~ List;
+    die 'windows-console-dimensions answered a malformed geometry: '
+        ~ @dims.raku
+        unless @dims.elems == 0 || @dims.elems == 2;
+    die 'windows-console-dimensions answered a non-positive geometry: '
+        ~ @dims.raku
+        if @dims.elems == 2 && @dims.grep(* <= 0);
 }
 else {
     restore-controlling-terminal-state($state);
+    die 'windows-console-dimensions must answer empty off Windows'
+        if windows-console-dimensions().elems;
 }
 
 say 'ok: Selkie terminal platform boundary is guarded';

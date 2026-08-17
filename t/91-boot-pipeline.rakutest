@@ -1,0 +1,84 @@
+use Test;
+use lib 'lib';
+
+use Selkie::Store;
+use App::Moneymoor::Handlers::Boot;
+use App::Moneymoor::Widget::BootProgressModal;
+use App::Moneymoor::UI;
+
+plan 4;
+
+subtest 'claim is a one-way interlock until failure releases it' => {
+    plan 5;
+    my $boot = App::Moneymoor::Handlers::Boot.new(
+        show-main => -> Bool :$fresh = False { },
+        on-failed => -> Str $message { },
+    );
+    ok $boot.claim, 'first submission owns the boot slot';
+    nok $boot.claim, 'duplicate submission is ignored';
+    ok $boot.in-flight, 'attempt remains active';
+    $boot.release;
+    ok $boot.claim, 'validation failure can release it';
+    nok $boot.claim, 'and the replacement attempt is still exclusive';
+};
+
+subtest 'store events route success exactly once on the loop thread' => {
+    plan 6;
+    my @shown;
+    my @failed;
+    my $store = Selkie::Store.new;
+    my $boot = App::Moneymoor::Handlers::Boot.new(
+        show-main => -> Bool :$fresh = False { @shown.push($fresh) },
+        on-failed => -> Str $message { @failed.push($message) },
+    );
+    $boot.register($store);
+    ok $boot.claim, 'claimed';
+    $store.dispatch('boot/started', detail => 'household');
+    $store.dispatch('boot/phase', phase => 'verify', detail => 'passphrase');
+    $store.dispatch('boot/ready', fresh => True);
+    $store.tick;
+    is-deeply @shown, [True], 'success callback receives fresh exactly once';
+    is-deeply @failed, [], 'failure callback did not run';
+    ok $boot.completed, 'coordinator is terminal after success';
+    $store.dispatch('boot/ready', fresh => False);
+    $store.dispatch('boot/failed', message => 'late');
+    $store.tick;
+    is-deeply @shown, [True], 'duplicate ready is ignored';
+    is-deeply @failed, [], 'late failure is ignored';
+};
+
+subtest 'failure restores retry and preserves the exact message' => {
+    plan 5;
+    my @failed;
+    my $store = Selkie::Store.new;
+    my $boot = App::Moneymoor::Handlers::Boot.new(
+        show-main => -> Bool :$fresh = False { },
+        on-failed => -> Str $message { @failed.push($message) },
+    );
+    $boot.register($store);
+    ok $boot.claim, 'claimed';
+    $store.dispatch('boot/failed', message => 'Invalid passphrase');
+    $store.tick;
+    is-deeply @failed, ['Invalid passphrase'], 'verbatim failure routed';
+    nok $boot.in-flight, 'failed attempt released';
+    nok $boot.completed, 'failure is retryable';
+    ok $boot.claim, 'retry can claim the slot';
+};
+
+subtest 'progress widget and warm-up command expose safe contracts' => {
+    plan 8;
+    my $store = Selkie::Store.new;
+    my $progress = App::Moneymoor::Widget::BootProgressModal.new(:$store);
+    my $modal = $progress.build;
+    nok $modal.dismissable, 'boot modal cannot be escaped';
+    ok $progress.focus-widget.focusable, 'modal owns focus';
+    $progress.apply(%(phase => 'migrate', detail => 'schema'));
+    is $progress.status-text, 'Checking database schema…', 'phase is user-facing';
+    is $progress.detail-text, 'schema', 'detail is retained';
+
+    my @cmd = App::Moneymoor::UI::warmup-command;
+    ok @cmd.elems >= 3, 'warm-up command has executable, repositories and program';
+    is @cmd[*-2], '-e', 'child runs a fixed inline program';
+    ok @cmd.tail.contains('App::Moneymoor::Screen::Main'), 'heavy screen is warmed';
+    nok @cmd.join(' ').contains('passphrase'), 'credentials are never child arguments';
+};

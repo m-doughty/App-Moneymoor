@@ -2,6 +2,54 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.4.0  2026-08-17T02:29:45+01:00
+
+    - [2026-08-17] Keep the banner intact across a Windows resize. Two
+      independent defects conspired: notcurses' Windows clear escape was a
+      bare ED(2), which ConPTY does not home the cursor for, so the first
+      row of every post-resize repaint was emitted wherever the cursor
+      happened to sit (fixed upstream in the notcurses fork by clearing
+      with \e[H\e[2J); and BannerBar's render marked a transient
+      zero-width geometry as served, so a banner that skipped a resize
+      frame was never repainted (fixed here with note-unpaintable-geometry
+      and a post-resize mark-dirty in the resize callback).
+
+    - Raise the dependency floors to Notcurses::Native 0.6.2 and Selkie
+      0.15.0. Both are hard requirements on Windows. Notcurses::Native
+      before 0.6.1 replaced the whole process PATH with its own library
+      directory — it wrote %*ENV<PATH> while Windows names the variable
+      'Path' — so every library loaded afterwards lost its search path and
+      SQLCipher could not find libcrypto, surfacing at the login screen as
+      a misleading "sqlcipher.dll not found"; 0.6.2 ships the r14
+      notcurses prebuilts whose Windows clear escape homes the cursor,
+      which the banner repaint fix above depends on. Selkie 0.15.0
+      carries the matching input and resize work.
+
+    - Extend the Ariza terminal-platform smoke command to exercise
+      windows-console-dimensions. Windows now has neither SIGWINCH nor a
+      resize input event, so that kernel32 binding is the only way a resize
+      is noticed; a bundle that could not resolve it would lose resize
+      handling silently rather than failing.
+
+    - Show the register newest first. A ledger grows at the recent end, so
+      reaching today meant scrolling to the bottom of everything that came
+      before it. Both the single-account and All Accounts views are
+      reversed.
+
+      The running-balance scan still runs in (date, id) order and is
+      reversed only afterwards, so each row keeps the balance as of its own
+      transaction; accumulating over reversed input would count backwards
+      from zero and produce a column that looks right and is not. The
+      gateway's ordering is untouched — Service::Budget derives each period
+      from the balance at the instant of each purchase, and the reports rely
+      on the same order.
+
+    - Keep the login UI responsive while SQLCipher opens and migrates the
+      budget and cold modules compile. A non-dismissable progress modal
+      swallows duplicate submission, database work stays off the render
+      thread, and structured boot traces identify compile, unlock, verify,
+      migration, workspace, store-bootstrap, mount, and first-frame costs.
+
 0.3.6  2026-08-14T22:27:34+01:00
 
     - [2026-08-14] Release 0.3.6 with the coherent Windows native dependency
