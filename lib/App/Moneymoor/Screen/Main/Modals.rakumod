@@ -14,7 +14,7 @@ seven.
 
 use App::Moneymoor::Screen::Main::Modals;
 
-App::Moneymoor::Screen::Main::Modals::open-settings($main);      # ctrl+,
+App::Moneymoor::Screen::Main::Modals::open-settings($main);      # ctrl+o
 App::Moneymoor::Screen::Main::Modals::open-diagnostics($main);   # ctrl+g
 
 # The budget period: ctrl+p from Settings, and once at creation.

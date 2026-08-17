@@ -26,7 +26,7 @@ Two install subs:
       anywhere on the Main screen regardless of which pane has focus:
       C<1> / C<2> / C<3> and C<Ctrl+1> / C<Ctrl+2> / C<Ctrl+3> (tab
       switch), C<[> / C<]> (period navigation), C<Ctrl+G>
-      (diagnostics), C<Ctrl+,> (settings), C<Ctrl+H> (the keybind
+      (diagnostics), C<Ctrl+O> (settings), C<Ctrl+H> (the keybind
       overlay). Registered once, at build time.
 =item C<install-content> — binds on the current tab's panes, so they
       only fire when that pane has focus. Re-run by
@@ -119,7 +119,13 @@ our sub install-global($main) {
         -> $ { App::Moneymoor::Screen::Main::Modals::open-diagnostics($self-ref) },
         :description('Diagnostics');
 
-    $root.on-key: 'ctrl+,',
+    # Ctrl+O, not Ctrl+,: terminals without a disambiguating keyboard
+    # protocol (Windows Terminal, Apple Terminal, xterm) encode
+    # ctrl+punctuation by masking with 0x1F, and ',' & 0x1F is 0x0C —
+    # byte-identical to ctrl+l. The combo either misfires or is
+    # unreachable there; ctrl+letter combos are distinct C0 bytes
+    # everywhere.
+    $root.on-key: 'ctrl+o',
         -> $ { App::Moneymoor::Screen::Main::Modals::open-settings($self-ref) },
         :description('Settings');
 

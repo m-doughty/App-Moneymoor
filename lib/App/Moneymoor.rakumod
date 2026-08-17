@@ -180,7 +180,7 @@ on terminals that can send it):
 C<Ctrl+H> lists the keys for whatever has focus; the bottom line
 always shows the important ones. C<Ctrl+G> opens diagnostics — the
 derivation's warnings, invariant errors and a digest fingerprint safe
-to paste into a bug report. C<Ctrl+,> opens settings: eleven palettes
+to paste into a bug report. C<Ctrl+O> opens settings: eleven palettes
 and a glyph tier (plain Unicode or Nerd Font), applied live and
 remembered in C<~/.moneymoor/config.json>.
 
@@ -230,4 +230,4 @@ unit class App::Moneymoor;
 #| The distribution version, for callers that want to record which
 #| engine derived a budget they are storing alongside it. Kept in step
 #| with C<META6.json> by C<t/85-distribution.rakutest>.
-method version(--> Version) { v0.4.0 }
+method version(--> Version) { v0.4.1 }
