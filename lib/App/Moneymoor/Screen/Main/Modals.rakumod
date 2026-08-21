@@ -3373,6 +3373,15 @@ our sub open-transaction-editor($main, Int :$transaction-id,
     # The remainder is against the amount, so it has to follow it.
     $amount-input.on-change.tap: -> $ { refresh-splits() };
 
+    # $picked has to follow the user's own choice, not stay frozen at
+    # the index the dialog opened on: every Amount keystroke re-enters
+    # refresh-splits, whose no-splits branch restores $picked — with a
+    # stale $picked that restore silently threw away a category chosen
+    # before the amount was (re)typed.
+    $category-select.on-change.tap: -> $idx {
+        $picked = $idx.Int unless $split-mode;
+    };
+
     #|( Changing the account can change what the form is allowed to be:
         picking a tracking account takes the category picker and the
         splits away, and picking a budget account gives them back.

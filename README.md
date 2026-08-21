@@ -68,37 +68,45 @@ The first screen lists the budgets it found and asks for a passphrase, or — wi
 
 Inside are three tabs — `1` / `2` / `3` (or `Ctrl+1` / `Ctrl+2` / `Ctrl+3` on terminals speaking the kitty keyboard protocol):
 
-  * **Budget** — the envelope grid for one month, grouped, with Ready-to-Assign above it and a rail beside it that shows exactly how an envelope's available figure was arrived at. `a` assigns, `m` moves money between envelopes, `f` funds every underfunded target at once, `x` explains a derived number, `[` and `]` change month.
+  * **Budget** — the envelope grid for one period, grouped, with Ready-to-Assign above it and a rail beside it that shows exactly how an envelope's available figure was arrived at. `a` assigns, `m` moves money between envelopes, `f` funds every underfunded target at once, `x` explains a derived number, `[` and `]` change period.
 
   * **Accounts** — ledgers on the left, register on the right. `n` adds a transaction (splits and all), `t` a transfer, `c` cycles uncleared → cleared → reconciled, `Ctrl+R` reconciles against a statement balance.
 
-  * **Reports** — the month's cash flow, and where the money went.
+  * **Reports** — the period's cash flow, and where the money went.
 
-The bottom line always shows the keys that apply to whatever has focus; `Ctrl+H` lists all of them. `Ctrl+G` opens diagnostics — the derivation's warnings, invariant errors, and a digest fingerprint safe to paste into a bug report. `Ctrl+,` opens settings: eleven palettes and two glyph tiers (plain Unicode, or Nerd Font), applied live and remembered.
+The bottom line always shows the keys that apply to whatever has focus; `Ctrl+H` lists all of them. `Ctrl+G` opens diagnostics — the derivation's warnings, invariant errors, and a digest fingerprint safe to paste into a bug report. `Ctrl+O` opens settings: eleven palettes and two glyph tiers (plain Unicode, or Nerd Font), applied live and remembered.
 
 The idea
 --------
 
 You do not budget the money you are going to earn. You budget the money you **have**, by giving every pound of it a job: rent, groceries, the December car insurance bill. When a job costs more than you gave it, you take the money from another job and watch that trade-off happen. That is the whole method, and it only works if the arithmetic is trustworthy.
 
-So Moneymoor stores **only what you authored** — accounts, categories, transactions with their splits, and per-month assignments — and derives everything else on demand with a pure function. Balances, activity, available, Ready to Assign, credit-card payment reserves: all recomputed, never stored. A stored derived number is a cache, and a cache that disagrees with the transactions that produced it is worse than no budget at all.
+So Moneymoor stores **only what you authored** — accounts, categories, transactions with their splits, and per-period assignments — and derives everything else on demand with a pure function. Balances, activity, available, Ready to Assign, credit-card payment reserves: all recomputed, never stored. A stored derived number is a cache, and a cache that disagrees with the transactions that produced it is worse than no budget at all.
 
-Targets, and the two ways to hit them
--------------------------------------
+Targets, and how to hit them
+----------------------------
 
-Give an envelope a **monthly target** — in its editor, `e` on the grid — and you have said "I want this much available in here each month". Rent £750, Groceries £400. Blank the field to take the target away again.
+Give an envelope a **target** in its editor — `e` on the grid — and you have told it how big a job it is. The editor asks which of three kinds first, because the same amount asks three different questions:
+
+  * **Refill each period** — "I want this much available in here each period". Rent £750, Groceries £400. The original behaviour, and the right shape for a spending envelope you empty.
+
+  * **Set aside each period** — "put this much in each period, whatever is already in there". The right shape for a fund that accumulates: £900 already saved still owes this period's £100, and pulling money back out re-opens the ask.
+
+  * **Goal by period** — "reach this much available by this date", optionally repeating every few periods. The plan is a straight line from the period the target was set in to the period containing the goal date, and each period asks for the distance to where the line says it should be.
+
+Blank the amount field to take the target away again.
 
 Three things follow:
 
-  * The grid grows a **Target** column, blank for the envelopes you have not set one on, and each group header shows what its envelopes want between them.
+  * The grid grows a **Target** column, blank for the envelopes you have not set one on, and each group header shows what its envelopes want between them. Refill and set-aside show their own per-period amount; a goal shows the **milestone** the plan says that envelope should have reached by this period, not the £50,000 it is heading for — so the column still adds up to what this period's plan is asking for.
 
-  * The detail rail says how far off you are: `To fund +£72.50` in amber, or `Target met`.
+  * The detail rail says how far off you are: `To fund +£72.50` in amber, or `Target met` — and for the kinds that measure more than an amount, what they are measuring: "£100.00 /period" for a set-aside, and for a goal, by when, which milestone **of** how many, and whether it repeats.
 
-  * The assign field learns two shapes. `=450` means "make this envelope's available £450" — not "assign £450", which is a different number the moment anything carried over or was spent. A bare `=` means "make it the target". Both are ordinary assignments underneath, by exactly the difference.
+  * The assign field learns two shapes. `=450` means "make this envelope's available £450" — not "assign £450", which is a different number the moment anything carried over or was spent. A bare `=` means "fund this envelope's plan for this period": whatever the target asks for, of whatever kind it is. Both are ordinary assignments underneath, by exactly the difference.
 
-And `f` does the lot: it lists every visible envelope that is short of its target, with what each would take, the total, and what Ready to Assign will be afterwards — then applies all of it in **one** write, so the budget is derived once and cannot end up half-funded. It only ever adds; an envelope already over its target is left alone. If the total would push Ready to Assign below zero the dialog says so in red, and still lets you do it — that is a real step on the way to a plan, and the pill above the grid will keep saying so for as long as it is true.
+And `f` does the lot: it lists every visible envelope that is short of its target, with what each would take, the total, and what Ready to Assign will be afterwards — then applies all of it in **one** write, so the budget is derived once and cannot end up half-funded. It only ever adds; an envelope already over its target is left alone. It funds to each kind's own idea of "done" — a refill to its level, a set-aside's contribution, a goal's next milestone — in the same sweep. If the total would push Ready to Assign below zero the dialog says so in red, and still lets you do it — that is a real step on the way to a plan, and the pill above the grid will keep saying so for as long as it is true.
 
-Targets are a **view-layer** idea, deliberately. `Service::Budget` has never heard of one: "underfunded" is `max(0, target - available)`, computed where it is drawn. A target moves no money by itself. Only `=`, `f` and your own typing do.
+Targets are a **view-layer** idea, deliberately. `Service::Budget` has never heard of one: "how much would fully funding this envelope's plan cost" is `$App::Moneymoor::Service::Target::target-ask`, computed where it is drawn. A target moves no money by itself. Only `=`, `f` and your own typing do.
 
 The master invariant
 --------------------
@@ -109,11 +117,11 @@ Envelopes partition **cash**. Every pound in a cash account is either sitting in
 
 Credit cards are not on the right-hand side: their balance is debt. What is on the left is the card's **payment envelope** — the cash you have set aside to pay it, which the engine fills automatically every time you spend on the card from a funded category.
 
-The general form of the invariant, which the engine checks for every month and the property suite asserts after every single operation, adds the two terms that future-month budgeting and credit-card overspending introduce:
+The general form of the invariant, which the engine checks for every period and the property suite asserts after every single operation, adds the two terms that future-period budgeting and credit-card overspending introduce:
 
-    Σ available(m) + RTA(m) + assigned-in-months-after(m)
-                            + credit-overspend(m)
-        == cash-balance(m)
+    Σ available(p) + RTA(p) + assigned-in-periods-after(p)
+                            + credit-overspend(p)
+        == cash-balance(p)
 
 `App::Moneymoor::Service::Budget`'s Pod is the full specification — four rules, each with worked numbers.
 
@@ -205,7 +213,7 @@ say format-pence(-123456);   # -£1,234.56
 say parse-pence('£12.34');   # 1234
 ```
 
-Settings (`ctrl+,`) picks the currency symbol (`£`, `$`, `€` — display only; nothing converts) and the number format (`1,234.56` or `1.234,56`). Both are saved to `config.json` and applied without a restart. The decimal mark drives parsing too, and thousands are grouped with whichever separator the decimal mark is not, in exact groups of three — so `'1,50'` in `.` mode is an error rather than a 100x-too-large assignment:
+Settings (`ctrl+o`) picks the currency symbol (`£`, `$`, `€` — display only; nothing converts) and the number format (`1,234.56` or `1.234,56`). Both are saved to `config.json` and applied without a restart. The decimal mark drives parsing too, and thousands are grouped with whichever separator the decimal mark is not, in exact groups of three — so `'1,50'` in `.` mode is an error rather than a 100x-too-large assignment:
 
 ```raku
 set-money-locale(symbol => '€', decimal-mark => ',');
@@ -241,10 +249,10 @@ And the UI, which never touches SQL:
 
   * `App::Moneymoor::Theme` / `Themes` / `Service::Icons` — the eleven palettes and the two glyph tiers.
 
-Not in v0.1
------------
+What it does not do
+-------------------
 
-Scheduled transactions, CSV and bank imports, multi-currency, incremental rollup caching, and net worth over time (which wants a per-month, per-account balance derivation the engine does not have yet).
+Scheduled transactions, CSV and bank imports, multi-currency, incremental rollup caching, and net worth over time (which wants a per-period, per-account balance derivation the engine does not have yet).
 
 Portability
 -----------

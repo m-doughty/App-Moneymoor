@@ -42,7 +42,7 @@ use App::Moneymoor::Screen::Main::Modals;
 # which is asserted against Date.today deliberately — it is what the
 # field is documented to do.
 
-plan 13;
+plan 14;
 
 my constant DAY = '2026-03-11';
 
@@ -210,6 +210,38 @@ subtest 'a new transaction, typed and saved' => {
     my @splits = $ws.transactions.find-splits($saved.id);
     ok @splits.elems == 1 && @splits[0].category-id == $groceries.id,
         'a single-category transaction is stored as exactly one split';
+};
+
+subtest 'typing the amount after picking the category keeps the pick' => {
+    plan 3;
+    # The regression: refresh-splits runs on every Amount keystroke,
+    # and its no-splits branch used to restore a $picked frozen at the
+    # index the dialog opened on — so choosing a category and THEN
+    # typing (or retyping) the amount silently snapped the picker back,
+    # and Ctrl+S saved the wrong envelope. set-text skips on-change by
+    # design, so only insert-text (what real keystrokes and paste go
+    # through) reproduces it.
+    my %f = fixture(account-id => $current.id);
+    my $main = %f<main>;
+    App::Moneymoor::Screen::Main::Modals::open-transaction-editor($main);
+    my $modal = $main.modals[0];
+    my %field = fields($modal);
+
+    %field<Date>.set-text(DAY);
+    %field<Memo>.set-text('petrol');
+    my UInt $fuel-idx = category-index(%field<Category>, 'Fuel').UInt;
+    %field<Category>.select-index($fuel-idx);
+    isnt $fuel-idx, 0, 'Fuel is not the row the dialog opened on';
+
+    %field<Amount>.insert-text('30.00');
+    is %field<Category>.selected, $fuel-idx,
+        'the picker still says Fuel after the amount is typed';
+
+    press-key($modal, 'ctrl+s');
+    %f<store>.tick;
+    my $saved = $ws.transactions.find-all.first({ .memo eq 'petrol' });
+    is $ws.transactions.find-splits($saved.id)[0].category-id, $fuel.id,
+        'and Ctrl+S saves the category the user actually chose';
 };
 
 subtest 'the Inflow choice flips the sign' => {

@@ -2,6 +2,26 @@ Revision history for App::Moneymoor
 
 {{$NEXT}}
 
+0.4.2  2026-08-21T22:31:22+01:00
+
+    - [2026-08-21] Transaction editor: typing (or retyping) the amount
+      after choosing a category silently snapped the category picker
+      back to the row the dialog opened on, so Ctrl+S saved the wrong
+      envelope. refresh-splits runs on every Amount keystroke, and its
+      no-splits branch restored a remembered pick that was frozen at
+      build time; the remembered pick now follows the user's own
+      selection. Regression-tested with insert-text (set-text skips
+      on-change by design, which is why the suite never caught it).
+
+    - [2026-08-20] Documentation drift. README and the module Pod still
+      said Ctrl+, opens settings (it has been Ctrl+O since 0.4.1), and
+      the module Pod said the envelope editor sets refill targets only,
+      when the editor has offered all three kinds since 0.3.0. The
+      README's targets section now tells the three-kind story (and the
+      kind-aware bare = and f) instead of the 0.1 monthly-target one,
+      and month→period wording was fixed throughout (the app is
+      period-scoped). README.md regenerated from docs/Readme.rakudoc.
+
 0.4.1  2026-08-17T21:41:35+01:00
 
     - [2026-08-17] Move the settings binding from Ctrl+, to Ctrl+O.

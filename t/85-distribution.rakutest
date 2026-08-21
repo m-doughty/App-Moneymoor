@@ -80,9 +80,9 @@ subtest 'META6 provides and lib/ describe the same distribution' => {
     # version that stopped tracking the dist.
     is App::Moneymoor.version.Str, %meta<version>,
         'App::Moneymoor.version agrees with META6';
-    is %meta<version>, '0.4.1',
+    is %meta<version>, '0.4.2',
         'META6 carries the release version';
-    # 0.6.2 is a hard floor, for two stacked Windows reasons. 0.6.0 and
+    # 0.6.5 is a hard floor, for two stacked Windows reasons. 0.6.0 and
     # earlier destroy the process PATH — they write %*ENV<PATH> while the
     # host names the variable 'Path', so the whole search path is replaced
     # by notcurses' own directory; SQLCipher then cannot find libcrypto and
@@ -96,10 +96,8 @@ subtest 'META6 provides and lib/ describe the same distribution' => {
         * eq 'Notcurses::Native:ver<0.6.5+>:auth<zef:apogee>'
     ).elems == 1,
         'META6 requires the Windows loader and resize-repaint fixes';
-    # 0.15.0 is where the register reversal's companion changes live: the
-    # NOTCURSES-GET-ERROR comparison and the polled Windows resize path.
     ok %meta<depends>.grep(
-        * eq 'Selkie:ver<0.15.1+>:auth<zef:apogee>'
+        * eq 'Selkie:ver<0.16.0+>:auth<zef:apogee>'
     ).elems == 1,
         'META6 requires the matching Selkie dependency chain';
 
